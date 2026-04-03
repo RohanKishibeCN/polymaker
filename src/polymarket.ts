@@ -109,7 +109,8 @@ export async function scanForNegativeRiskArbitrage() {
 
       if (!valid) continue;
 
-      const targetSum = 1.0 - config.bot.profitThreshold;
+      // 由于移除了 profitThreshold，这里固定一个测试阈值或者直接注释掉旧的套利逻辑
+      const targetSum = 0.99;
       
       // 我们打印出每一个有价值的互斥市场的当前和，以便您在日志中看到它正在工作
       if (sumOfYesAsks > 0) {

@@ -1,27 +1,27 @@
 import { config } from './config';
-import { scanForNegativeRiskArbitrage } from './polymarket';
+import { runMarketMakingCycle } from './market_maker';
 import { logDailySummary } from './notion';
 
 async function main() {
   console.log('==========================================');
-  console.log(' Polymarket Arbitrage Bot Started');
+  console.log(' Polymarket Market Maker & LP Rewards Bot');
   console.log(` Scan Interval: ${config.bot.scanInterval / 1000}s`);
   console.log(` Max Investment: ${config.bot.maxInvestment} USDC`);
+  console.log(` Target Markets: ${config.bot.targetMarketsCount}`);
   console.log('==========================================');
 
-  // Run the first scan immediately
-  await runScan();
+  // Run the first market making cycle immediately
+  await runCycle();
 
-  // Schedule subsequent scans
-  setInterval(runScan, config.bot.scanInterval);
+  // Schedule subsequent cycles (Re-quoting)
+  setInterval(runCycle, config.bot.scanInterval);
 
   // Daily summary at midnight
   scheduleDailySummary();
 }
 
-async function runScan() {
-  console.log(`\n[${new Date().toISOString()}] Initiating market scan...`);
-  await scanForNegativeRiskArbitrage();
+async function runCycle() {
+  await runMarketMakingCycle();
 }
 
 function scheduleDailySummary() {
