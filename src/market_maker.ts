@@ -39,8 +39,9 @@ export async function runMarketMakingCycle() {
   console.log('[Market Maker] Starting liquidity rewards & grid cycle...');
 
   try {
-    // 1. 直接使用 /markets 端点，获取带有 rewards 或 active 的具体市场
-    const response = await fetch('https://gamma-api.polymarket.com/markets?closed=false&active=true&limit=200');
+    // 1. 直接使用 /markets 端点，获取更多活跃市场以提高命中率
+    // 很多市场可能没有订单簿，我们需要获取更多的基数
+    const response = await fetch('https://gamma-api.polymarket.com/markets?closed=false&active=true&limit=1000');
     const markets = (await response.json()) as any[];
 
     // 2. 筛选适合我们做市的冷门长尾市场
@@ -59,6 +60,10 @@ export async function runMarketMakingCycle() {
 
       // 验证订单簿
       try {
+        // 如果 orderbook 请求太快可能会返回空数据或被 WAF 限制
+        // 我们在循环内稍微加点延迟，避免请求并发太高
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
         const orderbook = await clobClient.getOrderBook(yesTokenId);
         
         // 找到了一个符合条件的冷门/中等市场
