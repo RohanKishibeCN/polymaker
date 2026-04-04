@@ -70,6 +70,9 @@ export async function runMarketMakingCycle() {
         if (orderbook.bids) orderbook.bids.forEach((bid: any) => totalBidSize += parseFloat(bid.size));
         
         const totalLiquidity = totalAskSize + totalBidSize;
+        
+        // 我们增加一条日志看看当前扫到的市场流动性是多少，方便排查为什么选不出来
+        // console.log(`[Scan] ${event.title.substring(0, 30)}... Liquidity: ${totalLiquidity}`);
 
         if (totalLiquidity >= config.bot.minLiquidity && totalLiquidity <= config.bot.maxLiquidity) {
           // 找到了一个符合条件的冷门/中等市场
@@ -77,8 +80,9 @@ export async function runMarketMakingCycle() {
           const bestAsk = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].price) : 0;
           const bestBid = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].price) : 0;
 
-          // 必须有一个合理的价差才能做市
-          if (bestAsk > 0 && bestBid > 0 && bestAsk > bestBid) {
+          // 必须有一个合理的价差才能做市 (避免价差太小我们挂不进去)
+          // 并且价差必须足够大，至少容得下我们的 spreadHalf
+          if (bestAsk > 0 && bestBid > 0 && bestAsk > bestBid && (bestAsk - bestBid) >= (config.bot.spreadHalf * 2)) {
              targetMarkets.push({
                eventTitle: event.title,
                yesTokenId,

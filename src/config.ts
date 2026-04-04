@@ -20,10 +20,10 @@ export const config = {
     
     // 做市策略配置 (Market Making)
     targetMarketsCount: 5, // 想要同时做市的市场数量（前期测试选 5 个冷门市场）
-    spreadHalf: 0.02, // 距离中间价的单边价差，比如 mid=0.5, 买单0.48，卖单0.52。0.02 意味着 4% 的总价差
-    maxInventory: 3, // 最大单边库存容忍度 (如果连续买到 3 份 Yes，则暂停买入)
-    minLiquidity: 100, // 过滤掉完全没人的死水市场（盘口深度 < 100）
-    maxLiquidity: 50000, // 过滤掉大选级别的热门市场（盘口深度 > 50000，大机构在玩）
+    spreadHalf: 0.015, // 距离中间价的单边价差。0.015 意味着 3% 的总价差，更容易挤进去
+    maxInventory: 3, // 最大单边库存容忍度
+    minLiquidity: 50, // 放宽下限，有些很赚钱的长尾市场流动性确实很低
+    maxLiquidity: 100000, // 放宽上限，很多市场流动性很容易超过 5万
   }
 };
 
