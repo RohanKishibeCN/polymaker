@@ -39,59 +39,44 @@ export async function runMarketMakingCycle() {
   console.log('[Market Maker] Starting liquidity rewards & grid cycle...');
 
   try {
-    // 1. 抓取带 rewards 标签或处于 active 状态的预测市场
-    const response = await fetch('https://gamma-api.polymarket.com/events?closed=false&active=true&limit=100');
-    const events = (await response.json()) as any[];
+    // 1. 直接使用 /markets 端点，获取带有 rewards 或 active 的具体市场
+    const response = await fetch('https://gamma-api.polymarket.com/markets?closed=false&active=true&limit=200');
+    const markets = (await response.json()) as any[];
 
     // 2. 筛选适合我们做市的冷门长尾市场
     const targetMarkets = [];
     
-    for (const event of events) {
-      if (!event.markets || event.markets.length === 0) continue;
-      
-      // 我们只挑最简单的二元市场 (Yes/No)
-      const market = event.markets.find((m: any) => 
-        m.groupItemTitle !== 'Invalid' && m.closed === false
-      );
-
-      if (!market || !market.clobTokenIds || market.clobTokenIds.length < 2) continue;
+    for (const market of markets) {
+      if (market.groupItemTitle === 'Invalid' || market.closed === true) continue;
+      if (!market.clobTokenIds || market.clobTokenIds.length < 2) continue;
 
       const yesTokenId = market.clobTokenIds[0];
       const noTokenId = market.clobTokenIds[1]; // 通常二元市场有 yes 和 no 两个 token
 
-      // 验证流动性深度 (太深我们不抢，太浅没意义)
+      // 直接使用 Gamma API 返回的 liquidity 字段做初筛，避免频繁请求 clobClient 导致慢
+      const apiLiquidity = parseFloat(market.liquidity) || 0;
+      if (apiLiquidity < config.bot.minLiquidity || apiLiquidity > config.bot.maxLiquidity) continue;
+
+      // 验证订单簿
       try {
         const orderbook = await clobClient.getOrderBook(yesTokenId);
         
-        // 粗略估算流动性深度
-        let totalAskSize = 0;
-        let totalBidSize = 0;
-        if (orderbook.asks) orderbook.asks.forEach((ask: any) => totalAskSize += parseFloat(ask.size));
-        if (orderbook.bids) orderbook.bids.forEach((bid: any) => totalBidSize += parseFloat(bid.size));
-        
-        const totalLiquidity = totalAskSize + totalBidSize;
-        
-        // 我们增加一条日志看看当前扫到的市场流动性是多少，方便排查为什么选不出来
-        // console.log(`[Scan] ${event.title.substring(0, 30)}... Liquidity: ${totalLiquidity}`);
+        // 找到了一个符合条件的冷门/中等市场
+        // 获取当前的最佳买价和卖价
+        const bestAsk = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].price) : 0;
+        const bestBid = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].price) : 0;
 
-        if (totalLiquidity >= config.bot.minLiquidity && totalLiquidity <= config.bot.maxLiquidity) {
-          // 找到了一个符合条件的冷门/中等市场
-          // 获取当前的最佳买价和卖价
-          const bestAsk = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].price) : 0;
-          const bestBid = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].price) : 0;
-
-          // 必须有一个合理的价差才能做市 (避免价差太小我们挂不进去)
-          // 并且价差必须足够大，至少容得下我们的 spreadHalf
-          if (bestAsk > 0 && bestBid > 0 && bestAsk > bestBid && (bestAsk - bestBid) >= (config.bot.spreadHalf * 2)) {
-             targetMarkets.push({
-               eventTitle: event.title,
-               yesTokenId,
-               noTokenId,
-               bestBid,
-               bestAsk,
-               spread: bestAsk - bestBid
-             });
-          }
+        // 必须有一个合理的价差才能做市 (避免价差太小我们挂不进去)
+        // 并且价差必须足够大，至少容得下我们的 spreadHalf
+        if (bestAsk > 0 && bestBid > 0 && bestAsk > bestBid && (bestAsk - bestBid) >= (config.bot.spreadHalf * 2)) {
+           targetMarkets.push({
+             eventTitle: market.question, // 直接用 market 的问题做标题
+             yesTokenId,
+             noTokenId,
+             bestBid,
+             bestAsk,
+             spread: bestAsk - bestBid
+           });
         }
       } catch (e) {
         // console.warn(`Error fetching orderbook for ${yesTokenId}`);
