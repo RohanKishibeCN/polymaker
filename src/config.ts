@@ -17,9 +17,11 @@ export const config = {
   },
   bot: {
     // 基础配置
-    maxInvestment: 1, // USDC per trade to start safe
-    scanInterval: 1000 * 60 * 15, // 每 15 分钟扫描并更新一次挂单
-    
+    // 如果没有在 .env 里设置，默认使用 25 USDC 以满足大部分市场的官方流动性奖励门槛
+    maxInvestment: Number(process.env.POLYMARKET_MAX_INVESTMENT) || 25, 
+    // 如果没有在 .env 里设置，默认改为每 30 分钟扫描一次，大幅节省代理流量成本
+    scanInterval: 1000 * 60 * (Number(process.env.POLYMARKET_SCAN_INTERVAL_MINUTES) || 30), 
+
     // 做市策略配置 (Market Making)
     targetMarketsCount: 5, // 想要同时做市的市场数量（前期测试选 5 个冷门市场）
     spreadHalf: 0.015, // 距离中间价的单边价差。0.015 意味着 3% 的总价差，更容易挤进去
