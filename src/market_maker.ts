@@ -6,17 +6,26 @@ import { config } from './config';
 import { logTrade } from './notion';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import fetch from 'node-fetch'; // 引入兼容代理的 node-fetch
+import axios from 'axios'; // 引入 axios 以接管 ClobClient 的底层请求
 
-// IPRoyal 等商业代理的密码包含极多特殊字符，undici 处理起来存在诸多 Bug (407)
-// 业界最稳妥的方案是使用 https-proxy-agent + node-fetch 覆盖全局 fetch
+// IPRoyal 等商业代理的密码包含极多特殊字符，undici 和 axios 的默认解析处理起来存在诸多 Bug (407)
+// 业界最稳妥的方案是使用 https-proxy-agent + node-fetch 覆盖全局 fetch (用于 Gamma API)
+// 并将 https-proxy-agent 注入给全局 axios (用于 ClobClient)
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
 if (proxyUrl) {
   console.log(`[Market Maker] Setting global proxy to bypass Geoblock...`);
   const proxyAgent = new HttpsProxyAgent(proxyUrl);
+  
+  // 接管全局 fetch (用于我们自己写的 Gamma API 请求)
   // @ts-ignore
   global.fetch = function(url: any, options: any) {
     return fetch(url, { ...options, agent: proxyAgent });
   };
+  
+  // 接管全局 axios (用于 @polymarket/clob-client 内部的发单请求)
+  axios.defaults.proxy = false; // 必须禁用 axios 默认的代理处理，防止它解析密码出错
+  axios.defaults.httpsAgent = proxyAgent;
+  axios.defaults.httpAgent = proxyAgent;
 }
 
 // Initialize Wallet & Client using viem
