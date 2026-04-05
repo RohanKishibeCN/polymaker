@@ -4,31 +4,19 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
 import { config } from './config';
 import { logTrade } from './notion';
-import { setGlobalDispatcher, ProxyAgent } from 'undici';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import fetch from 'node-fetch'; // 引入兼容代理的 node-fetch
 
-// 如果环境变量中配置了 HTTP_PROXY 或 HTTPS_PROXY，强制让 Node.js 18+ 的原生 fetch 走代理
+// IPRoyal 等商业代理的密码包含极多特殊字符，undici 处理起来存在诸多 Bug (407)
+// 业界最稳妥的方案是使用 https-proxy-agent + node-fetch 覆盖全局 fetch
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
 if (proxyUrl) {
-  try {
-    const parsedUrl = new URL(proxyUrl);
-    console.log(`[Market Maker] Setting global proxy to bypass Geoblock...`);
-    
-    // 提取纯净的代理主机地址（不带账密）
-    const cleanProxyUri = `${parsedUrl.protocol}//${parsedUrl.host}`;
-    const proxyOptions: any = { uri: cleanProxyUri };
-    
-    if (parsedUrl.username && parsedUrl.password) {
-      const decodedUsername = decodeURIComponent(parsedUrl.username);
-      const decodedPassword = decodeURIComponent(parsedUrl.password);
-      const credentials = Buffer.from(`${decodedUsername}:${decodedPassword}`).toString('base64');
-      proxyOptions.token = `Basic ${credentials}`;
-    }
-    
-    const proxyAgent = new ProxyAgent(proxyOptions);
-    setGlobalDispatcher(proxyAgent);
-  } catch (err) {
-    console.error(`[Market Maker] Failed to parse proxy URL: ${err}`);
-  }
+  console.log(`[Market Maker] Setting global proxy to bypass Geoblock...`);
+  const proxyAgent = new HttpsProxyAgent(proxyUrl);
+  // @ts-ignore
+  global.fetch = function(url: any, options: any) {
+    return fetch(url, { ...options, agent: proxyAgent });
+  };
 }
 
 // Initialize Wallet & Client using viem
