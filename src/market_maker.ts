@@ -39,11 +39,15 @@ function getValidTokenId(rawTokenId: any): string | null {
 
   if (typeof rawTokenId === 'string' && rawTokenId.startsWith('[')) {
     try {
+      // API 有时返回的真的是只有一个字符 '[' 的异常字符串
+      if (rawTokenId === '[') return null;
+
       const validJsonStr = rawTokenId.replace(/'/g, '"');
       const parsedArray = JSON.parse(validJsonStr);
-      return parsedArray[0]; 
+      return Array.isArray(parsedArray) && parsedArray.length > 0 ? parsedArray[0] : null; 
     } catch (error) {
-      console.log(`Failed to parse clobTokenIds: ${rawTokenId}`);
+      // 避免因为单个市场的脏数据刷屏日志
+      // console.log(`Failed to parse clobTokenIds: ${rawTokenId}`);
       return null;
     }
   }
@@ -119,9 +123,13 @@ export async function runMarketMakingCycle() {
         const bestAsk = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].price) : 0;
         const bestBid = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].price) : 0;
 
-        // 如果连任何一方挂单都没有，不适合刚开始做市
+        // 如果连任何一方挂单都没有，或者倒挂，不适合刚开始做市
         if (bestAsk <= 0 || bestBid <= 0 || bestAsk <= bestBid) continue;
-        // 必须有一个合理的价差才能做市 (避免价差太小我们挂不进去)
+        
+        // 过滤极端概率市场（避免被单边打穿，适当放宽到 0.01 到 0.99，因为长尾市场很多都在这个区间）
+        if (bestAsk > 0.99 || bestBid < 0.01) continue;
+
+        // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单)
         // 并且价差必须足够大，至少容得下我们的 spreadHalf
         if ((bestAsk - bestBid) >= (config.bot.spreadHalf * 2)) {
            targetMarkets.push({
@@ -157,9 +165,16 @@ export async function runMarketMakingCycle() {
     for (const tm of targetMarkets) {
       const midPrice = (tm.bestBid + tm.bestAsk) / 2;
       
+      // 动态计算挂单价：如果买卖价差非常大（比如 bid 0.20, ask 0.80），我们需要收敛盘口
       // 我们在中间价的上下方各挂一单
       const myBidPrice = Number((midPrice - config.bot.spreadHalf).toFixed(2)); // 我愿意买入的价格 (低买)
       const myAskPrice = Number((midPrice + config.bot.spreadHalf).toFixed(2)); // 我愿意卖出的价格 (高卖)
+
+      // 避免我们的挂单变成市价吃单 (Taker)
+      if (myBidPrice >= tm.bestAsk || myAskPrice <= tm.bestBid) {
+        console.log(`     Skipping: Quote prices would cross the book (Taker).`);
+        continue;
+      }
 
       // 基本的库存风控：如果买得太多了，就不再挂买单；卖得太多了，不再挂卖单
       if (!inventory[tm.yesTokenId]) {
