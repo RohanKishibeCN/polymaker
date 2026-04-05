@@ -64,15 +64,27 @@ export async function runMarketMakingCycle() {
   console.log('[Market Maker] Starting liquidity rewards & grid cycle...');
 
   try {
-    // 1. 直接使用 ClobClient 获取真实的 Sampling Markets 列表
-    const marketsResponse = await clobClient.getSamplingMarkets();
-    let events = (marketsResponse as any).data || marketsResponse || [];
+    // 1. 根据开源社区的最佳实践，做市机器人通常使用 Gamma API (/events) 获取带元数据的市场
+    // 因为 /sampling-markets 或 CLOB /markets 经常包含大量早已死亡或不规范的子市场
+    console.log("[Market Maker] Fetching active events from Gamma API...");
+    const response = await fetch('https://gamma-api.polymarket.com/events?closed=false&active=true&limit=100');
+    const gammaData = (await response.json()) as any;
+    const gammaEvents = Array.isArray(gammaData) ? gammaData : gammaData.data || [];
     
-    if (!Array.isArray(events)) {
-      console.log("[Market Maker] Could not parse sampling markets. Trying raw fetch...");
-      const response = await fetch('https://clob.polymarket.com/sampling-markets');
-      const data = (await response.json()) as any;
-      events = data.markets || data.data || data || [];
+    // 我们需要把 Gamma events 展平为可做市的 markets 数组
+    let events: any[] = [];
+    for (const ge of gammaEvents) {
+      if (ge.markets) {
+        for (const gm of ge.markets) {
+          if (gm.closed === false && gm.active === true && gm.clobTokenIds && gm.clobTokenIds.length > 0) {
+            events.push({
+              question: gm.question || ge.title,
+              token_id: gm.clobTokenIds[0], // 传递原始数据给 getValidTokenId 处理
+              active: true
+            });
+          }
+        }
+      }
     }
 
     // 2. 筛选适合我们做市的冷门长尾市场
@@ -81,7 +93,7 @@ export async function runMarketMakingCycle() {
     for (const market of events) {
       if (market.active !== true && market.active !== "true") continue;
 
-      const yesTokenId = getValidTokenId(market.token_id || market.condition_id);
+      const yesTokenId = getValidTokenId(market.token_id);
       if (!yesTokenId) continue;
 
       // 验证订单簿

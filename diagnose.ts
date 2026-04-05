@@ -56,42 +56,20 @@ async function diagnose() {
     config.polymarket.funderAddress
   );
 
-  // /markets returns OLD markets. We need to fetch NEXT cursor until we get to recent ones, or sort!
-  const response = await fetch('https://clob.polymarket.com/markets');
-  const marketsResponse = await response.json();
-  let events = marketsResponse.data || marketsResponse || [];
-  
-  // Actually, clob API has `next_cursor`. Let's just use Gamma API again but get the token_id properly.
-  const gammaRes = await fetch('https://gamma-api.polymarket.com/events?closed=false&active=true&limit=100');
-  const gammaData = await gammaRes.json();
-  const gammaEvents = Array.isArray(gammaData) ? gammaData : gammaData.data || [];
-  
-  // We need a helper to map Gamma events to CLOB markets
-  events = [];
-  for (const ge of gammaEvents) {
-    if (ge.markets) {
-      for (const gm of ge.markets) {
-        if (gm.clobTokenIds && gm.clobTokenIds.length > 0) {
-          const tId = getValidTokenId(gm.clobTokenIds);
-          if (tId) {
-            events.push({
-              question: gm.question || ge.title,
-              token_id: tId,
-              active: true
-            });
-          }
-        }
-      }
-    }
+  const marketsResponse = await clobClient.getSamplingMarkets();
+  let events = (marketsResponse as any).data || marketsResponse || [];
+  if (!Array.isArray(events)) {
+    const response = await fetch('https://clob.polymarket.com/sampling-markets');
+    const data = (await response.json()) as any;
+    events = data.markets || data.data || data || [];
   }
   
-  console.log(`Fetched ${events.length} active events from ClobClient.`);
+  console.log(`Fetched ${events.length} active events.`);
   
-  let rejectedByTitle = 0;
+  let rejectedByActive = 0;
   let rejectedByTokens = 0;
-  let rejectedByLiquidity = 0;
   let rejectedByOrderbookFetch = 0;
-  let rejectedBySpreadLogic = 0;
+  let rejectedByEmptyBook = 0;
   let rejectedBecauseTooTight = 0;
   
   const spreadRejections: any[] = [];
@@ -99,8 +77,8 @@ async function diagnose() {
   let validFound = 0;
 
   for (const market of events) {
-    if (market.active !== true) {
-      rejectedByTitle++;
+    if (market.active !== true && market.active !== "true") {
+      rejectedByActive++;
       continue;
     }
     
@@ -111,56 +89,36 @@ async function diagnose() {
     }
     
     try {
-      await delay(100);
-      // 终于找到原因了！！！
-      // Polymarket 官方文档的正确 Endpoint 参数不是 ?market=，而是 ?token_id= !!!
-      // 所以我们之前用 fetch(`https://clob.polymarket.com/book?market=${tokenId}`) 也是错的！
-      // 真正的 URL 是 https://clob.polymarket.com/book?token_id=${tokenId}
-      const obResponse = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
-      const orderbook = await obResponse.json();
+      await delay(50);
+      const obResponse = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0'
+        }
+      });
+      const orderbook = (await obResponse.json()) as any;
+      
+      if (orderbook.error || orderbook.message) {
+        rejectedByOrderbookFetch++;
+        continue;
+      }
       
       const bestAsk = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].price) : 0;
       const bestBid = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].price) : 0;
       const spread = bestAsk - bestBid;
-      const minRequiredSpread = config.bot.spreadHalf * 2; // 默认 0.03
+      const minRequiredSpread = config.bot.spreadHalf * 2; 
 
-      // 这里可能是最重要的：如果市场价格在 0.01 或 0.99，Spread 可能根本不符合条件，
-      // 因为我们要求两边都有足够的空间挂单。如果 bid=0.01，ask=0.04，是可以的。
-      if (bestAsk <= 0 || bestBid <= 0) {
-        rejectedBySpreadLogic++;
-        if (rejectedBySpreadLogic < 3) {
-          console.log(`[Empty Orderbook] Event: ${market.question} | Token: ${tokenId} - Asks: ${orderbook.asks?.length || 0}, Bids: ${orderbook.bids?.length || 0}`);
-        }
-        continue;
-      }
-      
-      if (bestAsk <= bestBid) {
-        rejectedBySpreadLogic++;
+      if (bestAsk <= 0 || bestBid <= 0 || bestAsk <= bestBid) {
+        rejectedByEmptyBook++;
         continue;
       }
 
       if (spread < minRequiredSpread) {
         rejectedBecauseTooTight++;
-        if (spreadRejections.length < 5) {
-          spreadRejections.push({
-            title: market.question,
-            token: tokenId,
-            bestBid,
-            bestAsk,
-            spread: spread.toFixed(4),
-            required: minRequiredSpread.toFixed(4)
-          });
-        }
         continue;
       }
       
-      console.log(`\n✅ VALID MARKET FOUND:`);
-      console.log(`Event: ${market.question}`);
-      console.log(`Token: ${tokenId}`);
-      console.log(`Bid: ${bestBid}, Ask: ${bestAsk}, Spread: ${spread.toFixed(4)}`);
       validFound++;
-      if (validFound >= 3) break;
-
     } catch (e: any) {
       rejectedByOrderbookFetch++;
     }
@@ -168,12 +126,12 @@ async function diagnose() {
 
   console.log('\n--- Diagnosis Summary ---');
   console.log(`Total Events: ${events.length}`);
-  console.log(`Rejected (Invalid/Closed): ${rejectedByTitle}`);
+  console.log(`Rejected (Not Active): ${rejectedByActive}`);
   console.log(`Rejected (Missing Tokens): ${rejectedByTokens}`);
-  console.log(`Rejected (Liquidity not in ${config.bot.minLiquidity}-${config.bot.maxLiquidity}): ${rejectedByLiquidity}`);
   console.log(`Rejected (Orderbook Fetch Error): ${rejectedByOrderbookFetch}`);
-  console.log(`Rejected (Empty/Invalid Orderbook): ${rejectedBySpreadLogic}`);
-  console.log(`Rejected (Spread too tight < ${config.bot.spreadHalf * 2}): ${rejectedBecauseTooTight}`);
+  console.log(`Rejected (Empty Book or Invalid Spread): ${rejectedByEmptyBook}`);
+  console.log(`Rejected (Spread < ${config.bot.spreadHalf * 2}): ${rejectedBecauseTooTight}`);
+  console.log(`Valid Markets Found: ${validFound}`);
   
   if (spreadRejections.length > 0) {
     console.log('\nSample Spread Rejections (Markets where spread is too small for our bot):');
