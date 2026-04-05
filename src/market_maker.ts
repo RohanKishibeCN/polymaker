@@ -212,19 +212,22 @@ export async function runMarketMakingCycle() {
       // 挂买单 (提供底层流动性)
       if (currentInv.yes < config.bot.maxInventory) {
         try {
-          await clobClient.createAndPostOrder({
+          const res = await clobClient.createAndPostOrder({
             tokenID: tm.yesTokenId,
             price: myBidPrice,
             side: Side.BUY,
             size: size,
             feeRateBps: 0,
-            // orderType 不存在于当前版本的 @polymarket/clob-client 中
           });
-          console.log(`     [+] Placed BUY (Bid) order for ${size} YES at $${myBidPrice}`);
           
-          // 注意：这里简单假设挂单必成。真实的量化系统需要 WebSocket 监听 Fill 事件
-          // 为了防止爆仓，我们每次挂单都先给库存 +1
-          currentInv.yes += size; 
+          if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+            console.log(`     [!] Failed to place BUY order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+          } else {
+            console.log(`     [+] Placed BUY (Bid) order for ${size} YES at $${myBidPrice}`);
+            // 注意：这里简单假设挂单必成。真实的量化系统需要 WebSocket 监听 Fill 事件
+            // 为了防止爆仓，我们每次挂单都先给库存 +1
+            currentInv.yes += size; 
+          }
         } catch (e: any) {
           console.log(`     [!] Failed to place BUY order: ${e.message}`);
         }
@@ -235,17 +238,20 @@ export async function runMarketMakingCycle() {
       // 挂卖单 (提供上方流动性)
       if (currentInv.yes > -config.bot.maxInventory) {
         try {
-          await clobClient.createAndPostOrder({
+          const res = await clobClient.createAndPostOrder({
             tokenID: tm.yesTokenId,
             price: myAskPrice,
             side: Side.SELL, // 卖出 YES 份额
             size: size,
             feeRateBps: 0,
-            // orderType 不存在于当前版本的 @polymarket/clob-client 中
           });
-          console.log(`     [-] Placed SELL (Ask) order for ${size} YES at $${myAskPrice}`);
           
-          currentInv.yes -= size;
+          if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+            console.log(`     [!] Failed to place SELL order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+          } else {
+            console.log(`     [-] Placed SELL (Ask) order for ${size} YES at $${myAskPrice}`);
+            currentInv.yes -= size;
+          }
         } catch (e: any) {
           console.log(`     [!] Failed to place SELL order: ${e.message}`);
         }
