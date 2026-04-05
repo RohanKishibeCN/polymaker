@@ -34,50 +34,88 @@ const clobClient = new ClobClient(
 // 注意：VPS 重启后会清零。如果要严格风控，应该存在本地 SQLite 中
 const inventory: Record<string, { yes: number, no: number }> = {};
 
+function getValidTokenId(rawTokenId: any): string | null {
+  if (!rawTokenId) return null;
+
+  if (typeof rawTokenId === 'string' && rawTokenId.startsWith('[')) {
+    try {
+      const validJsonStr = rawTokenId.replace(/'/g, '"');
+      const parsedArray = JSON.parse(validJsonStr);
+      return parsedArray[0]; 
+    } catch (error) {
+      console.log(`Failed to parse clobTokenIds: ${rawTokenId}`);
+      return null;
+    }
+  }
+
+  if (typeof rawTokenId === 'string') {
+    return rawTokenId;
+  }
+
+  if (Array.isArray(rawTokenId) && rawTokenId.length > 0) {
+    return rawTokenId[0];
+  }
+
+  return null;
+}
+
 export async function runMarketMakingCycle() {
   console.log(`\n[${new Date().toISOString()}] =====================================`);
   console.log('[Market Maker] Starting liquidity rewards & grid cycle...');
 
   try {
-    // 1. 直接使用 /markets 端点，获取更多活跃市场以提高命中率
-    // 很多市场可能没有订单簿，我们需要获取更多的基数
-    const response = await fetch('https://gamma-api.polymarket.com/markets?closed=false&active=true&limit=1000');
-    const markets = (await response.json()) as any[];
+    // 1. 直接使用 ClobClient 获取真实的 Sampling Markets 列表
+    const marketsResponse = await clobClient.getSamplingMarkets();
+    let events = (marketsResponse as any).data || marketsResponse || [];
+    
+    if (!Array.isArray(events)) {
+      console.log("[Market Maker] Could not parse sampling markets. Trying raw fetch...");
+      const response = await fetch('https://clob.polymarket.com/sampling-markets');
+      const data = (await response.json()) as any;
+      events = data.markets || data.data || data || [];
+    }
 
     // 2. 筛选适合我们做市的冷门长尾市场
     const targetMarkets = [];
     
-    for (const market of markets) {
-      if (market.groupItemTitle === 'Invalid' || market.closed === true) continue;
-      if (!market.clobTokenIds || market.clobTokenIds.length < 2) continue;
+    for (const market of events) {
+      if (market.active !== true && market.active !== "true") continue;
 
-      const yesTokenId = market.clobTokenIds[0];
-      const noTokenId = market.clobTokenIds[1]; // 通常二元市场有 yes 和 no 两个 token
-
-      // 直接使用 Gamma API 返回的 liquidity 字段做初筛，避免频繁请求 clobClient 导致慢
-      const apiLiquidity = parseFloat(market.liquidity) || 0;
-      if (apiLiquidity < config.bot.minLiquidity || apiLiquidity > config.bot.maxLiquidity) continue;
+      const yesTokenId = getValidTokenId(market.token_id || market.condition_id);
+      if (!yesTokenId) continue;
 
       // 验证订单簿
       try {
-        // 如果 orderbook 请求太快可能会返回空数据或被 WAF 限制
-        // 我们在循环内稍微加点延迟，避免请求并发太高
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // 加点延迟避免请求并发太高
+        await new Promise(resolve => setTimeout(resolve, 50));
         
-        const orderbook = await clobClient.getOrderBook(yesTokenId);
+        // 绕过 SDK 网络层问题，直接使用原生 fetch 加上 headers 获取
+        const obResponse = await fetch(`https://clob.polymarket.com/book?token_id=${yesTokenId}`, {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0'
+          }
+        });
+        const orderbook = (await obResponse.json()) as any;
         
+        if (orderbook.error || orderbook.message) {
+          continue;
+        }
+
         // 找到了一个符合条件的冷门/中等市场
         // 获取当前的最佳买价和卖价
         const bestAsk = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].price) : 0;
         const bestBid = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].price) : 0;
 
+        // 如果连任何一方挂单都没有，不适合刚开始做市
+        if (bestAsk <= 0 || bestBid <= 0 || bestAsk <= bestBid) continue;
         // 必须有一个合理的价差才能做市 (避免价差太小我们挂不进去)
         // 并且价差必须足够大，至少容得下我们的 spreadHalf
-        if (bestAsk > 0 && bestBid > 0 && bestAsk > bestBid && (bestAsk - bestBid) >= (config.bot.spreadHalf * 2)) {
+        if ((bestAsk - bestBid) >= (config.bot.spreadHalf * 2)) {
            targetMarkets.push({
-             eventTitle: market.question, // 直接用 market 的问题做标题
+             eventTitle: market.question || market.market || "Unknown Market", 
              yesTokenId,
-             noTokenId,
+             noTokenId: "unknown", // 原生 clob markets 没有直接返回数组，暂且占位
              bestBid,
              bestAsk,
              spread: bestAsk - bestBid
@@ -141,7 +179,7 @@ export async function runMarketMakingCycle() {
             feeRateBps: 0,
             // orderType 不存在于当前版本的 @polymarket/clob-client 中
           });
-          console.log(`     [+] Placed POST_ONLY BUY (Bid) order for ${size} YES at $${myBidPrice}`);
+          console.log(`     [+] Placed BUY (Bid) order for ${size} YES at $${myBidPrice}`);
           
           // 注意：这里简单假设挂单必成。真实的量化系统需要 WebSocket 监听 Fill 事件
           // 为了防止爆仓，我们每次挂单都先给库存 +1
@@ -164,7 +202,7 @@ export async function runMarketMakingCycle() {
             feeRateBps: 0,
             // orderType 不存在于当前版本的 @polymarket/clob-client 中
           });
-          console.log(`     [-] Placed POST_ONLY SELL (Ask) order for ${size} YES at $${myAskPrice}`);
+          console.log(`     [-] Placed SELL (Ask) order for ${size} YES at $${myAskPrice}`);
           
           currentInv.yes -= size;
         } catch (e: any) {
