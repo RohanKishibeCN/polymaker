@@ -4,28 +4,73 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
 import { config } from './config';
 import { logTrade } from './notion';
-import { bootstrap } from 'global-agent';
-import fetch from 'node-fetch'; // 引入兼容代理的 node-fetch
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import fetch, { Headers, Request, Response } from 'node-fetch';
+import https from 'https';
+import nodeHttp from 'http';
 
-// 终极杀手锏：利用 global-agent 从 Node.js 最底层 (http.request/https.request) 强制接管一切网络请求
-// 无论第三方包是用什么姿势、什么版本的 axios/fetch 发请求，统统都会被强制走我们设定的商业代理
+// 终极修复：彻底清理环境变量并精确 Monkey Patch (猴子补丁) 劫持
+// 之前失败的原因是：Node.js 底层的 undici 和 axios 自动读取了 HTTPS_PROXY 环境变量，
+// 并使用了它们内置的有 Bug 的代理解析器（无法正确处理 IPRoyal 复杂的密码），从而原生地抛出了 407！
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
 if (proxyUrl) {
-  console.log(`[Market Maker] Setting global proxy via global-agent to bypass Geoblock and 407 errors...`);
+  console.log(`[Market Maker] Setting global proxy via native monkey-patch to bypass Geoblock and 407 errors...`);
   
-  // 必须配置这两个专属环境变量给 global-agent 识别
-  process.env.GLOBAL_AGENT_HTTP_PROXY = proxyUrl;
-  process.env.GLOBAL_AGENT_HTTPS_PROXY = proxyUrl;
+  const proxyAgent = new HttpsProxyAgent(proxyUrl);
   
-  // 核心：强制关闭各种三方库自带的（且通常有 Bug 的）代理处理逻辑，防止冲突
-  process.env.NO_PROXY = '*'; 
-  
-  // 启动 Node.js 级别的底层拦截
-  bootstrap();
+  // 1. 【核心杀招】删除环境变量！防止 undici 和 axios 自动读取并在底层原生抛出 407
+  // 这也会让 viem (连接 Polygon RPC) 走直连，不仅不会被 Geoblock 拦截，还能帮您大幅节省代理流量！
+  delete process.env.HTTPS_PROXY;
+  delete process.env.HTTP_PROXY;
+  delete process.env.https_proxy;
+  delete process.env.http_proxy;
+  process.env.NO_PROXY = '*';
 
-  // 接管全局 fetch (用于我们自己写的 Gamma API 请求)
+  // 2. 暴力接管全局 fetch，强制使用兼容代理的 node-fetch (用于 Gamma API)
   // @ts-ignore
-  global.fetch = fetch;
+  global.fetch = function(url: any, options: any = {}) {
+    options.agent = proxyAgent;
+    return fetch(url, options);
+  };
+  // @ts-ignore
+  global.Headers = Headers;
+  // @ts-ignore
+  global.Request = Request;
+  // @ts-ignore
+  global.Response = Response;
+
+  // 3. 暴力接管 Node.js 原生 https.request (用于 clob-client 的 axios 发单)
+  const originalHttpsRequest = https.request;
+  // @ts-ignore
+  https.request = function(...args: any[]) {
+    if (typeof args[0] === 'string' || args[0] instanceof URL) {
+      if (typeof args[1] === 'object' && args[1] !== null) {
+        args[1].agent = proxyAgent;
+      } else {
+        args.splice(1, 0, { agent: proxyAgent });
+      }
+    } else if (args[0] && typeof args[0] === 'object') {
+      args[0].agent = proxyAgent;
+    }
+    // @ts-ignore
+    return originalHttpsRequest.apply(this, args);
+  };
+
+  const originalHttpRequest = nodeHttp.request;
+  // @ts-ignore
+  nodeHttp.request = function(...args: any[]) {
+    if (typeof args[0] === 'string' || args[0] instanceof URL) {
+      if (typeof args[1] === 'object' && args[1] !== null) {
+        args[1].agent = proxyAgent;
+      } else {
+        args.splice(1, 0, { agent: proxyAgent });
+      }
+    } else if (args[0] && typeof args[0] === 'object') {
+      args[0].agent = proxyAgent;
+    }
+    // @ts-ignore
+    return originalHttpRequest.apply(this, args);
+  };
 }
 
 // Initialize Wallet & Client using viem
