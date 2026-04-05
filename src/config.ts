@@ -8,6 +8,8 @@ export const config = {
     passphrase: process.env.POLYMARKET_API_PASSPHRASE || '',
     funderAddress: process.env.POLYMARKET_FUNDER_ADDRESS || '',
     privateKey: process.env.PRIVATE_KEY || '',
+    // Polymarket 地理封锁风控需要的 geoBlockToken
+    geoBlockToken: process.env.POLYMARKET_GEOBLOCK_TOKEN || '',
   },
   notion: {
     token: process.env.NOTION_TOKEN || '',

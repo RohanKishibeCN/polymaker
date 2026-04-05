@@ -26,8 +26,9 @@ const clobClient = new ClobClient(
     secret: config.polymarket.secret,
     passphrase: config.polymarket.passphrase,
   },
-  undefined,
-  config.polymarket.funderAddress
+  undefined, // signatureType
+  config.polymarket.funderAddress,
+  config.polymarket.geoBlockToken // 添加 geoBlockToken 绕过地区限制
 );
 
 // 简单内存状态，记录我们在每个市场的持仓情况
