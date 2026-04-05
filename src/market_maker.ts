@@ -1,4 +1,4 @@
-import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
+import { ClobClient, Side, SignatureType } from '@polymarket/clob-client';
 import { createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
@@ -94,7 +94,7 @@ const clobClient = new ClobClient(
     secret: config.polymarket.secret,
     passphrase: config.polymarket.passphrase,
   },
-  undefined, // signatureType
+  SignatureType.POLY_GNOSIS_SAFE, // Polymarket 网页端生成的 API Key 必须使用这个 Gnosis Safe 签名类型，否则报 Unauthorized
   config.polymarket.funderAddress,
   config.polymarket.geoBlockToken // 添加 geoBlockToken 绕过地区限制
 );

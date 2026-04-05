@@ -3,17 +3,17 @@ dotenv.config();
 
 export const config = {
   polymarket: {
-    apiKey: process.env.POLYMARKET_API_KEY || '',
-    secret: process.env.POLYMARKET_API_SECRET || '',
-    passphrase: process.env.POLYMARKET_API_PASSPHRASE || '',
-    funderAddress: process.env.POLYMARKET_FUNDER_ADDRESS || '',
-    privateKey: process.env.PRIVATE_KEY || '',
+    apiKey: (process.env.POLYMARKET_API_KEY || '').trim(),
+    secret: (process.env.POLYMARKET_API_SECRET || '').trim(),
+    passphrase: (process.env.POLYMARKET_API_PASSPHRASE || '').trim(),
+    funderAddress: (process.env.POLYMARKET_FUNDER_ADDRESS || '').trim(),
+    privateKey: (process.env.PRIVATE_KEY || '').trim(),
     // Polymarket 地理封锁风控需要的 geoBlockToken
-    geoBlockToken: process.env.POLYMARKET_GEOBLOCK_TOKEN || '',
+    geoBlockToken: (process.env.POLYMARKET_GEOBLOCK_TOKEN || '').trim(),
   },
   notion: {
-    token: process.env.NOTION_TOKEN || '',
-    databaseId: process.env.NOTION_DATABASE_ID || '',
+    token: (process.env.NOTION_TOKEN || '').trim(),
+    databaseId: (process.env.NOTION_DATABASE_ID || '').trim(),
   },
   bot: {
     // 基础配置
