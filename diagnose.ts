@@ -90,7 +90,10 @@ async function diagnose() {
             events.push({
               question: gm.question || ge.title,
               token_id: gm.clobTokenIds,
-              active: true
+              active: true,
+              rewards: gm.clobRewards || [],
+              rewardsMinSize: gm.rewardsMinSize || 0,
+              rewardsMaxSpread: gm.rewardsMaxSpread || 0
             });
           }
         }
@@ -111,6 +114,8 @@ async function diagnose() {
   const spreadRejections: any[] = [];
   const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+  let rejectedByNoRewards = 0;
+  
   for (const market of events) {
     if (market.active !== true && market.active !== "true") {
       rejectedByActive++;
@@ -144,8 +149,11 @@ async function diagnose() {
       const bestAsk = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].price) : 0;
       const bestBid = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].price) : 0;
       const spread = bestAsk - bestBid;
-      const minRequiredSpread = config.bot.spreadHalf * 2; 
-
+      const spreadRatio = spread; // because price is 0-1, the difference is the ratio (or spread)
+      
+      // Let's check rewardsMaxSpread (usually in cents or percent, polymarket uses percent 3.5 = 0.035 or 3.5 cents)
+      const maxSpread = market.rewardsMaxSpread > 0 ? (market.rewardsMaxSpread / 100) : 0.05; // default 5%
+      
       if (bestAsk <= 0 || bestBid <= 0 || bestAsk <= bestBid) {
         rejectedByEmptyBook++;
         continue;
@@ -157,8 +165,22 @@ async function diagnose() {
         continue;
       }
 
+      if (spread > maxSpread) {
+        // Wait, if spread is larger than maxSpread, we CAN provide liquidity and earn rewards, because our quote will narrow the spread!
+        // Actually, the rewards require OUR orders to be within `rewardsMaxSpread` from the midpoint.
+        // So as long as we place orders within `midPrice +/- (rewardsMaxSpread / 2)`, we earn rewards.
+        // It doesn't mean we reject the market.
+      }
+      
+      // But we need a minimum required spread for OUR profitability:
+      const minRequiredSpread = config.bot.spreadHalf * 2; 
       if (spread < minRequiredSpread) {
         rejectedBecauseTooTight++;
+        continue;
+      }
+      
+      if (market.rewards.length === 0) {
+        rejectedByNoRewards++;
         continue;
       }
       
@@ -176,6 +198,7 @@ async function diagnose() {
   console.log(`Rejected (Empty Book or Invalid Spread): ${rejectedByEmptyBook}`);
   console.log(`Rejected (Extreme Probability <0.05 or >0.95): ${rejectedByExtremeProb}`);
   console.log(`Rejected (Spread < ${config.bot.spreadHalf * 2}): ${rejectedBecauseTooTight}`);
+  console.log(`Rejected (No Liquidity Rewards): ${rejectedByNoRewards}`);
   console.log(`Valid Markets Found: ${validFound}`);
   
   if (spreadRejections.length > 0) {

@@ -80,11 +80,16 @@ export async function runMarketMakingCycle() {
     for (const ge of gammaEvents) {
       if (ge.markets) {
         for (const gm of ge.markets) {
-          if (gm.closed === false && gm.active === true && gm.clobTokenIds && gm.clobTokenIds.length > 0) {
+          const isActive = gm.active === true || gm.active === "true";
+          const isClosed = gm.closed === true || gm.closed === "true";
+          if (!isClosed && isActive && gm.clobTokenIds) {
             events.push({
               question: gm.question || ge.title,
-              token_id: gm.clobTokenIds[0], // 传递原始数据给 getValidTokenId 处理
-              active: true
+              token_id: gm.clobTokenIds, // 传递整个字符串或数组给 getValidTokenId 处理，切勿加 [0]
+              active: true,
+              rewards: gm.clobRewards || [],
+              rewardsMinSize: gm.rewardsMinSize || 0,
+              rewardsMaxSpread: gm.rewardsMaxSpread || 0
             });
           }
         }
@@ -96,6 +101,9 @@ export async function runMarketMakingCycle() {
     
     for (const market of events) {
       if (market.active !== true && market.active !== "true") continue;
+      
+      // [LP Rewards Bot] 核心逻辑：只在官方有流动性补贴的市场做市！
+      if (market.rewards && market.rewards.length === 0) continue;
 
       const yesTokenId = getValidTokenId(market.token_id);
       if (!yesTokenId) continue;
@@ -138,7 +146,8 @@ export async function runMarketMakingCycle() {
              noTokenId: "unknown", // 原生 clob markets 没有直接返回数组，暂且占位
              bestBid,
              bestAsk,
-             spread: bestAsk - bestBid
+             spread: bestAsk - bestBid,
+             rewardsMinSize: market.rewardsMinSize || 20
            });
         }
       } catch (e) {
@@ -193,7 +202,12 @@ export async function runMarketMakingCycle() {
         continue;
       }
 
-      const size = config.bot.maxInvestment;
+      // Polymarket 最新 2026年4月流动性激励要求订单大小必须满足 rewardsMinSize (通常为20~50)
+      // 如果用户配置的 maxInvestment 过小，我们仍然执行挂单，但打印警告信息
+      const size = Math.max(config.bot.maxInvestment, 1);
+      if (size < tm.rewardsMinSize) {
+        console.log(`     [!] Warning: Order size (${size}) is less than required rewardsMinSize (${tm.rewardsMinSize}). You won't earn LP rewards.`);
+      }
 
       // 挂买单 (提供底层流动性)
       if (currentInv.yes < config.bot.maxInventory) {
