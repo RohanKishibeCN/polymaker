@@ -13,12 +13,14 @@ if (proxyUrl) {
     const parsedUrl = new URL(proxyUrl);
     console.log(`[Market Maker] Setting global proxy to bypass Geoblock...`);
     
-    const proxyOptions: any = { uri: proxyUrl };
+    // 提取纯净的代理主机地址（不带账密）
+    const cleanProxyUri = `${parsedUrl.protocol}//${parsedUrl.host}`;
+    const proxyOptions: any = { uri: cleanProxyUri };
     
-    // 如果代理链接中包含用户名和密码，undici 的 ProxyAgent 不会自动提取
-    // 必须手动将其转换为 base64 的 Basic Auth token
     if (parsedUrl.username && parsedUrl.password) {
-      const credentials = Buffer.from(`${parsedUrl.username}:${parsedUrl.password}`).toString('base64');
+      const decodedUsername = decodeURIComponent(parsedUrl.username);
+      const decodedPassword = decodeURIComponent(parsedUrl.password);
+      const credentials = Buffer.from(`${decodedUsername}:${decodedPassword}`).toString('base64');
       proxyOptions.token = `Basic ${credentials}`;
     }
     
