@@ -9,9 +9,24 @@ import { setGlobalDispatcher, ProxyAgent } from 'undici';
 // 如果环境变量中配置了 HTTP_PROXY 或 HTTPS_PROXY，强制让 Node.js 18+ 的原生 fetch 走代理
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
 if (proxyUrl) {
-  console.log(`[Market Maker] Setting global proxy to ${proxyUrl} to bypass Geoblock...`);
-  const proxyAgent = new ProxyAgent(proxyUrl);
-  setGlobalDispatcher(proxyAgent);
+  try {
+    const parsedUrl = new URL(proxyUrl);
+    console.log(`[Market Maker] Setting global proxy to bypass Geoblock...`);
+    
+    const proxyOptions: any = { uri: proxyUrl };
+    
+    // 如果代理链接中包含用户名和密码，undici 的 ProxyAgent 不会自动提取
+    // 必须手动将其转换为 base64 的 Basic Auth token
+    if (parsedUrl.username && parsedUrl.password) {
+      const credentials = Buffer.from(`${parsedUrl.username}:${parsedUrl.password}`).toString('base64');
+      proxyOptions.token = `Basic ${credentials}`;
+    }
+    
+    const proxyAgent = new ProxyAgent(proxyOptions);
+    setGlobalDispatcher(proxyAgent);
+  } catch (err) {
+    console.error(`[Market Maker] Failed to parse proxy URL: ${err}`);
+  }
 }
 
 // Initialize Wallet & Client using viem
