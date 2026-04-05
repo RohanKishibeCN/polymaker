@@ -4,6 +4,15 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
 import { config } from './config';
 import { logTrade } from './notion';
+import { setGlobalDispatcher, ProxyAgent } from 'undici';
+
+// 如果环境变量中配置了 HTTP_PROXY 或 HTTPS_PROXY，强制让 Node.js 18+ 的原生 fetch 走代理
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+if (proxyUrl) {
+  console.log(`[Market Maker] Setting global proxy to ${proxyUrl} to bypass Geoblock...`);
+  const proxyAgent = new ProxyAgent(proxyUrl);
+  setGlobalDispatcher(proxyAgent);
+}
 
 // Initialize Wallet & Client using viem
 const privateKey = config.polymarket.privateKey.startsWith('0x') 
