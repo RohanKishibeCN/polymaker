@@ -99,7 +99,10 @@ async function main() {
       'https://clob.polymarket.com',
       137,
       // @ts-ignore (viem WalletClient is supported but types might clash)
-      walletClient
+      walletClient,
+      undefined,
+      2, // SignatureType.POLY_GNOSIS_SAFE
+      process.env.POLYMARKET_FUNDER_ADDRESS?.trim()
     );
 
     // 3. 通过私钥对签名消息 (EIP-712) 派生出一组绝对匹配的 API Credentials

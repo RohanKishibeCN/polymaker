@@ -12,7 +12,7 @@ import nodeHttp from 'http';
 // 终极修复：彻底清理环境变量并精确 Monkey Patch (猴子补丁) 劫持
 // 之前失败的原因是：Node.js 底层的 undici 和 axios 自动读取了 HTTPS_PROXY 环境变量，
 // 并使用了它们内置的有 Bug 的代理解析器（无法正确处理 IPRoyal 复杂的密码），从而原生地抛出了 407！
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
 if (proxyUrl) {
   console.log(`[Market Maker] Setting global proxy via native monkey-patch to bypass Geoblock and 407 errors...`);
   
