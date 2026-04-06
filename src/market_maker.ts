@@ -273,7 +273,7 @@ export async function runMarketMakingCycle() {
       }
 
       // 挂买单 (提供底层流动性)
-      if (currentInv.yes < config.bot.maxInventory) {
+      if (currentInv.yes < config.bot.maxInventory * size) {
         try {
           const res = await clobClient.createAndPostOrder({
             tokenID: tm.yesTokenId,
@@ -282,14 +282,12 @@ export async function runMarketMakingCycle() {
             size: size,
             feeRateBps: 0,
           });
-          
+
           if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
             console.log(`     [!] Failed to place BUY order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
           } else {
             console.log(`     [+] Placed BUY (Bid) order for ${size} YES at $${myBidPrice}`);
-            // 注意：这里简单假设挂单必成。真实的量化系统需要 WebSocket 监听 Fill 事件
-            // 为了防止爆仓，我们每次挂单都先给库存 +1
-            currentInv.yes += size; 
+            // 真实环境应通过 WS 监听成交。这里仅为了测试，不累加预估库存，避免假性锁死
           }
         } catch (e: any) {
           console.log(`     [!] Failed to place BUY order: ${e.message}`);
@@ -299,27 +297,30 @@ export async function runMarketMakingCycle() {
       }
 
       // 挂卖单 (提供上方流动性)
-      if (currentInv.yes > -config.bot.maxInventory) {
+      // 修改：Polymarket 必须有持仓才能挂 SELL，或者通过挂 NO 代币的 BUY 来实现等效的 SELL
+      // 由于我们目前简化处理，仅在确实拥有多头仓位时才挂 SELL
+      // 注意：真实生产环境中，MM 机器人应该同时获取每个 token 的余额再决定是否挂单
+      if (currentInv.yes > 0) {
         try {
           const res = await clobClient.createAndPostOrder({
             tokenID: tm.yesTokenId,
             price: myAskPrice,
             side: Side.SELL, // 卖出 YES 份额
-            size: size,
+            size: Math.min(size, currentInv.yes), // 只能卖出自己拥有的库存
             feeRateBps: 0,
           });
-          
+
           if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
             console.log(`     [!] Failed to place SELL order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
           } else {
-            console.log(`     [-] Placed SELL (Ask) order for ${size} YES at $${myAskPrice}`);
-            currentInv.yes -= size;
+            console.log(`     [-] Placed SELL (Ask) order for ${Math.min(size, currentInv.yes)} YES at $${myAskPrice}`);
+            currentInv.yes -= Math.min(size, currentInv.yes);
           }
         } catch (e: any) {
           console.log(`     [!] Failed to place SELL order: ${e.message}`);
         }
       } else {
-        console.log(`     [!] Skipping SELL: Inventory heavily skewed negative.`);
+        console.log(`     [i] Skipping SELL: No inventory to sell. Waiting for BUY orders to fill first.`);
       }
 
       // Notion 记录我们的做市行为 (可选，可以只记 daily summary 免得记录太多)
