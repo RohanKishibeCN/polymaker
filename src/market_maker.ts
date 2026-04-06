@@ -95,7 +95,7 @@ const clobClient = new ClobClient(
 
 // 简单内存状态，记录我们在每个市场的持仓情况
 // 注意：VPS 重启后会清零。如果要严格风控，应该存在本地 SQLite 中
-const inventory: Record<string, { yes: number, no: number }> = {};
+const inventory: Record<string, { yes: number, no: number, avgCost?: number }> = {};
 
 function getValidTokenId(rawTokenId: any): string | null {
   if (!rawTokenId) return null;
@@ -354,7 +354,7 @@ export async function runMarketMakingCycle() {
 
       // 基本的库存风控：如果买得太多了，就不再挂买单；卖得太多了，不再挂卖单
       if (!inventory[tm.yesTokenId]) {
-        inventory[tm.yesTokenId] = { yes: 0, no: 0 };
+        inventory[tm.yesTokenId] = { yes: 0, no: 0, avgCost: 0 };
       }
       
       const currentInv = inventory[tm.yesTokenId];
