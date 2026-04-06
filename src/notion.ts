@@ -32,7 +32,7 @@ export async function logTrade(name: string, content: string) {
           rich_text: [
             {
               text: {
-                content: content,
+                content: content.substring(0, 2000), // Notion rich_text content limit
               },
             },
           ],
@@ -73,7 +73,7 @@ export async function logDailySummary(name: string, content: string) {
           rich_text: [
             {
               text: {
-                content: content,
+                content: content.substring(0, 2000), // Notion rich_text content limit
               },
             },
           ],

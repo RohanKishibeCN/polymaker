@@ -17,6 +17,8 @@ export const config = {
   },
   bot: {
     // 基础配置
+    // 初始投入资金 (用于计算盈亏)
+    initialCapital: Number(process.env.POLYMARKET_INITIAL_CAPITAL) || 70,
     // 如果没有在 .env 里设置，默认使用 25 USDC 以满足大部分市场的官方流动性奖励门槛
     maxInvestment: Number(process.env.POLYMARKET_MAX_INVESTMENT) || 25, 
     // 如果没有在 .env 里设置，默认改为每 30 分钟扫描一次，大幅节省代理流量成本

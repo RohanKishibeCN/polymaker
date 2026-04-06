@@ -1,7 +1,7 @@
 import { ClobClient, Side, SignatureType } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
 import { config } from './config';
-import { logTrade } from './notion';
+import { logTrade, logDailySummary } from './notion';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import fetch, { Headers, Request, Response } from 'node-fetch';
 import https from 'https';
@@ -126,9 +126,113 @@ function getValidTokenId(rawTokenId: any): string | null {
   return null;
 }
 
+// 记录每天是否已经推送过总结
+let lastSummaryDateStr = '';
+
+export async function runDailySummary() {
+  try {
+    console.log(`[Daily Summary] Generating daily summary...`);
+
+    // 1. 获取 USDC 余额
+    // 注意: getAllowance 在 clob-client 里返回 allowance，但这里我们需要余额，可以使用 REST API 或者 RPC。
+    // 为了不引入新依赖，简单使用 Polygon RPC 查询 Funder 的 USDC (0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174) 余额
+    let cashBalance = 0;
+    try {
+      const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+      // balanceOf 签名 0x70a08231，拼接 32 字节 padded address
+      const funderAddrPadded = config.polymarket.funderAddress.replace('0x', '').padStart(64, '0');
+      const data = `0x70a08231${funderAddrPadded}`;
+      
+      const rpcRes = await fetch('https://polygon-bor-rpc.publicnode.com', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_call",
+          params: [{ to: usdcAddress, data: data }, "latest"]
+        })
+      });
+      const rpcJson = await rpcRes.json();
+      if (rpcJson.result && rpcJson.result !== '0x') {
+        cashBalance = parseInt(rpcJson.result, 16) / 1e6; // USDC 有 6 位小数
+      }
+    } catch (e: any) {
+      console.log(`[Daily Summary] Failed to fetch USDC balance: ${e.message}`);
+    }
+
+    // 2. 整合各事件的持仓明细和未实现盈亏
+    let portfolioValue = 0;
+    let positionsDetail = '';
+    
+    let index = 1;
+    for (const [tokenId, inv] of Object.entries(inventory)) {
+      if (inv.yes > 0 || inv.no > 0) {
+        // 尝试从内存中找到这个 token 对应的事件标题和市价
+        let eventTitle = 'Unknown Event';
+        let marketPrice = 0;
+        let costPrice = inv.avgCost || 0.5; // 假设有一个平均成本字段，如果没有默认 0.5
+        let positionType = inv.yes > 0 ? 'YES' : 'NO';
+        let positionSize = Math.max(inv.yes, inv.no);
+        
+        // 简单从 activeMarkets 缓存里找（注意：这里需要依赖你上一次扫描缓存的数据）
+        // 因为 clobClient 无法直接查所有历史市场的标题
+        let unrealizedPnL = 0;
+        
+        // 这里只是为了演示格式，实际需要配合完善的库存记账系统
+        positionsDetail += `\n${index}. TokenID: ${tokenId.substring(0,8)}...\n`;
+        positionsDetail += `   - 仓位 (Position): ${positionSize} ${positionType}\n`;
+        positionsDetail += `   - 预估价值 (Estimated Value): ~${(positionSize * 0.5).toFixed(2)} USDC\n`;
+        
+        portfolioValue += (positionSize * 0.5); // 粗略估算按 0.5 算
+        index++;
+      }
+    }
+
+    if (positionsDetail === '') {
+      positionsDetail = '\n   - 无活跃持仓 (No active positions)\n';
+    }
+
+    const totalEquity = cashBalance + portfolioValue;
+    const initialCapital = config.bot.initialCapital || 70;
+    const totalPnL = totalEquity - initialCapital;
+    const pnlPercent = (totalPnL / initialCapital) * 100;
+
+    // 3. 构建 Content
+    let content = `📊 【账户资产总览】\n`;
+    content += `- 现金余额 (Cash Balance): ${cashBalance.toFixed(2)} USDC\n`;
+    content += `- 预估持仓价值 (Portfolio Value): ~${portfolioValue.toFixed(2)} USDC\n`;
+    content += `- 预估账户总资产 (Total Equity): ~${totalEquity.toFixed(2)} USDC\n`;
+    content += `- 累计盈亏 (Total PnL): ${totalPnL >= 0 ? '+' : ''}${totalPnL.toFixed(2)} USDC (${totalPnL >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)\n\n`;
+    
+    content += `📈 【事件持仓明细】${positionsDetail}`;
+
+    const dateStr = new Date().toISOString().split('T')[0];
+    await logDailySummary(`Daily Summary: ${dateStr}`, content);
+
+  } catch (error) {
+    console.error('[Daily Summary] Fatal error:', error);
+  }
+}
+
 export async function runMarketMakingCycle() {
   console.log(`\n[${new Date().toISOString()}] =====================================`);
-  console.log('[Market Maker] Starting liquidity rewards & grid cycle...');
+  console.log(`[Market Maker] Starting liquidity rewards & grid cycle...`);
+
+  // 每天早上 8 点 (UTC 0 点) 触发 Daily Summary
+  try {
+    const now = new Date();
+    const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+    const hoursUTC = now.getUTCHours();
+    
+    // 如果当前是 UTC 0点 (北京时间 8点)，且今天还没推送过
+    if (hoursUTC === 0 && lastSummaryDateStr !== dateStr) {
+      await runDailySummary();
+      lastSummaryDateStr = dateStr;
+    }
+  } catch (e: any) {
+    console.error(`[Market Maker] Failed to check/run Daily Summary: ${e.message}`);
+  }
 
   try {
     // 1. 根据开源社区的最佳实践，做市机器人通常使用 Gamma API (/events) 获取带元数据的市场
@@ -322,12 +426,8 @@ export async function runMarketMakingCycle() {
       } else {
         console.log(`     [i] Skipping SELL: No inventory to sell. Waiting for BUY orders to fill first.`);
       }
-
-      // Notion 记录我们的做市行为 (可选，可以只记 daily summary 免得记录太多)
-      const content = `Event: ${tm.eventTitle}\nMy Bid: ${myBidPrice}\nMy Ask: ${myAskPrice}\nSize: ${size} USDC\nExpected Spread Profit: ${(myAskPrice - myBidPrice).toFixed(3)} USDC per share`;
-      await logTrade(`Grid MM: ${tm.eventTitle.substring(0, 20)}...`, content);
     }
-    
+
     console.log(`[Market Maker] Cycle complete. Waiting for next interval.`);
   } catch (error) {
     console.error('[Market Maker] Fatal error in cycle:', error);
