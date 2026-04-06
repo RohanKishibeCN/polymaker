@@ -24,7 +24,7 @@ async function main() {
   }
 
   // 1. 设置代理 (接管原生 https 请求以通过 IPRoyal 的鉴权)
-  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
   if (proxyUrl) {
     console.log(`[+] Using proxy to bypass Geoblock...`);
     const proxyAgent = new HttpsProxyAgent(proxyUrl);

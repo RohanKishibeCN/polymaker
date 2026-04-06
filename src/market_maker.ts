@@ -1,7 +1,5 @@
 import { ClobClient, Side, SignatureType } from '@polymarket/clob-client';
-import { createWalletClient, http } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
-import { polygon } from 'viem/chains';
+import { Wallet } from 'ethers';
 import { config } from './config';
 import { logTrade } from './notion';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -73,22 +71,18 @@ if (proxyUrl) {
   };
 }
 
-// Initialize Wallet & Client using viem
-const privateKey = config.polymarket.privateKey.startsWith('0x') 
-  ? config.polymarket.privateKey as `0x${string}`
-  : `0x${config.polymarket.privateKey}` as `0x${string}`;
+// Initialize Wallet & Client using ethers
+const privateKey = config.polymarket.privateKey.startsWith('0x')
+  ? config.polymarket.privateKey
+  : `0x${config.polymarket.privateKey}`;
 
-const account = privateKeyToAccount(privateKey);
-const walletClient = createWalletClient({
-  account,
-  chain: polygon,
-  transport: http('https://polygon-rpc.com'),
-});
+const wallet = new Wallet(privateKey);
 
 const clobClient = new ClobClient(
   'https://clob.polymarket.com',
   137,
-  walletClient,
+  // @ts-ignore
+  wallet,
   {
     key: config.polymarket.apiKey,
     secret: config.polymarket.secret,
