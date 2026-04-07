@@ -161,32 +161,32 @@ export async function runDailySummary() {
       console.log(`[Daily Summary] Failed to fetch USDC balance: ${e.message}`);
     }
 
-    // 2. 整合各事件的持仓明细和未实现盈亏
+    // 2. 获取真实的各事件持仓明细和未实现盈亏
     let portfolioValue = 0;
     let positionsDetail = '';
     
-    let index = 1;
-    for (const [tokenId, inv] of Object.entries(inventory)) {
-      if (inv.yes > 0 || inv.no > 0) {
-        // 尝试从内存中找到这个 token 对应的事件标题和市价
-        let eventTitle = 'Unknown Event';
-        let marketPrice = 0;
-        let costPrice = inv.avgCost || 0.5; // 假设有一个平均成本字段，如果没有默认 0.5
-        let positionType = inv.yes > 0 ? 'YES' : 'NO';
-        let positionSize = Math.max(inv.yes, inv.no);
-        
-        // 简单从 activeMarkets 缓存里找（注意：这里需要依赖你上一次扫描缓存的数据）
-        // 因为 clobClient 无法直接查所有历史市场的标题
-        let unrealizedPnL = 0;
-        
-        // 这里只是为了演示格式，实际需要配合完善的库存记账系统
-        positionsDetail += `\n${index}. TokenID: ${tokenId.substring(0,8)}...\n`;
-        positionsDetail += `   - 仓位 (Position): ${positionSize} ${positionType}\n`;
-        positionsDetail += `   - 预估价值 (Estimated Value): ~${(positionSize * 0.5).toFixed(2)} USDC\n`;
-        
-        portfolioValue += (positionSize * 0.5); // 粗略估算按 0.5 算
-        index++;
+    try {
+      const positionsRes = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`);
+      const positions = await positionsRes.json();
+      
+      let index = 1;
+      if (Array.isArray(positions)) {
+        for (const pos of positions) {
+          if (pos.size > 0) {
+            positionsDetail += `\n${index}. ${pos.title}\n`;
+            positionsDetail += `   - 仓位 (Position): ${pos.size} ${pos.outcome}\n`;
+            positionsDetail += `   - 持仓成本 (Cost): $${pos.avgPrice} / 股\n`;
+            positionsDetail += `   - 当前市价 (Market): $${pos.curPrice} / 股\n`;
+            const pnlSign = pos.cashPnl >= 0 ? '+' : '';
+            positionsDetail += `   - 未实现盈亏 (Unrealized PnL): ${pnlSign}$${pos.cashPnl.toFixed(2)}\n`;
+            
+            portfolioValue += pos.currentValue;
+            index++;
+          }
+        }
       }
+    } catch (e: any) {
+      console.log(`[Daily Summary] Failed to fetch positions: ${e.message}`);
     }
 
     if (positionsDetail === '') {
@@ -215,6 +215,38 @@ export async function runDailySummary() {
   }
 }
 
+async function syncInventoryFromChain() {
+  try {
+    const res = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`);
+    const positions = await res.json();
+    
+    // 重置内存库存，避免残留脏数据
+    for (const key in inventory) {
+      inventory[key].yes = 0;
+      inventory[key].no = 0;
+      inventory[key].avgCost = 0;
+    }
+
+    if (Array.isArray(positions)) {
+      for (const pos of positions) {
+        if (!inventory[pos.asset]) {
+          inventory[pos.asset] = { yes: 0, no: 0, avgCost: 0 };
+        }
+        
+        if (pos.outcome === 'Yes' || pos.outcome === 'YES') {
+          inventory[pos.asset].yes = pos.size;
+          inventory[pos.asset].avgCost = pos.avgPrice;
+        } else if (pos.outcome === 'No' || pos.outcome === 'NO') {
+          inventory[pos.asset].no = pos.size;
+          inventory[pos.asset].avgCost = pos.avgPrice;
+        }
+      }
+    }
+  } catch (e: any) {
+    console.log(`[Market Maker] Failed to sync inventory from data-api: ${e.message}`);
+  }
+}
+
 export async function runMarketMakingCycle() {
   console.log(`\n[${new Date().toISOString()}] =====================================`);
   console.log(`[Market Maker] Starting liquidity rewards & grid cycle...`);
@@ -235,6 +267,9 @@ export async function runMarketMakingCycle() {
   }
 
   try {
+    // 0. 从链上/API 同步真实的持仓数据
+    await syncInventoryFromChain();
+
     // 1. 根据开源社区的最佳实践，做市机器人通常使用 Gamma API (/events) 获取带元数据的市场
     // 因为 /sampling-markets 或 CLOB /markets 经常包含大量早已死亡或不规范的子市场
     console.log("[Market Maker] Fetching active events from Gamma API...");
