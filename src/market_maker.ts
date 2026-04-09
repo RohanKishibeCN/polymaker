@@ -360,28 +360,40 @@ export async function runMarketMakingCycle() {
     // 为每个选定的市场挂单
     for (const tm of targetMarkets) {
       const midPrice = (tm.bestBid + tm.bestAsk) / 2;
-      
-      // 动态计算挂单价：如果买卖价差非常大（比如 bid 0.20, ask 0.80），我们需要收敛盘口
-      // 我们在中间价的上下方各挂一单
-      const myBidPrice = Number((midPrice - config.bot.spreadHalf).toFixed(2)); // 我愿意买入的价格 (低买)
-      const myAskPrice = Number((midPrice + config.bot.spreadHalf).toFixed(2)); // 我愿意卖出的价格 (高卖)
+
+      // 获取当前库存
+      if (!inventory[tm.yesTokenId]) {
+        inventory[tm.yesTokenId] = { yes: 0, no: 0, avgCost: 0 };
+      }
+      const currentInv = inventory[tm.yesTokenId];
+
+      const size = Math.max(config.bot.maxInvestment, 1);
+      const maxInvShares = config.bot.maxInventory * size; // e.g. 3 * 25 = 75
+
+      // 计算库存倾斜系数 (Inventory Skew)
+      // 计算公式: (当前库存 / 最大库存) * 最大倾斜降幅
+      // 例如：库存为 0，偏移为 0；库存为 75，偏移为 0.02 (2 美分)
+      const skewRatio = Math.min(currentInv.yes / maxInvShares, 1); // 0 到 1 之间
+      const skewAdjustment = skewRatio * config.bot.inventorySkewFactor; // 最大降幅
+
+      // 动态计算挂单价：基础网格 + 库存倾斜
+      // 我们愿意买入的价格 (低买)，库存越多，买价压得越低 (不愿接盘)
+      const myBidPrice = Number((midPrice - config.bot.spreadHalf - skewAdjustment).toFixed(2));
+      // 我们愿意卖出的价格 (高卖)，库存越多，卖价压得越低 (急于抛售)
+      const myAskPrice = Number((midPrice + config.bot.spreadHalf - skewAdjustment).toFixed(2));
 
       // 避免我们的挂单变成市价吃单 (Taker)
       if (myBidPrice >= tm.bestAsk || myAskPrice <= tm.bestBid) {
+        console.log(`\n  -> Event: ${tm.eventTitle}`);
+        console.log(`     Market Spread: Bid ${tm.bestBid} | Mid ${midPrice.toFixed(3)} | Ask ${tm.bestAsk}`);
+        console.log(`     My Quotes    : Bid ${myBidPrice} | Ask ${myAskPrice} (Skew: -${skewAdjustment.toFixed(3)})`);
         console.log(`     Skipping: Quote prices would cross the book (Taker).`);
         continue;
       }
 
-      // 基本的库存风控：如果买得太多了，就不再挂买单；卖得太多了，不再挂卖单
-      if (!inventory[tm.yesTokenId]) {
-        inventory[tm.yesTokenId] = { yes: 0, no: 0, avgCost: 0 };
-      }
-      
-      const currentInv = inventory[tm.yesTokenId];
-
       console.log(`\n  -> Event: ${tm.eventTitle}`);
       console.log(`     Market Spread: Bid ${tm.bestBid} | Mid ${midPrice.toFixed(3)} | Ask ${tm.bestAsk}`);
-      console.log(`     My Quotes    : Bid ${myBidPrice} | Ask ${myAskPrice}`);
+      console.log(`     My Quotes    : Bid ${myBidPrice} | Ask ${myAskPrice} (Skew: -${skewAdjustment.toFixed(3)})`);
 
       // 如果当前盘口的买卖价差太小，或者我的挂单价格荒谬，则跳过
       if (myBidPrice <= 0 || myAskPrice >= 1) {
@@ -390,8 +402,6 @@ export async function runMarketMakingCycle() {
       }
 
       // Polymarket 最新 2026年4月流动性激励要求订单大小必须满足 rewardsMinSize (通常为20~50)
-      // 如果用户配置的 maxInvestment 过小，我们仍然执行挂单，但打印警告信息
-      const size = Math.max(config.bot.maxInvestment, 1);
       if (size < tm.rewardsMinSize) {
         console.log(`     [!] Warning: Order size (${size}) is less than required rewardsMinSize (${tm.rewardsMinSize}). You won't earn LP rewards.`);
       }

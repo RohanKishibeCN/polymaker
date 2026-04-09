@@ -27,7 +27,8 @@ export const config = {
     // 做市策略配置 (Market Making)
     targetMarketsCount: 5, // 想要同时做市的市场数量（前期测试选 5 个冷门市场）
     spreadHalf: 0.015, // 距离中间价的单边价差。0.015 意味着 3% 的总价差，更容易挤进去
-    maxInventory: 3, // 最大单边库存容忍度
+    maxInventory: 3, // 最大单边库存容忍度 (倍数，比如 3 代表 3 * maxInvestment = 75 股)
+    inventorySkewFactor: Number(process.env.POLYMARKET_INVENTORY_SKEW_FACTOR) || 0.02, // 库存倾斜的最大降价幅度（默认 0.02 即 2 美分）
     minLiquidity: 10, // 再次放宽下限，因为官方 API 返回的 liquidity 计算方式和实际订单簿深度有差异
     maxLiquidity: 500000, // 放宽上限
   }
