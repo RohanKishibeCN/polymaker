@@ -1,6 +1,5 @@
 import { config } from './config';
-import { runMarketMakingCycle } from './market_maker';
-import { logDailySummary } from './notion';
+import { runMarketMakingCycle, runDailySummary } from './market_maker';
 
 async function main() {
   console.log('==========================================');
@@ -16,7 +15,7 @@ async function main() {
   // Schedule subsequent cycles (Re-quoting)
   setInterval(runCycle, config.bot.scanInterval);
 
-  // Daily summary at midnight
+  // Daily summary at midnight UTC (8:00 AM Beijing Time)
   scheduleDailySummary();
 }
 
@@ -32,7 +31,11 @@ function scheduleDailySummary() {
   const msUntilMidnight = nextMidnight.getTime() - now.getTime();
 
   setTimeout(async () => {
-    await logDailySummary('Daily Bot Summary', 'Bot ran successfully. No errors detected.');
+    try {
+      await runDailySummary();
+    } catch (e: any) {
+      console.error(`[Daily Summary Schedule] Error: ${e.message}`);
+    }
     // Reschedule for next day
     scheduleDailySummary();
   }, msUntilMidnight);

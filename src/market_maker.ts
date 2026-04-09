@@ -251,21 +251,6 @@ export async function runMarketMakingCycle() {
   console.log(`\n[${new Date().toISOString()}] =====================================`);
   console.log(`[Market Maker] Starting liquidity rewards & grid cycle...`);
 
-  // 每天早上 8 点 (UTC 0 点) 触发 Daily Summary
-  try {
-    const now = new Date();
-    const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
-    const hoursUTC = now.getUTCHours();
-    
-    // 如果当前是 UTC 0点 (北京时间 8点)，且今天还没推送过
-    if (hoursUTC === 0 && lastSummaryDateStr !== dateStr) {
-      await runDailySummary();
-      lastSummaryDateStr = dateStr;
-    }
-  } catch (e: any) {
-    console.error(`[Market Maker] Failed to check/run Daily Summary: ${e.message}`);
-  }
-
   try {
     // 0. 从链上/API 同步真实的持仓数据
     await syncInventoryFromChain();
