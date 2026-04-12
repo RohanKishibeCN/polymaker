@@ -5,7 +5,6 @@ import { logTrade, logDailySummary } from './notion';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import fetch, { Headers, Request, Response } from 'node-fetch';
 import https from 'https';
-import axios from 'axios';
 
 // 初始化专门用于 Polymarket 请求的代理 Agent
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
@@ -23,13 +22,23 @@ if (proxyUrl) {
   delete process.env.http_proxy;
   process.env.NO_PROXY = '*';
 
-  // [Geoblock Fix] clob-client 底层强依赖全局 axios。
-  // 虽然我们在实例化时尝试覆盖 clobClient.axiosInstance，但这可能太晚或覆盖不全（部分请求在内部直接用了全局 axios）。
-  // 因此，我们在这里显式覆盖全局 axios 的 agent，但确保不影响 node-fetch (用于 Notion) 和 viem/ethers 的 RPC 请求。
-  axios.defaults.httpsAgent = proxyAgent;
-  axios.defaults.httpAgent = proxyAgent;
-  // 必须设为 false，以禁用 axios 默认读取环境变量的 proxy 逻辑，避免与 Agent 冲突
-  axios.defaults.proxy = false; 
+  // [Geoblock Fix - Dual Package Hazard]
+  // 由于项目是 CommonJS，而 @polymarket/clob-client 是 ESM，导致内存中存在两个隔离的 axios 实例。
+  // 直接修改 `import axios from 'axios'` 无法影响到 clob-client 内部的 axios 实例。
+  // 因此，我们采用最底层、最精准的拦截：只对发往 polymarket.com 的原生 https 请求注入代理。
+  const originalHttpsRequest = https.request;
+  
+  // @ts-ignore
+  https.request = function(options: any, ...args: any[]) {
+    // 精准匹配，只有 polymarket 的 API 走代理，Notion 和 RPC 保持直连
+    if (options && options.host && typeof options.host === 'string' && options.host.includes('polymarket.com')) {
+      options.agent = proxyAgent;
+    } else if (options && options.hostname && typeof options.hostname === 'string' && options.hostname.includes('polymarket.com')) {
+      options.agent = proxyAgent;
+    }
+    // @ts-ignore
+    return originalHttpsRequest(options, ...args);
+  };
 }
 
 // Initialize Wallet & Client using ethers
