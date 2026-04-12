@@ -5,6 +5,7 @@ import { logTrade, logDailySummary } from './notion';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import fetch, { Headers, Request, Response } from 'node-fetch';
 import https from 'https';
+import axios from 'axios';
 
 // 初始化专门用于 Polymarket 请求的代理 Agent
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
@@ -21,6 +22,14 @@ if (proxyUrl) {
   delete process.env.https_proxy;
   delete process.env.http_proxy;
   process.env.NO_PROXY = '*';
+
+  // [Geoblock Fix] clob-client 底层强依赖全局 axios。
+  // 虽然我们在实例化时尝试覆盖 clobClient.axiosInstance，但这可能太晚或覆盖不全（部分请求在内部直接用了全局 axios）。
+  // 因此，我们在这里显式覆盖全局 axios 的 agent，但确保不影响 node-fetch (用于 Notion) 和 viem/ethers 的 RPC 请求。
+  axios.defaults.httpsAgent = proxyAgent;
+  axios.defaults.httpAgent = proxyAgent;
+  // 必须设为 false，以禁用 axios 默认读取环境变量的 proxy 逻辑，避免与 Agent 冲突
+  axios.defaults.proxy = false; 
 }
 
 // Initialize Wallet & Client using ethers

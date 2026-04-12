@@ -16,6 +16,7 @@
   "dependencies": {
     "@notionhq/client": "^5.16.0",
     "@polymarket/clob-client": "^5.8.1",
+    "axios": "^1.15.0",
     "dotenv": "^17.4.0",
     "ethers": "^5.7.2",
     "https-proxy-agent": "^9.0.0",
