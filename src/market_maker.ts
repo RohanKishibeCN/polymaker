@@ -5,70 +5,22 @@ import { logTrade, logDailySummary } from './notion';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import fetch, { Headers, Request, Response } from 'node-fetch';
 import https from 'https';
-import nodeHttp from 'http';
 
-// 终极修复：彻底清理环境变量并精确 Monkey Patch (猴子补丁) 劫持
-// 之前失败的原因是：Node.js 底层的 undici 和 axios 自动读取了 HTTPS_PROXY 环境变量，
-// 并使用了它们内置的有 Bug 的代理解析器（无法正确处理 IPRoyal 复杂的密码），从而原生地抛出了 407！
+// 初始化专门用于 Polymarket 请求的代理 Agent
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
+let proxyAgent: HttpsProxyAgent<string> | undefined;
+
 if (proxyUrl) {
-  console.log(`[Market Maker] Setting global proxy via native monkey-patch to bypass Geoblock and 407 errors...`);
+  console.log(`[Market Maker] Initializing targeted proxy agent for Polymarket requests...`);
+  proxyAgent = new HttpsProxyAgent(proxyUrl);
   
-  const proxyAgent = new HttpsProxyAgent(proxyUrl);
-  
-  // 1. 【核心杀招】删除环境变量！防止 undici 和 axios 自动读取并在底层原生抛出 407
-  // 这也会让 viem (连接 Polygon RPC) 走直连，不仅不会被 Geoblock 拦截，还能帮您大幅节省代理流量！
+  // 核心杀招：删除环境变量，防止 undici/axios 自动读取并在底层报错。
+  // 同时解放了后续 Notion 和 RPC 请求，让它们默认走直连，大幅节省代理流量！
   delete process.env.HTTPS_PROXY;
   delete process.env.HTTP_PROXY;
   delete process.env.https_proxy;
   delete process.env.http_proxy;
   process.env.NO_PROXY = '*';
-
-  // 2. 暴力接管全局 fetch，强制使用兼容代理的 node-fetch (用于 Gamma API)
-  // @ts-ignore
-  global.fetch = function(url: any, options: any = {}) {
-    options.agent = proxyAgent;
-    return fetch(url, options);
-  };
-  // @ts-ignore
-  global.Headers = Headers;
-  // @ts-ignore
-  global.Request = Request;
-  // @ts-ignore
-  global.Response = Response;
-
-  // 3. 暴力接管 Node.js 原生 https.request (用于 clob-client 的 axios 发单)
-  const originalHttpsRequest = https.request;
-  // @ts-ignore
-  https.request = function(...args: any[]) {
-    if (typeof args[0] === 'string' || args[0] instanceof URL) {
-      if (typeof args[1] === 'object' && args[1] !== null) {
-        args[1].agent = proxyAgent;
-      } else {
-        args.splice(1, 0, { agent: proxyAgent });
-      }
-    } else if (args[0] && typeof args[0] === 'object') {
-      args[0].agent = proxyAgent;
-    }
-    // @ts-ignore
-    return originalHttpsRequest.apply(this, args);
-  };
-
-  const originalHttpRequest = nodeHttp.request;
-  // @ts-ignore
-  nodeHttp.request = function(...args: any[]) {
-    if (typeof args[0] === 'string' || args[0] instanceof URL) {
-      if (typeof args[1] === 'object' && args[1] !== null) {
-        args[1].agent = proxyAgent;
-      } else {
-        args.splice(1, 0, { agent: proxyAgent });
-      }
-    } else if (args[0] && typeof args[0] === 'object') {
-      args[0].agent = proxyAgent;
-    }
-    // @ts-ignore
-    return originalHttpRequest.apply(this, args);
-  };
 }
 
 // Initialize Wallet & Client using ethers
@@ -77,6 +29,9 @@ const privateKey = config.polymarket.privateKey.startsWith('0x')
   : `0x${config.polymarket.privateKey}`;
 
 const wallet = new Wallet(privateKey);
+
+// 定制化的 axios httpsAgent，供 clob-client 内部使用
+const axiosHttpsAgent = proxyAgent ? proxyAgent : new https.Agent();
 
 const clobClient = new ClobClient(
   'https://clob.polymarket.com',
@@ -90,8 +45,15 @@ const clobClient = new ClobClient(
   },
   SignatureType.POLY_GNOSIS_SAFE, // Polymarket 网页端生成的 API Key 必须使用这个 Gnosis Safe 签名类型，否则报 Unauthorized
   config.polymarket.funderAddress,
-  config.polymarket.geoBlockToken // 添加 geoBlockToken 绕过地区限制
+  config.polymarket.geoBlockToken // 添加 geoBlockToken (可选) 绕过地区限制
 );
+
+// 覆盖 clobClient 内部的 axios 实例配置，让其走代理
+// @ts-ignore
+if (clobClient.axiosInstance) {
+  // @ts-ignore
+  clobClient.axiosInstance.defaults.httpsAgent = axiosHttpsAgent;
+}
 
 // 简单内存状态，记录我们在每个市场的持仓情况
 // 注意：VPS 重启后会清零。如果要严格风控，应该存在本地 SQLite 中
@@ -185,7 +147,9 @@ export async function runDailySummary() {
     let positionsDetail = '';
     
     try {
-      const positionsRes = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`);
+      const positionsRes = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`, {
+        agent: proxyAgent
+      });
       const positions = await positionsRes.json();
       
       let index = 1;
@@ -236,7 +200,9 @@ export async function runDailySummary() {
 
 async function syncInventoryFromChain() {
   try {
-    const res = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`);
+    const res = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`, {
+      agent: proxyAgent
+    });
     const positions = await res.json();
     
     // 重置内存库存，避免残留脏数据
@@ -277,7 +243,9 @@ export async function runMarketMakingCycle() {
     // 1. 根据开源社区的最佳实践，做市机器人通常使用 Gamma API (/events) 获取带元数据的市场
     // 因为 /sampling-markets 或 CLOB /markets 经常包含大量早已死亡或不规范的子市场
     console.log("[Market Maker] Fetching active events from Gamma API...");
-    const response = await fetch('https://gamma-api.polymarket.com/events?closed=false&active=true&limit=100');
+    const response = await fetch('https://gamma-api.polymarket.com/events?closed=false&active=true&limit=100', {
+      agent: proxyAgent
+    });
     const gammaData = (await response.json()) as any;
     const gammaEvents = Array.isArray(gammaData) ? gammaData : gammaData.data || [];
     
@@ -321,6 +289,7 @@ export async function runMarketMakingCycle() {
         
         // 绕过 SDK 网络层问题，直接使用原生 fetch 加上 headers 获取
         const obResponse = await fetch(`https://clob.polymarket.com/book?token_id=${yesTokenId}`, {
+          agent: proxyAgent,
           headers: {
             'Accept': 'application/json',
             'User-Agent': 'Mozilla/5.0'

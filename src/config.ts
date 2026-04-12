@@ -36,9 +36,14 @@ export const config = {
 
 // Validate config
 const missingKeys = Object.entries(config.polymarket)
-  .filter(([_, value]) => !value)
+  .filter(([key, value]) => key !== 'geoBlockToken' && !value) // geoBlockToken is optional when using a proxy
   .map(([key]) => `polymarket.${key}`);
 
 if (missingKeys.length > 0) {
-  console.warn(`Missing Polymarket config keys: ${missingKeys.join(', ')}`);
+  console.warn(`[Warning] Missing Polymarket config keys: ${missingKeys.join(', ')}`);
+}
+
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
+if (!proxyUrl) {
+  console.warn(`[Warning] No HTTP/HTTPS proxy configured. You might encounter Geo-block errors on VPS.`);
 }
