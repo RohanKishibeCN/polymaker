@@ -143,19 +143,38 @@ export async function runDailySummary() {
       const funderAddrPadded = config.polymarket.funderAddress.replace('0x', '').padStart(64, '0');
       const data = `0x70a08231${funderAddrPadded}`;
       
-      const rpcRes = await fetch('https://polygon-bor-rpc.publicnode.com', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "eth_call",
-          params: [{ to: usdcAddress, data: data }, "latest"]
-        })
-      });
-      const rpcJson = await rpcRes.json();
-      if (rpcJson.result && rpcJson.result !== '0x') {
-        cashBalance = parseInt(rpcJson.result, 16) / 1e6; // USDC 有 6 位小数
+      const rpcs = [
+        'https://polygon-bor-rpc.publicnode.com',
+        'https://polygon-rpc.com',
+        'https://rpc.ankr.com/polygon'
+      ];
+      
+      let balanceFetched = false;
+      for (const rpc of rpcs) {
+        try {
+          const rpcRes = await fetch(rpc, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "eth_call",
+              params: [{ to: usdcAddress, data: data }, "latest"]
+            })
+          });
+          const rpcJson = await rpcRes.json();
+          if (rpcJson.result && rpcJson.result !== '0x') {
+            cashBalance = parseInt(rpcJson.result, 16) / 1e6; // USDC 有 6 位小数
+            balanceFetched = true;
+            break; // 成功获取，退出重试循环
+          }
+        } catch (rpcError: any) {
+          console.log(`[Daily Summary] RPC ${rpc} failed: ${rpcError.message}. Trying next...`);
+        }
+      }
+      
+      if (!balanceFetched) {
+        console.log(`[Daily Summary] All RPCs failed to fetch USDC balance.`);
       }
     } catch (e: any) {
       console.log(`[Daily Summary] Failed to fetch USDC balance: ${e.message}`);

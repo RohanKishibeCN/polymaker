@@ -9,18 +9,21 @@ async function main() {
   console.log(` Target Markets: ${config.bot.targetMarketsCount}`);
   console.log('==========================================');
 
-  // Run the first market making cycle immediately
-  await runCycle();
-
-  // Schedule subsequent cycles (Re-quoting)
-  setInterval(runCycle, config.bot.scanInterval);
+  // Run the first market making cycle immediately and recursively schedule subsequent cycles
+  await runCycleLoop();
 
   // Daily summary at midnight UTC (8:00 AM Beijing Time)
   scheduleDailySummary();
 }
 
-async function runCycle() {
-  await runMarketMakingCycle();
+async function runCycleLoop() {
+  try {
+    await runMarketMakingCycle();
+  } catch (e: any) {
+    console.error(`[Market Maker] Cycle error: ${e.message}`);
+  }
+  // Schedule next cycle only after the current one completes
+  setTimeout(runCycleLoop, config.bot.scanInterval);
 }
 
 function scheduleDailySummary() {
