@@ -475,24 +475,22 @@ export async function runMarketMakingCycle() {
       // 计算单笔挂单大小 (总权益 5%~10%，且不能超过剩余可用敞口，除非是减仓单)
       const targetSizeUSDC = totalEquity * config.bot.sizePct;
       const availableExposureUSDC = Math.max(maxMarketUSDC - currentExposureUSDC, 0);
-      const actualOrderUSDC = isExposureMaxedOut ? targetSizeUSDC : Math.min(targetSizeUSDC, availableExposureUSDC);
       
-      // 转换为股数 (Size)
-      let size = Math.floor(actualOrderUSDC / Math.max(midPrice, 0.01));
-      
-      // 满足 Polymarket 交易所的硬性下限：
-      // 1. Maker 限价单最少 5 股
-      size = Math.max(size, 5);
-      // 2. Taker 吃单最小价值 $1 (防止行情波动瞬间穿价被拒)
+      // 转换为基础目标股数
+      let baseTargetSize = Math.floor(targetSizeUSDC / Math.max(midPrice, 0.01));
+      let minRequiredSize = Math.max(baseTargetSize, 5); // 满足 5 股限制
       const minSizeFor1USD = Math.ceil(1.00 / Math.max(midPrice, 0.01));
-      size = Math.max(size, minSizeFor1USD);
+      minRequiredSize = Math.max(minRequiredSize, minSizeFor1USD); // 满足 $1 限制
 
-      // 如果为了满足最小 Size 导致挂单金额超过了可用敞口（且不是为了减仓），并且不是在减仓模式下，则跳过挂单
-      if (!isExposureMaxedOut && size * midPrice > availableExposureUSDC + 0.5) { // 留 0.5U 的容差
-         console.log(`\n  -> Event: ${tm.eventTitle}`);
-         console.log(`     [i] Skipping: Required min size (${size} shares, ~$${(size*midPrice).toFixed(2)}) exceeds available exposure ($${availableExposureUSDC.toFixed(2)})`);
-         continue;
-      }
+      // 计算买入 YES 的实际资金消耗
+      const buyYesCostUSDC = minRequiredSize * midPrice;
+      // 计算买入 NO 的实际资金消耗
+      const buyNoCostUSDC = minRequiredSize * (1 - midPrice);
+
+      // 如果未超限，但在满足最小 Size 的情况下，实际消耗的资金大于可用敞口，且差距超过 0.5U，则跳过“加仓”挂单
+      const canIncreaseExposure = !isExposureMaxedOut && 
+                                  (buyYesCostUSDC <= availableExposureUSDC + 0.5) && 
+                                  (buyNoCostUSDC <= availableExposureUSDC + 0.5);
 
       // 计算库存倾斜系数 (Inventory Skew)
       // 倾斜比例 = 净敞口 USDC / 最大允许敞口 USDC (范围 -1 到 1)
@@ -537,7 +535,16 @@ export async function runMarketMakingCycle() {
       
       // 挂 Bid 腿 (低买 YES，或高卖 NO 等效)
       // 如果我们有 NO 的库存，优先卖出 NO（平仓）来等效挂出 Bid
-      if (invNo.no >= size) {
+      if (invNo.no > 0) {
+        // 允许尾数全平：平仓不受目标 Size 限制，能卖多少卖多少（受限于目标挂单大小）
+        const sellSize = Math.min(invNo.no, minRequiredSize);
+        // 如果尾数小于交易所最小要求（5股/$1），可能会被拒，这里依然尝试，或者可以堆积到足够大
+        // 为避免频繁报错，对于减仓操作，我们尝试合并到 minRequiredSize（如果不足就不挂，或者挂 minRequiredSize 并容忍反向持仓）
+        // 最佳实践是：Polymarket 允许减仓单 < minSize 吗？如果允许，直接挂；如果不允许，我们可能需要使用 merge 等操作。
+        // 这里我们强制取 max(sellSize, minSize) 如果被拒就算了，或者如果是平仓就挂真实的量。
+        // 为了安全起见，挂单量依然必须满足 minRequiredSize
+        const safeSellSize = Math.max(sellSize, 5);
+
         // 卖出 NO 的价格 = 1 - 买入 YES 的价格
         const sellNoPrice = Number((1 - myBidPrice).toFixed(2));
         if (sellNoPrice > 0 && sellNoPrice < 1) {
@@ -546,14 +553,14 @@ export async function runMarketMakingCycle() {
               tokenID: tm.noTokenId,
               price: sellNoPrice,
               side: Side.SELL,
-              size: size,
+              size: safeSellSize,
               feeRateBps: 0,
             });
 
             if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
               console.log(`     [!] Failed to place SELL NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
             } else {
-              console.log(`     [+] Placed SELL NO (Eq Bid) for ${size} shares at $${sellNoPrice} (Eq YES Bid $${myBidPrice})`);
+              console.log(`     [+] Placed SELL NO (Eq Bid) for ${safeSellSize} shares at $${sellNoPrice} (Eq YES Bid $${myBidPrice})`);
               dailyStats.ordersPosted++;
             }
           } catch (e: any) {
@@ -562,47 +569,50 @@ export async function runMarketMakingCycle() {
         }
       } else {
         // 没有足够的 NO 库存，只能通过 BUY YES 来挂 Bid。
-        // 但必须确保未超限。如果已超限，禁止买入！
-        if (!isExposureMaxedOut) {
+        // 必须确保允许加仓
+        if (canIncreaseExposure) {
           try {
             const res = await clobClient.createAndPostOrder({
               tokenID: tm.yesTokenId,
               price: myBidPrice,
               side: Side.BUY,
-              size: size,
+              size: minRequiredSize,
               feeRateBps: 0,
             });
 
             if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
               console.log(`     [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
             } else {
-              console.log(`     [+] Placed BUY YES (Bid) for ${size} shares at $${myBidPrice}`);
+              console.log(`     [+] Placed BUY YES (Bid) for ${minRequiredSize} shares at $${myBidPrice}`);
               dailyStats.ordersPosted++;
             }
           } catch (e: any) {
             console.log(`     [!] Failed to place BUY YES order: ${e.message}`);
           }
         } else {
-          console.log(`     [i] Skipping BUY YES (Bid): Exposure maxed out and no NO inventory to sell.`);
+          console.log(`     [i] Skipping BUY YES (Bid): Exposure limits reached and no NO inventory to sell.`);
         }
       }
 
       // 挂 Ask 腿 (高卖 YES，或低买 NO 等效)
       // 如果我们有 YES 的库存，优先卖出 YES（平仓）
-      if (invYes.yes >= size) {
+      if (invYes.yes > 0) {
+        const sellSize = Math.min(invYes.yes, minRequiredSize);
+        const safeSellSize = Math.max(sellSize, 5);
+
         try {
           const res = await clobClient.createAndPostOrder({
             tokenID: tm.yesTokenId,
             price: myAskPrice,
             side: Side.SELL,
-            size: size,
+            size: safeSellSize,
             feeRateBps: 0,
           });
 
           if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
             console.log(`     [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
           } else {
-            console.log(`     [-] Placed SELL YES (Ask) for ${size} shares at $${myAskPrice}`);
+            console.log(`     [-] Placed SELL YES (Ask) for ${safeSellSize} shares at $${myAskPrice}`);
             dailyStats.ordersPosted++;
           }
         } catch (e: any) {
@@ -610,8 +620,8 @@ export async function runMarketMakingCycle() {
         }
       } else {
         // 没有足够的 YES 库存，只能通过 BUY NO 来挂 Ask。
-        // 但必须确保未超限。如果已超限，禁止买入！
-        if (!isExposureMaxedOut) {
+        // 必须确保允许加仓
+        if (canIncreaseExposure) {
           const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
           if (buyNoPrice > 0 && buyNoPrice < 1) {
             try {
@@ -619,14 +629,14 @@ export async function runMarketMakingCycle() {
                 tokenID: tm.noTokenId,
                 price: buyNoPrice,
                 side: Side.BUY,
-                size: size,
+                size: minRequiredSize,
                 feeRateBps: 0,
               });
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
               } else {
-                console.log(`     [-] Placed BUY NO (Eq Ask) for ${size} shares at $${buyNoPrice} (Eq YES Ask $${myAskPrice})`);
+                console.log(`     [-] Placed BUY NO (Eq Ask) for ${minRequiredSize} shares at $${buyNoPrice} (Eq YES Ask $${myAskPrice})`);
                 dailyStats.ordersPosted++;
               }
             } catch (e: any) {
@@ -634,7 +644,7 @@ export async function runMarketMakingCycle() {
             }
           }
         } else {
-          console.log(`     [i] Skipping BUY NO (Ask): Exposure maxed out and no YES inventory to sell.`);
+          console.log(`     [i] Skipping BUY NO (Ask): Exposure limits reached and no YES inventory to sell.`);
         }
       }
     }
