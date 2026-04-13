@@ -465,16 +465,17 @@ export async function runMarketMakingCycle() {
       
       // 检查当前市场的资金占用是否超限 (总权益 15%)
       const maxMarketUSDC = totalEquity * config.bot.maxMarketPct;
+      let isExposureMaxedOut = false;
       if (currentExposureUSDC >= maxMarketUSDC) {
         console.log(`\n  -> Event: ${tm.eventTitle}`);
-        console.log(`     [!] Exposure Maxed Out: ${currentExposureUSDC.toFixed(2)} USDC >= Limit ${maxMarketUSDC.toFixed(2)} USDC`);
-        continue;
+        console.log(`     [!] Exposure Maxed Out: ${currentExposureUSDC.toFixed(2)} USDC >= Limit ${maxMarketUSDC.toFixed(2)} USDC. Will only place reducing orders.`);
+        isExposureMaxedOut = true;
       }
 
-      // 计算单笔挂单大小 (总权益 5%~10%，且不能超过剩余可用敞口)
+      // 计算单笔挂单大小 (总权益 5%~10%，且不能超过剩余可用敞口，除非是减仓单)
       const targetSizeUSDC = totalEquity * config.bot.sizePct;
-      const availableExposureUSDC = maxMarketUSDC - currentExposureUSDC;
-      const actualOrderUSDC = Math.min(targetSizeUSDC, availableExposureUSDC);
+      const availableExposureUSDC = Math.max(maxMarketUSDC - currentExposureUSDC, 0);
+      const actualOrderUSDC = isExposureMaxedOut ? targetSizeUSDC : Math.min(targetSizeUSDC, availableExposureUSDC);
       
       // 转换为股数 (Size)
       // 注意: size 必须是整数，且至少为 1
@@ -523,8 +524,9 @@ export async function runMarketMakingCycle() {
 
       // === 4. 执行挂单 (双腿解封) ===
       // 挂 Bid 腿 (买入 YES)
-      // 条件: 只要还没达到最大正向敞口，就可以买入 YES
-      if (currentNetYes >= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / midPrice)) {
+      // 条件: 只要还没达到最大正向敞口，或者是净做空状态需要买回，就可以买入 YES
+      const canBuyYes = !isExposureMaxedOut || currentNetYes < 0;
+      if (canBuyYes && (currentNetYes >= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / midPrice) || currentNetYes < 0)) {
         try {
           const res = await clobClient.createAndPostOrder({
             tokenID: tm.yesTokenId,
@@ -546,8 +548,9 @@ export async function runMarketMakingCycle() {
       }
 
       // 挂 Ask 腿 (卖出 YES，如果不足则 买入 NO)
-      // 条件: 只要还没达到最大负向敞口，就可以提供 Ask
-      if (currentNetYes <= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / (1 - midPrice))) {
+      // 条件: 只要还没达到最大负向敞口，或者是净多头状态需要卖出，就可以提供 Ask
+      const canSellYes = !isExposureMaxedOut || currentNetYes > 0;
+      if (canSellYes && (currentNetYes <= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / (1 - midPrice)) || currentNetYes > 0)) {
         if (invYes.yes >= size) {
           // 有足够的 YES 库存，直接挂 SELL YES
           try {
