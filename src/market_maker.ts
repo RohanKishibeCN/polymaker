@@ -478,10 +478,21 @@ export async function runMarketMakingCycle() {
       const actualOrderUSDC = isExposureMaxedOut ? targetSizeUSDC : Math.min(targetSizeUSDC, availableExposureUSDC);
       
       // 转换为股数 (Size)
-      // 注意: size 必须是整数，且至少为 1
-      // Polymarket 上，买入 YES 成本约等于 midPrice * size，买入 NO 成本约等于 (1 - midPrice) * size
-      // 为了简单，我们统一按 0.5 估算，或者直接按 midPrice 估算
-      const size = Math.max(Math.floor(actualOrderUSDC / Math.max(midPrice, 0.01)), 1);
+      let size = Math.floor(actualOrderUSDC / Math.max(midPrice, 0.01));
+      
+      // 满足 Polymarket 交易所的硬性下限：
+      // 1. Maker 限价单最少 5 股
+      size = Math.max(size, 5);
+      // 2. Taker 吃单最小价值 $1 (防止行情波动瞬间穿价被拒)
+      const minSizeFor1USD = Math.ceil(1.00 / Math.max(midPrice, 0.01));
+      size = Math.max(size, minSizeFor1USD);
+
+      // 如果为了满足最小 Size 导致挂单金额超过了可用敞口（且不是为了减仓），并且不是在减仓模式下，则跳过挂单
+      if (!isExposureMaxedOut && size * midPrice > availableExposureUSDC + 0.5) { // 留 0.5U 的容差
+         console.log(`\n  -> Event: ${tm.eventTitle}`);
+         console.log(`     [i] Skipping: Required min size (${size} shares, ~$${(size*midPrice).toFixed(2)}) exceeds available exposure ($${availableExposureUSDC.toFixed(2)})`);
+         continue;
+      }
 
       // 计算库存倾斜系数 (Inventory Skew)
       // 倾斜比例 = 净敞口 USDC / 最大允许敞口 USDC (范围 -1 到 1)
