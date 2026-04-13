@@ -85,33 +85,35 @@
 *   **资金效率**：现金占比、资金占用在各市场的分布
 
 ### 2. Notion 记录模板（方案 A：仅更新 Content 文本）
-Notion 写入目前只有 `Content` 一个长文本字段，且会被截断到 2000 字符以内，因此每日总结需要使用固定模板，并对持仓明细做压缩。
+Notion 写入目前只有 `Content` 一个长文本字段，且会被截断到 2000 字符以内，因此每日总结使用紧凑文本模板。
 
-#### Content 模板（建议）
+#### Content 模板（已实现）
 ```
-📊 ACCOUNT
-equity=82.30 cash=11.55 pos_value=70.75 pnl_total=+12.30 pnl_total_pct=+17.57% dd_day=...
+📊 [ACCOUNT]
+Equity: ~82.30 USDC | Cash: 11.55 USDC
+PnL: +12.30 USDC (+17.57%) | MaxDD: N/A
 
-🧾 FLOW
-fills_buy=... fills_sell=... only_buy=... only_sell=...
-orders_posted=... orders_canceled=...
+🔄 [FLOW]
+Orders Posted: 15 | Canceled: 3
+Fills Buy/Sell: N/A
 
-🧮 INVENTORY
-net_yes_equiv=... cash_pct=... max_mkt_alloc_pct=...
-inv_age_avg_min=... inv_age_max_min=...
+📦 [INVENTORY]
+Max Pos %: 14.50% | Circuit Breaks: 2
+Avg Spread: ±0.025
 
-🛡 RISK
-snapshot_fuse_triggers=... skip_quote_count=... cancel_all_count=...
+⚠️ [RISK]
+(No manual alerts)
 
-📈 POSITIONS_TOP5
-1) <event> side=YES qty=... avg=... mkt=... uPnL=...
-2) ...
+📈 [POSITIONS_TOP5]
+1. [Trump wins 2024...] - 25 YES (Eq ~12.50 USDC) - PnL: +1.25
+2. [MicroStrategy...] - 10 NO (Eq ~4.50 USDC) - PnL: -0.50
+... and 2 other smaller positions
 ```
 
 #### 压缩规则（必须遵守，避免超过 2000 字符）
-*   只保留 Top 5 持仓（按资金占用或未实现亏损绝对值排序），其余用 `others_count=... others_pos_value=...` 汇总。
-*   数字尽量使用短键名与定点小数（例如 2 位），事件标题超长时截断为 50 字符以内。
-*   如果当日有重要风控触发（例如快照级熔断），优先保留 `RISK` 区块，必要时减少持仓展示行数（Top 3）。
+*   只保留 Top 5 持仓（按 Absolute Exposure 资金占用绝对值倒序排列）。
+*   事件标题超长时自动截断为 40 字符以内。
+*   超出 Top 5 的持仓进行数量汇总，不再展示明细。
 
 ### 3. 第一轮迭代的达标条件（满足则进入扩容或下一轮）
 *   连续 7 天运行无致命错误
