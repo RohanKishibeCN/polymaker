@@ -522,66 +522,92 @@ export async function runMarketMakingCycle() {
         continue;
       }
 
-      // === 4. 执行挂单 (双腿解封) ===
-      // 挂 Bid 腿 (买入 YES)
-      // 条件: 只要还没达到最大正向敞口，或者是净做空状态需要买回，就可以买入 YES
-      const canBuyYes = !isExposureMaxedOut || currentNetYes < 0;
-      if (canBuyYes && (currentNetYes >= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / midPrice) || currentNetYes < 0)) {
-        try {
-          const res = await clobClient.createAndPostOrder({
-            tokenID: tm.yesTokenId,
-            price: myBidPrice,
-            side: Side.BUY,
-            size: size,
-            feeRateBps: 0,
-          });
-
-          if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-            console.log(`     [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
-          } else {
-            console.log(`     [+] Placed BUY YES (Bid) for ${size} shares at $${myBidPrice}`);
-            dailyStats.ordersPosted++;
-          }
-        } catch (e: any) {
-          console.log(`     [!] Failed to place BUY YES order: ${e.message}`);
-        }
-      }
-
-      // 挂 Ask 腿 (卖出 YES，如果不足则 买入 NO)
-      // 条件: 只要还没达到最大负向敞口，或者是净多头状态需要卖出，就可以提供 Ask
-      const canSellYes = !isExposureMaxedOut || currentNetYes > 0;
-      if (canSellYes && (currentNetYes <= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / (1 - midPrice)) || currentNetYes > 0)) {
-        if (invYes.yes >= size) {
-          // 有足够的 YES 库存，直接挂 SELL YES
+      // === 4. 执行挂单 (基于真实库存流转) ===
+      
+      // 挂 Bid 腿 (低买 YES，或高卖 NO 等效)
+      // 如果我们有 NO 的库存，优先卖出 NO（平仓）来等效挂出 Bid
+      if (invNo.no >= size) {
+        // 卖出 NO 的价格 = 1 - 买入 YES 的价格
+        const sellNoPrice = Number((1 - myBidPrice).toFixed(2));
+        if (sellNoPrice > 0 && sellNoPrice < 1) {
           try {
             const res = await clobClient.createAndPostOrder({
-              tokenID: tm.yesTokenId,
-              price: myAskPrice,
+              tokenID: tm.noTokenId,
+              price: sellNoPrice,
               side: Side.SELL,
               size: size,
               feeRateBps: 0,
             });
 
             if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-              console.log(`     [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+              console.log(`     [!] Failed to place SELL NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
             } else {
-              console.log(`     [-] Placed SELL YES (Ask) for ${size} shares at $${myAskPrice}`);
+              console.log(`     [+] Placed SELL NO (Eq Bid) for ${size} shares at $${sellNoPrice} (Eq YES Bid $${myBidPrice})`);
               dailyStats.ordersPosted++;
             }
           } catch (e: any) {
-            console.log(`     [!] Failed to place SELL YES order: ${e.message}`);
+            console.log(`     [!] Failed to place SELL NO order: ${e.message}`);
+          }
+        }
+      } else {
+        // 没有足够的 NO 库存，只能通过 BUY YES 来挂 Bid。
+        // 但必须确保未超限。如果已超限，禁止买入！
+        if (!isExposureMaxedOut) {
+          try {
+            const res = await clobClient.createAndPostOrder({
+              tokenID: tm.yesTokenId,
+              price: myBidPrice,
+              side: Side.BUY,
+              size: size,
+              feeRateBps: 0,
+            });
+
+            if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+              console.log(`     [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+            } else {
+              console.log(`     [+] Placed BUY YES (Bid) for ${size} shares at $${myBidPrice}`);
+              dailyStats.ordersPosted++;
+            }
+          } catch (e: any) {
+            console.log(`     [!] Failed to place BUY YES order: ${e.message}`);
           }
         } else {
-          // 没有足够的 YES 库存，启用最小双腿：通过 BUY NO 提供等效的 Ask
-          // 等效价格: 买入 NO 的价格 = 1 - 卖出 YES 的价格
+          console.log(`     [i] Skipping BUY YES (Bid): Exposure maxed out and no NO inventory to sell.`);
+        }
+      }
+
+      // 挂 Ask 腿 (高卖 YES，或低买 NO 等效)
+      // 如果我们有 YES 的库存，优先卖出 YES（平仓）
+      if (invYes.yes >= size) {
+        try {
+          const res = await clobClient.createAndPostOrder({
+            tokenID: tm.yesTokenId,
+            price: myAskPrice,
+            side: Side.SELL,
+            size: size,
+            feeRateBps: 0,
+          });
+
+          if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+            console.log(`     [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+          } else {
+            console.log(`     [-] Placed SELL YES (Ask) for ${size} shares at $${myAskPrice}`);
+            dailyStats.ordersPosted++;
+          }
+        } catch (e: any) {
+          console.log(`     [!] Failed to place SELL YES order: ${e.message}`);
+        }
+      } else {
+        // 没有足够的 YES 库存，只能通过 BUY NO 来挂 Ask。
+        // 但必须确保未超限。如果已超限，禁止买入！
+        if (!isExposureMaxedOut) {
           const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
-          
           if (buyNoPrice > 0 && buyNoPrice < 1) {
             try {
               const res = await clobClient.createAndPostOrder({
                 tokenID: tm.noTokenId,
                 price: buyNoPrice,
-                side: Side.BUY, // 买入 NO 相当于卖出 YES
+                side: Side.BUY,
                 size: size,
                 feeRateBps: 0,
               });
@@ -596,6 +622,8 @@ export async function runMarketMakingCycle() {
               console.log(`     [!] Failed to place BUY NO order: ${e.message}`);
             }
           }
+        } else {
+          console.log(`     [i] Skipping BUY NO (Ask): Exposure maxed out and no YES inventory to sell.`);
         }
       }
     }
