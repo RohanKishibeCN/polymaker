@@ -19,15 +19,18 @@ export const config = {
     // 基础配置
     // 初始投入资金 (用于计算盈亏)
     initialCapital: Number(process.env.POLYMARKET_INITIAL_CAPITAL) || 70,
-    // 如果没有在 .env 里设置，默认使用 25 USDC 以满足大部分市场的官方流动性奖励门槛
-    maxInvestment: Number(process.env.POLYMARKET_MAX_INVESTMENT) || 25, 
+    // 【第一轮迭代】资金比例 Size
+    sizePct: Number(process.env.POLYMARKET_SIZE_PCT) || 0.05, // 每次挂单金额占总权益比例（5%）
+    maxMarketPct: Number(process.env.POLYMARKET_MAX_MARKET_PCT) || 0.15, // 单市场占用资金上限（15%）
+    
     // 如果没有在 .env 里设置，默认改为每 30 分钟扫描一次，大幅节省代理流量成本
     scanInterval: 1000 * 60 * (Number(process.env.POLYMARKET_SCAN_INTERVAL_MINUTES) || 30), 
 
     // 做市策略配置 (Market Making)
-    targetMarketsCount: 5, // 想要同时做市的市场数量（前期测试选 5 个冷门市场）
-    spreadHalf: 0.015, // 距离中间价的单边价差。0.015 意味着 3% 的总价差，更容易挤进去
-    maxInventory: 3, // 最大单边库存容忍度 (倍数，比如 3 代表 3 * maxInvestment = 75 股)
+    targetMarketsCount: 5, // 想要同时做市的市场数量
+    // 【第一轮迭代】极低频宽价差防守
+    spreadHalfBase: 0.02, // 保守基准半价差 (总价差 4%)
+    spreadHalfMax: 0.06, // 最大允许半价差
     inventorySkewFactor: Number(process.env.POLYMARKET_INVENTORY_SKEW_FACTOR) || 0.02, // 库存倾斜的最大降价幅度（默认 0.02 即 2 美分）
     minLiquidity: 10, // 再次放宽下限，因为官方 API 返回的 liquidity 计算方式和实际订单簿深度有差异
     maxLiquidity: 500000, // 放宽上限

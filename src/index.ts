@@ -5,8 +5,8 @@ async function main() {
   console.log('==========================================');
   console.log(' Polymarket Market Maker & LP Rewards Bot');
   console.log(` Scan Interval: ${config.bot.scanInterval / 1000}s`);
-  console.log(` Max Investment: ${config.bot.maxInvestment} USDC`);
   console.log(` Target Markets: ${config.bot.targetMarketsCount}`);
+  console.log(` Size Pct: ${config.bot.sizePct * 100}%, Max Market Pct: ${config.bot.maxMarketPct * 100}%`);
   console.log('==========================================');
 
   // Run the first market making cycle immediately and recursively schedule subsequent cycles

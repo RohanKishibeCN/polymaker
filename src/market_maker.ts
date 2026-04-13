@@ -77,30 +77,38 @@ if (clobClient.axiosInstance) {
 // 注意：VPS 重启后会清零。如果要严格风控，应该存在本地 SQLite 中
 const inventory: Record<string, { yes: number, no: number, avgCost?: number }> = {};
 
-function getValidTokenId(rawTokenId: any): string | null {
+// 快照级熔断所需：记录上一次扫描的中间价
+const lastMidPrices: Record<string, number> = {};
+
+// Notion 总结需要的数据
+let dailyStats = {
+  fillsBuy: 0,
+  fillsSell: 0,
+  ordersPosted: 0,
+  ordersCanceled: 0,
+  circuitBreakTriggers: 0,
+  maxPositionPctEquity: 0,
+  avgSpreadHalfUsed: 0,
+  spreadHalfUsedCount: 0,
+};
+
+function getValidTokenIds(rawTokenId: any): [string, string] | null {
   if (!rawTokenId) return null;
 
   if (typeof rawTokenId === 'string' && rawTokenId.startsWith('[')) {
     try {
-      // API 有时返回的真的是只有一个字符 '[' 的异常字符串
       if (rawTokenId === '[') return null;
 
       const validJsonStr = rawTokenId.replace(/'/g, '"');
       const parsedArray = JSON.parse(validJsonStr);
-      return Array.isArray(parsedArray) && parsedArray.length > 0 ? parsedArray[0] : null; 
+      return Array.isArray(parsedArray) && parsedArray.length >= 2 ? [parsedArray[0], parsedArray[1]] : null; 
     } catch (error) {
-      // 避免因为单个市场的脏数据刷屏日志
-      // console.log(`Failed to parse clobTokenIds: ${rawTokenId}`);
       return null;
     }
   }
 
-  if (typeof rawTokenId === 'string') {
-    return rawTokenId;
-  }
-
-  if (Array.isArray(rawTokenId) && rawTokenId.length > 0) {
-    return rawTokenId[0];
+  if (Array.isArray(rawTokenId) && rawTokenId.length >= 2) {
+    return [rawTokenId[0], rawTokenId[1]];
   }
 
   return null;
@@ -109,56 +117,51 @@ function getValidTokenId(rawTokenId: any): string | null {
 // 记录每天是否已经推送过总结
 let lastSummaryDateStr = '';
 
+// 获取 USDC 余额辅助函数
+async function getCashBalance(): Promise<number> {
+  try {
+    const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+    const funderAddrPadded = config.polymarket.funderAddress.replace('0x', '').padStart(64, '0');
+    const data = `0x70a08231${funderAddrPadded}`;
+    
+    const rpcs = [
+      'https://polygon-bor-rpc.publicnode.com',
+      'https://polygon-rpc.com',
+      'https://rpc.ankr.com/polygon'
+    ];
+    
+    for (const rpc of rpcs) {
+      try {
+        const rpcRes = await fetch(rpc, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_call",
+            params: [{ to: usdcAddress, data: data }, "latest"]
+          })
+        });
+        const rpcData = await rpcRes.json();
+        if (rpcData && rpcData.result) {
+          return parseInt(rpcData.result, 16) / 1e6;
+        }
+      } catch (e) {
+        // try next RPC
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to get cash balance");
+  }
+  return 0;
+}
+
 export async function runDailySummary() {
   try {
     console.log(`[Daily Summary] Generating daily summary...`);
 
     // 1. 获取 USDC 余额
-    // 注意: getAllowance 在 clob-client 里返回 allowance，但这里我们需要余额，可以使用 REST API 或者 RPC。
-    // 为了不引入新依赖，简单使用 Polygon RPC 查询 Funder 的 USDC (0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174) 余额
-    let cashBalance = 0;
-    try {
-      const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-      // balanceOf 签名 0x70a08231，拼接 32 字节 padded address
-      const funderAddrPadded = config.polymarket.funderAddress.replace('0x', '').padStart(64, '0');
-      const data = `0x70a08231${funderAddrPadded}`;
-      
-      const rpcs = [
-        'https://polygon-bor-rpc.publicnode.com',
-        'https://polygon-rpc.com',
-        'https://rpc.ankr.com/polygon'
-      ];
-      
-      let balanceFetched = false;
-      for (const rpc of rpcs) {
-        try {
-          const rpcRes = await fetch(rpc, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              jsonrpc: "2.0",
-              id: 1,
-              method: "eth_call",
-              params: [{ to: usdcAddress, data: data }, "latest"]
-            })
-          });
-          const rpcJson = await rpcRes.json();
-          if (rpcJson.result && rpcJson.result !== '0x') {
-            cashBalance = parseInt(rpcJson.result, 16) / 1e6; // USDC 有 6 位小数
-            balanceFetched = true;
-            break; // 成功获取，退出重试循环
-          }
-        } catch (rpcError: any) {
-          console.log(`[Daily Summary] RPC ${rpc} failed: ${rpcError.message}. Trying next...`);
-        }
-      }
-      
-      if (!balanceFetched) {
-        console.log(`[Daily Summary] All RPCs failed to fetch USDC balance.`);
-      }
-    } catch (e: any) {
-      console.log(`[Daily Summary] Failed to fetch USDC balance: ${e.message}`);
-    }
+    let cashBalance = await getCashBalance();
 
     // 2. 获取真实的各事件持仓明细和未实现盈亏
     let portfolioValue = 0;
@@ -172,18 +175,29 @@ export async function runDailySummary() {
       
       let index = 1;
       if (Array.isArray(positions)) {
-        for (const pos of positions) {
-          if (pos.size > 0) {
-            positionsDetail += `\n${index}. ${pos.title}\n`;
-            positionsDetail += `   - 仓位 (Position): ${pos.size} ${pos.outcome}\n`;
-            positionsDetail += `   - 持仓成本 (Cost): $${pos.avgPrice} / 股\n`;
-            positionsDetail += `   - 当前市价 (Market): $${pos.curPrice} / 股\n`;
-            const pnlSign = pos.cashPnl >= 0 ? '+' : '';
-            positionsDetail += `   - 未实现盈亏 (Unrealized PnL): ${pnlSign}$${pos.cashPnl.toFixed(2)}\n`;
-            
-            portfolioValue += pos.currentValue;
-            index++;
+        // Sort positions by currentValue (absolute exposure) descending to get Top 5
+        const activePositions = positions.filter(p => parseFloat(p.size) > 0);
+        activePositions.sort((a, b) => (parseFloat(b.currentValue) || 0) - (parseFloat(a.currentValue) || 0));
+        
+        for (const pos of activePositions) {
+          const size = parseFloat(pos.size) || 0;
+          const curPrice = parseFloat(pos.currentPrice) || 0;
+          const cashPnl = parseFloat(pos.cashPnl) || 0;
+          const currentValue = parseFloat(pos.currentValue) || 0;
+          
+          portfolioValue += currentValue;
+          
+          if (index <= 5) {
+            // Truncate title to save Notion chars
+            const shortTitle = pos.title ? pos.title.substring(0, 40) + (pos.title.length > 40 ? '...' : '') : 'Unknown';
+            const pnlSign = cashPnl >= 0 ? '+' : '';
+            positionsDetail += `${index}. [${shortTitle}] - ${size} ${pos.outcome} (Eq ~${currentValue.toFixed(2)} USDC) - PnL: ${pnlSign}${cashPnl.toFixed(2)}\n`;
           }
+          index++;
+        }
+        
+        if (activePositions.length > 5) {
+          positionsDetail += `... and ${activePositions.length - 5} other smaller positions\n`;
         }
       }
     } catch (e: any) {
@@ -191,7 +205,7 @@ export async function runDailySummary() {
     }
 
     if (positionsDetail === '') {
-      positionsDetail = '\n   - 无活跃持仓 (No active positions)\n';
+      positionsDetail = 'No active positions\n';
     }
 
     const totalEquity = cashBalance + portfolioValue;
@@ -199,24 +213,46 @@ export async function runDailySummary() {
     const totalPnL = totalEquity - initialCapital;
     const pnlPercent = (totalPnL / initialCapital) * 100;
 
-    // 3. 构建 Content
-    let content = `📊 【账户资产总览】\n`;
-    content += `- 现金余额 (Cash Balance): ${cashBalance.toFixed(2)} USDC\n`;
-    content += `- 预估持仓价值 (Portfolio Value): ~${portfolioValue.toFixed(2)} USDC\n`;
-    content += `- 预估账户总资产 (Total Equity): ~${totalEquity.toFixed(2)} USDC\n`;
-    content += `- 累计盈亏 (Total PnL): ${totalPnL >= 0 ? '+' : ''}${totalPnL.toFixed(2)} USDC (${totalPnL >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)\n\n`;
+    // 3. 构建 Content (Notion Scheme A)
+    let content = `📊 [ACCOUNT]\n`;
+    content += `Equity: ~${totalEquity.toFixed(2)} USDC | Cash: ${cashBalance.toFixed(2)} USDC\n`;
+    content += `PnL: ${totalPnL >= 0 ? '+' : ''}${totalPnL.toFixed(2)} USDC (${totalPnL >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%) | MaxDD: N/A\n\n`;
     
-    content += `📈 【事件持仓明细】${positionsDetail}`;
+    content += `🔄 [FLOW]\n`;
+    content += `Orders Posted: ${dailyStats.ordersPosted} | Canceled: ${dailyStats.ordersCanceled}\n`;
+    content += `Fills Buy/Sell: N/A\n\n`; // TODO: Implement fill tracking if possible
+    
+    content += `📦 [INVENTORY]\n`;
+    content += `Max Pos %: ${(dailyStats.maxPositionPctEquity * 100).toFixed(2)}% | Circuit Breaks: ${dailyStats.circuitBreakTriggers}\n`;
+    content += `Avg Spread: ±${dailyStats.avgSpreadHalfUsed.toFixed(3)}\n\n`;
+    
+    content += `⚠️ [RISK]\n`;
+    content += `(No manual alerts)\n\n`;
+
+    content += `📈 [POSITIONS_TOP5]\n${positionsDetail}`;
 
     const dateStr = new Date().toISOString().split('T')[0];
     await logDailySummary(`Daily Summary: ${dateStr}`, content);
+    
+    // Reset daily stats after summary
+    dailyStats = {
+      fillsBuy: 0,
+      fillsSell: 0,
+      ordersPosted: 0,
+      ordersCanceled: 0,
+      circuitBreakTriggers: 0,
+      maxPositionPctEquity: 0,
+      avgSpreadHalfUsed: 0,
+      spreadHalfUsedCount: 0,
+    };
 
   } catch (error) {
     console.error('[Daily Summary] Fatal error:', error);
   }
 }
 
-async function syncInventoryFromChain() {
+async function syncInventoryFromChain(): Promise<number> {
+  let portfolioValue = 0;
   try {
     const res = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`, {
       agent: proxyAgent
@@ -236,18 +272,25 @@ async function syncInventoryFromChain() {
           inventory[pos.asset] = { yes: 0, no: 0, avgCost: 0 };
         }
         
+        const size = parseFloat(pos.size) || 0;
+        const avgPrice = parseFloat(pos.avgPrice) || 0;
+        const currentPrice = parseFloat(pos.currentPrice) || avgPrice;
+        
+        portfolioValue += size * currentPrice;
+
         if (pos.outcome === 'Yes' || pos.outcome === 'YES') {
-          inventory[pos.asset].yes = pos.size;
-          inventory[pos.asset].avgCost = pos.avgPrice;
+          inventory[pos.asset].yes = size;
+          inventory[pos.asset].avgCost = avgPrice;
         } else if (pos.outcome === 'No' || pos.outcome === 'NO') {
-          inventory[pos.asset].no = pos.size;
-          inventory[pos.asset].avgCost = pos.avgPrice;
+          inventory[pos.asset].no = size;
+          inventory[pos.asset].avgCost = avgPrice;
         }
       }
     }
   } catch (e: any) {
     console.log(`[Market Maker] Failed to sync inventory from data-api: ${e.message}`);
   }
+  return portfolioValue;
 }
 
 export async function runMarketMakingCycle() {
@@ -256,7 +299,10 @@ export async function runMarketMakingCycle() {
 
   try {
     // 0. 从链上/API 同步真实的持仓数据
-    await syncInventoryFromChain();
+    const portfolioValue = await syncInventoryFromChain();
+    const cashBalance = await getCashBalance();
+    const totalEquity = Math.max(cashBalance + portfolioValue, config.bot.initialCapital); // 保底，避免获取失败导致 size=0
+    console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} USDC`);
 
     // 1. 根据开源社区的最佳实践，做市机器人通常使用 Gamma API (/events) 获取带元数据的市场
     // 因为 /sampling-markets 或 CLOB /markets 经常包含大量早已死亡或不规范的子市场
@@ -297,8 +343,9 @@ export async function runMarketMakingCycle() {
       // [LP Rewards Bot] 核心逻辑：只在官方有流动性补贴的市场做市！
       if (market.rewards && market.rewards.length === 0) continue;
 
-      const yesTokenId = getValidTokenId(market.token_id);
-      if (!yesTokenId) continue;
+      const yesTokenIds = getValidTokenIds(market.token_id);
+      if (!yesTokenIds) continue;
+      const [yesTokenId, noTokenId] = yesTokenIds;
 
       // 验证订单簿
       try {
@@ -323,6 +370,8 @@ export async function runMarketMakingCycle() {
         // 获取当前的最佳买价和卖价
         const bestAsk = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].price) : 0;
         const bestBid = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].price) : 0;
+        const askSizeTop = orderbook.asks && orderbook.asks.length > 0 ? parseFloat(orderbook.asks[0].size) : 0;
+        const bidSizeTop = orderbook.bids && orderbook.bids.length > 0 ? parseFloat(orderbook.bids[0].size) : 0;
 
         // 如果连任何一方挂单都没有，或者倒挂，不适合刚开始做市
         if (bestAsk <= 0 || bestBid <= 0 || bestAsk <= bestBid) continue;
@@ -332,13 +381,15 @@ export async function runMarketMakingCycle() {
 
         // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单)
         // 并且价差必须足够大，至少容得下我们的 spreadHalf
-        if ((bestAsk - bestBid) >= (config.bot.spreadHalf * 2)) {
+        if ((bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
            targetMarkets.push({
              eventTitle: market.question || market.market || "Unknown Market", 
              yesTokenId,
-             noTokenId: "unknown", // 原生 clob markets 没有直接返回数组，暂且占位
+             noTokenId,
              bestBid,
              bestAsk,
+             bidSizeTop,
+             askSizeTop,
              spread: bestAsk - bestBid,
              rewardsMinSize: market.rewardsMinSize || 20
            });
@@ -355,10 +406,14 @@ export async function runMarketMakingCycle() {
     console.log(`[Market Maker] Selected ${targetMarkets.length} target markets for liquidity provision.`);
 
     // 3. 开始撤单与重挂 (Re-quoting)
-    // 撤销之前所有市场遗留的挂单 (以免被单边打穿)
     console.log(`[Market Maker] Canceling old orders to avoid stale quotes...`);
     try {
-      await clobClient.cancelAll(); 
+      const canceled = await clobClient.cancelAll();
+      if (canceled && canceled.length) {
+        dailyStats.ordersCanceled += canceled.length;
+      } else {
+        dailyStats.ordersCanceled++; // Just an approximation if length is not available
+      }
     } catch (e) {
       console.log(`[Market Maker] No old orders to cancel or error canceling.`);
     }
@@ -367,53 +422,109 @@ export async function runMarketMakingCycle() {
     for (const tm of targetMarkets) {
       const midPrice = (tm.bestBid + tm.bestAsk) / 2;
 
-      // 获取当前库存
-      if (!inventory[tm.yesTokenId]) {
-        inventory[tm.yesTokenId] = { yes: 0, no: 0, avgCost: 0 };
+      // === 1. 快照级事后熔断 (Circuit Breaker) ===
+      const lastMid = lastMidPrices[tm.yesTokenId];
+      if (lastMid !== undefined) {
+        const jump = Math.abs(midPrice - lastMid);
+        if (jump >= 0.10) {
+          console.log(`\n  -> Event: ${tm.eventTitle}`);
+          console.log(`     [!] Circuit Breaker: Price jumped by ${jump.toFixed(3)} (Last: ${lastMid.toFixed(3)}, Current: ${midPrice.toFixed(3)})`);
+          console.log(`     [!] Skipping market for this cycle.`);
+          dailyStats.circuitBreakTriggers++;
+          lastMidPrices[tm.yesTokenId] = midPrice; // Update for next cycle
+          continue;
+        }
       }
-      const currentInv = inventory[tm.yesTokenId];
+      
+      // 极端区间过滤
+      if (midPrice <= 0.10 || midPrice >= 0.90) {
+        console.log(`\n  -> Event: ${tm.eventTitle}`);
+        console.log(`     [!] Circuit Breaker: Price ${midPrice.toFixed(3)} in extreme bounds. Skipping.`);
+        dailyStats.circuitBreakTriggers++;
+        lastMidPrices[tm.yesTokenId] = midPrice;
+        continue;
+      }
+      
+      lastMidPrices[tm.yesTokenId] = midPrice;
 
-      const size = Math.max(config.bot.maxInvestment, 1);
-      const maxInvShares = config.bot.maxInventory * size; // e.g. 3 * 25 = 75
+      // === 2. 资金比例与库存上限计算 ===
+      // 获取当前库存 (YES 腿和 NO 腿)
+      const invYes = inventory[tm.yesTokenId] || { yes: 0, no: 0 };
+      const invNo = inventory[tm.noTokenId] || { yes: 0, no: 0 };
+      
+      // 净方向风险敞口 (YES 等效股数)
+      // 持有 YES 代表多头 (+)，持有 NO 代表空头 (等效卖出 YES, -)
+      const currentNetYes = invYes.yes - invNo.no;
+      const currentExposureUSDC = Math.abs(currentNetYes) * (currentNetYes > 0 ? midPrice : (1 - midPrice));
+      
+      // 更新单日最大仓位占比统计
+      const currentPctEquity = totalEquity > 0 ? currentExposureUSDC / totalEquity : 0;
+      if (currentPctEquity > dailyStats.maxPositionPctEquity) {
+        dailyStats.maxPositionPctEquity = currentPctEquity;
+      }
+      
+      // 检查当前市场的资金占用是否超限 (总权益 15%)
+      const maxMarketUSDC = totalEquity * config.bot.maxMarketPct;
+      if (currentExposureUSDC >= maxMarketUSDC) {
+        console.log(`\n  -> Event: ${tm.eventTitle}`);
+        console.log(`     [!] Exposure Maxed Out: ${currentExposureUSDC.toFixed(2)} USDC >= Limit ${maxMarketUSDC.toFixed(2)} USDC`);
+        continue;
+      }
+
+      // 计算单笔挂单大小 (总权益 5%~10%，且不能超过剩余可用敞口)
+      const targetSizeUSDC = totalEquity * config.bot.sizePct;
+      const availableExposureUSDC = maxMarketUSDC - currentExposureUSDC;
+      const actualOrderUSDC = Math.min(targetSizeUSDC, availableExposureUSDC);
+      
+      // 转换为股数 (Size)
+      // 注意: size 必须是整数，且至少为 1
+      // Polymarket 上，买入 YES 成本约等于 midPrice * size，买入 NO 成本约等于 (1 - midPrice) * size
+      // 为了简单，我们统一按 0.5 估算，或者直接按 midPrice 估算
+      const size = Math.max(Math.floor(actualOrderUSDC / Math.max(midPrice, 0.01)), 1);
 
       // 计算库存倾斜系数 (Inventory Skew)
-      // 计算公式: (当前库存 / 最大库存) * 最大倾斜降幅
-      // 例如：库存为 0，偏移为 0；库存为 75，偏移为 0.02 (2 美分)
-      const skewRatio = Math.min(currentInv.yes / maxInvShares, 1); // 0 到 1 之间
+      // 倾斜比例 = 净敞口 USDC / 最大允许敞口 USDC (范围 -1 到 1)
+      const skewRatio = Math.max(-1, Math.min(currentExposureUSDC / maxMarketUSDC, 1)) * (currentNetYes > 0 ? 1 : -1);
       const skewAdjustment = skewRatio * config.bot.inventorySkewFactor; // 最大降幅
 
+      // === 3. 极低频宽价差防守 ===
+      let dynamicSpreadHalf = config.bot.spreadHalfBase;
+      // 惩罚机制：盘口原生价差大，或顶层深度极低，加宽价差
+      if (tm.spread > 0.06) dynamicSpreadHalf += 0.01;
+      if (tm.bidSizeTop < 50 || tm.askSizeTop < 50) dynamicSpreadHalf += 0.01;
+      
+      // 钳制价差范围
+      dynamicSpreadHalf = Math.max(config.bot.spreadHalfBase, Math.min(dynamicSpreadHalf, config.bot.spreadHalfMax));
+
+      // 记录统计
+      dailyStats.avgSpreadHalfUsed = (dailyStats.avgSpreadHalfUsed * dailyStats.spreadHalfUsedCount + dynamicSpreadHalf) / (dailyStats.spreadHalfUsedCount + 1);
+      dailyStats.spreadHalfUsedCount++;
+
       // 动态计算挂单价：基础网格 + 库存倾斜
-      // 我们愿意买入的价格 (低买)，库存越多，买价压得越低 (不愿接盘)
-      const myBidPrice = Number((midPrice - config.bot.spreadHalf - skewAdjustment).toFixed(2));
-      // 我们愿意卖出的价格 (高卖)，库存越多，卖价压得越低 (急于抛售)
-      const myAskPrice = Number((midPrice + config.bot.spreadHalf - skewAdjustment).toFixed(2));
+      const myBidPrice = Number((midPrice - dynamicSpreadHalf - skewAdjustment).toFixed(2));
+      const myAskPrice = Number((midPrice + dynamicSpreadHalf - skewAdjustment).toFixed(2));
 
       // 避免我们的挂单变成市价吃单 (Taker)
       if (myBidPrice >= tm.bestAsk || myAskPrice <= tm.bestBid) {
         console.log(`\n  -> Event: ${tm.eventTitle}`);
-        console.log(`     Market Spread: Bid ${tm.bestBid} | Mid ${midPrice.toFixed(3)} | Ask ${tm.bestAsk}`);
-        console.log(`     My Quotes    : Bid ${myBidPrice} | Ask ${myAskPrice} (Skew: -${skewAdjustment.toFixed(3)})`);
         console.log(`     Skipping: Quote prices would cross the book (Taker).`);
         continue;
       }
 
       console.log(`\n  -> Event: ${tm.eventTitle}`);
       console.log(`     Market Spread: Bid ${tm.bestBid} | Mid ${midPrice.toFixed(3)} | Ask ${tm.bestAsk}`);
-      console.log(`     My Quotes    : Bid ${myBidPrice} | Ask ${myAskPrice} (Skew: -${skewAdjustment.toFixed(3)})`);
+      console.log(`     My Quotes    : Bid ${myBidPrice} | Ask ${myAskPrice} (Spread: ±${dynamicSpreadHalf.toFixed(3)}, Skew: -${skewAdjustment.toFixed(3)})`);
+      console.log(`     Net Exposure : ${currentNetYes} YES eq (~${currentExposureUSDC.toFixed(2)} USDC)`);
 
-      // 如果当前盘口的买卖价差太小，或者我的挂单价格荒谬，则跳过
       if (myBidPrice <= 0 || myAskPrice >= 1) {
         console.log(`     Skipping: Quote prices out of valid bounds.`);
         continue;
       }
 
-      // Polymarket 最新 2026年4月流动性激励要求订单大小必须满足 rewardsMinSize (通常为20~50)
-      if (size < tm.rewardsMinSize) {
-        console.log(`     [!] Warning: Order size (${size}) is less than required rewardsMinSize (${tm.rewardsMinSize}). You won't earn LP rewards.`);
-      }
-
-      // 挂买单 (提供底层流动性)
-      if (currentInv.yes < config.bot.maxInventory * size) {
+      // === 4. 执行挂单 (双腿解封) ===
+      // 挂 Bid 腿 (买入 YES)
+      // 条件: 只要还没达到最大正向敞口，就可以买入 YES
+      if (currentNetYes >= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / midPrice)) {
         try {
           const res = await clobClient.createAndPostOrder({
             tokenID: tm.yesTokenId,
@@ -424,43 +535,65 @@ export async function runMarketMakingCycle() {
           });
 
           if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-            console.log(`     [!] Failed to place BUY order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+            console.log(`     [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
           } else {
-            console.log(`     [+] Placed BUY (Bid) order for ${size} YES at $${myBidPrice}`);
-            // 真实环境应通过 WS 监听成交。这里仅为了测试，不累加预估库存，避免假性锁死
+            console.log(`     [+] Placed BUY YES (Bid) for ${size} shares at $${myBidPrice}`);
+            dailyStats.ordersPosted++;
           }
         } catch (e: any) {
-          console.log(`     [!] Failed to place BUY order: ${e.message}`);
+          console.log(`     [!] Failed to place BUY YES order: ${e.message}`);
         }
-      } else {
-        console.log(`     [!] Skipping BUY: Inventory maxed out (${currentInv.yes})`);
       }
 
-      // 挂卖单 (提供上方流动性)
-      // 修改：Polymarket 必须有持仓才能挂 SELL，或者通过挂 NO 代币的 BUY 来实现等效的 SELL
-      // 由于我们目前简化处理，仅在确实拥有多头仓位时才挂 SELL
-      // 注意：真实生产环境中，MM 机器人应该同时获取每个 token 的余额再决定是否挂单
-      if (currentInv.yes > 0) {
-        try {
-          const res = await clobClient.createAndPostOrder({
-            tokenID: tm.yesTokenId,
-            price: myAskPrice,
-            side: Side.SELL, // 卖出 YES 份额
-            size: Math.min(size, currentInv.yes), // 只能卖出自己拥有的库存
-            feeRateBps: 0,
-          });
+      // 挂 Ask 腿 (卖出 YES，如果不足则 买入 NO)
+      // 条件: 只要还没达到最大负向敞口，就可以提供 Ask
+      if (currentNetYes <= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / (1 - midPrice))) {
+        if (invYes.yes >= size) {
+          // 有足够的 YES 库存，直接挂 SELL YES
+          try {
+            const res = await clobClient.createAndPostOrder({
+              tokenID: tm.yesTokenId,
+              price: myAskPrice,
+              side: Side.SELL,
+              size: size,
+              feeRateBps: 0,
+            });
 
-          if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-            console.log(`     [!] Failed to place SELL order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
-          } else {
-            console.log(`     [-] Placed SELL (Ask) order for ${Math.min(size, currentInv.yes)} YES at $${myAskPrice}`);
-            currentInv.yes -= Math.min(size, currentInv.yes);
+            if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+              console.log(`     [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+            } else {
+              console.log(`     [-] Placed SELL YES (Ask) for ${size} shares at $${myAskPrice}`);
+              dailyStats.ordersPosted++;
+            }
+          } catch (e: any) {
+            console.log(`     [!] Failed to place SELL YES order: ${e.message}`);
           }
-        } catch (e: any) {
-          console.log(`     [!] Failed to place SELL order: ${e.message}`);
+        } else {
+          // 没有足够的 YES 库存，启用最小双腿：通过 BUY NO 提供等效的 Ask
+          // 等效价格: 买入 NO 的价格 = 1 - 卖出 YES 的价格
+          const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
+          
+          if (buyNoPrice > 0 && buyNoPrice < 1) {
+            try {
+              const res = await clobClient.createAndPostOrder({
+                tokenID: tm.noTokenId,
+                price: buyNoPrice,
+                side: Side.BUY, // 买入 NO 相当于卖出 YES
+                size: size,
+                feeRateBps: 0,
+              });
+
+              if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+                console.log(`     [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+              } else {
+                console.log(`     [-] Placed BUY NO (Eq Ask) for ${size} shares at $${buyNoPrice} (Eq YES Ask $${myAskPrice})`);
+                dailyStats.ordersPosted++;
+              }
+            } catch (e: any) {
+              console.log(`     [!] Failed to place BUY NO order: ${e.message}`);
+            }
+          }
         }
-      } else {
-        console.log(`     [i] Skipping SELL: No inventory to sell. Waiting for BUY orders to fill first.`);
       }
     }
 
