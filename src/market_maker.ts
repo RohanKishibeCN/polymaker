@@ -465,6 +465,7 @@ export async function runMarketMakingCycle() {
       
       // 检查当前市场的资金占用是否超限 (总权益 15%)
       const maxMarketUSDC = totalEquity * config.bot.maxMarketPct;
+<<<<<<< HEAD
       let isExposureMaxedOut = false;
       if (currentExposureUSDC >= maxMarketUSDC) {
         console.log(`\n  -> Event: ${tm.eventTitle}`);
@@ -491,6 +492,24 @@ export async function runMarketMakingCycle() {
       const canIncreaseExposure = !isExposureMaxedOut && 
                                   (buyYesCostUSDC <= availableExposureUSDC + 0.5) && 
                                   (buyNoCostUSDC <= availableExposureUSDC + 0.5);
+=======
+      if (currentExposureUSDC >= maxMarketUSDC) {
+        console.log(`\n  -> Event: ${tm.eventTitle}`);
+        console.log(`     [!] Exposure Maxed Out: ${currentExposureUSDC.toFixed(2)} USDC >= Limit ${maxMarketUSDC.toFixed(2)} USDC`);
+        continue;
+      }
+
+      // 计算单笔挂单大小 (总权益 5%~10%，且不能超过剩余可用敞口)
+      const targetSizeUSDC = totalEquity * config.bot.sizePct;
+      const availableExposureUSDC = maxMarketUSDC - currentExposureUSDC;
+      const actualOrderUSDC = Math.min(targetSizeUSDC, availableExposureUSDC);
+      
+      // 转换为股数 (Size)
+      // 注意: size 必须是整数，且至少为 1
+      // Polymarket 上，买入 YES 成本约等于 midPrice * size，买入 NO 成本约等于 (1 - midPrice) * size
+      // 为了简单，我们统一按 0.5 估算，或者直接按 midPrice 估算
+      const size = Math.max(Math.floor(actualOrderUSDC / Math.max(midPrice, 0.01)), 1);
+>>>>>>> trae/solo-agent-Nzw2DQ
 
       // 计算库存倾斜系数 (Inventory Skew)
       // 倾斜比例 = 净敞口 USDC / 最大允许敞口 USDC (范围 -1 到 1)
@@ -531,6 +550,7 @@ export async function runMarketMakingCycle() {
         continue;
       }
 
+<<<<<<< HEAD
       // === 4. 执行挂单 (基于真实库存流转) ===
       
       // 挂 Bid 腿 (低买 YES，或高卖 NO 等效)
@@ -606,10 +626,23 @@ export async function runMarketMakingCycle() {
             price: myAskPrice,
             side: Side.SELL,
             size: safeSellSize,
+=======
+      // === 4. 执行挂单 (双腿解封) ===
+      // 挂 Bid 腿 (买入 YES)
+      // 条件: 只要还没达到最大正向敞口，就可以买入 YES
+      if (currentNetYes >= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / midPrice)) {
+        try {
+          const res = await clobClient.createAndPostOrder({
+            tokenID: tm.yesTokenId,
+            price: myBidPrice,
+            side: Side.BUY,
+            size: size,
+>>>>>>> trae/solo-agent-Nzw2DQ
             feeRateBps: 0,
           });
 
           if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+<<<<<<< HEAD
             console.log(`     [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
           } else {
             console.log(`     [-] Placed SELL YES (Ask) for ${safeSellSize} shares at $${myAskPrice}`);
@@ -623,28 +656,80 @@ export async function runMarketMakingCycle() {
         // 必须确保允许加仓
         if (canIncreaseExposure) {
           const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
+=======
+            console.log(`     [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+          } else {
+            console.log(`     [+] Placed BUY YES (Bid) for ${size} shares at $${myBidPrice}`);
+            dailyStats.ordersPosted++;
+          }
+        } catch (e: any) {
+          console.log(`     [!] Failed to place BUY YES order: ${e.message}`);
+        }
+      }
+
+      // 挂 Ask 腿 (卖出 YES，如果不足则 买入 NO)
+      // 条件: 只要还没达到最大负向敞口，就可以提供 Ask
+      if (currentNetYes <= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / (1 - midPrice))) {
+        if (invYes.yes >= size) {
+          // 有足够的 YES 库存，直接挂 SELL YES
+          try {
+            const res = await clobClient.createAndPostOrder({
+              tokenID: tm.yesTokenId,
+              price: myAskPrice,
+              side: Side.SELL,
+              size: size,
+              feeRateBps: 0,
+            });
+
+            if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+              console.log(`     [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+            } else {
+              console.log(`     [-] Placed SELL YES (Ask) for ${size} shares at $${myAskPrice}`);
+              dailyStats.ordersPosted++;
+            }
+          } catch (e: any) {
+            console.log(`     [!] Failed to place SELL YES order: ${e.message}`);
+          }
+        } else {
+          // 没有足够的 YES 库存，启用最小双腿：通过 BUY NO 提供等效的 Ask
+          // 等效价格: 买入 NO 的价格 = 1 - 卖出 YES 的价格
+          const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
+          
+>>>>>>> trae/solo-agent-Nzw2DQ
           if (buyNoPrice > 0 && buyNoPrice < 1) {
             try {
               const res = await clobClient.createAndPostOrder({
                 tokenID: tm.noTokenId,
                 price: buyNoPrice,
+<<<<<<< HEAD
                 side: Side.BUY,
                 size: minRequiredSize,
+=======
+                side: Side.BUY, // 买入 NO 相当于卖出 YES
+                size: size,
+>>>>>>> trae/solo-agent-Nzw2DQ
                 feeRateBps: 0,
               });
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
               } else {
+<<<<<<< HEAD
                 console.log(`     [-] Placed BUY NO (Eq Ask) for ${minRequiredSize} shares at $${buyNoPrice} (Eq YES Ask $${myAskPrice})`);
+=======
+                console.log(`     [-] Placed BUY NO (Eq Ask) for ${size} shares at $${buyNoPrice} (Eq YES Ask $${myAskPrice})`);
+>>>>>>> trae/solo-agent-Nzw2DQ
                 dailyStats.ordersPosted++;
               }
             } catch (e: any) {
               console.log(`     [!] Failed to place BUY NO order: ${e.message}`);
             }
           }
+<<<<<<< HEAD
         } else {
           console.log(`     [i] Skipping BUY NO (Ask): Exposure limits reached and no YES inventory to sell.`);
+=======
+>>>>>>> trae/solo-agent-Nzw2DQ
         }
       }
     }
