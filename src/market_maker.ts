@@ -382,20 +382,31 @@ export async function runMarketMakingCycle() {
     // 2. 筛选适合我们做市的冷门长尾市场
     const targetMarkets = [];
     const tagCounter: Record<string, number> = {};
+    let newMarketsCount = 0;
     
     for (const market of events) {
       if (market.active !== true && market.active !== "true") continue;
       
-      // [LP Rewards Bot] 核心逻辑：只在官方有流动性补贴的市场做市！
-      if (market.rewards && market.rewards.length === 0) continue;
-
       const yesTokenIds = getValidTokenIds(market.token_id);
       if (!yesTokenIds) continue;
       const [yesTokenId, noTokenId] = yesTokenIds;
 
+      // 检查是否已有库存（持有仓位的市场享有特权，防止被过滤成死仓）
+      const invYes = inventory[yesTokenId] || { yes: 0, no: 0 };
+      const invNo = inventory[noTokenId] || { yes: 0, no: 0 };
+      const hasInventory = invYes.yes > 0 || invNo.no > 0;
+
+      // 如果没有库存，且新开市场数量已经达到上限，跳过该市场
+      if (!hasInventory && newMarketsCount >= config.bot.targetMarketsCount) {
+        continue;
+      }
+
+      // [LP Rewards Bot] 核心逻辑：只在官方有流动性补贴的市场做市！(有库存的市场强制放行，方便平仓)
+      if (!hasInventory && market.rewards && market.rewards.length === 0) continue;
+
       // 【第二轮迭代】Tag 多样性过滤（解决同质化事件扎堆）
       let skipForTagQuota = false;
-      if (market.tags && market.tags.length > 0) {
+      if (!hasInventory && market.tags && market.tags.length > 0) {
         for (const tag of market.tags) {
           if ((tagCounter[tag] || 0) >= config.bot.tagQuota) {
             skipForTagQuota = true;
@@ -434,12 +445,11 @@ export async function runMarketMakingCycle() {
         // 如果连任何一方挂单都没有，或者倒挂，不适合刚开始做市
         if (bestAsk <= 0 || bestBid <= 0 || bestAsk <= bestBid) continue;
         
-        // 过滤极端概率市场（避免被单边打穿，适当放宽到 0.01 到 0.99，因为长尾市场很多都在这个区间）
-        if (bestAsk > 0.99 || bestBid < 0.01) continue;
+        // 过滤极端概率市场（避免被单边打穿，适当放宽到 0.01 到 0.99，因为长尾市场很多都在这个区间）(有库存的放行)
+        if (!hasInventory && (bestAsk > 0.99 || bestBid < 0.01)) continue;
 
-        // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单)
-        // 并且价差必须足够大，至少容得下我们的 spreadHalf
-        if ((bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
+        // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单) (有库存的放行)
+        if (hasInventory || (bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
            targetMarkets.push({
              eventTitle: market.question || market.market || "Unknown Market", 
              yesTokenId,
@@ -452,19 +462,19 @@ export async function runMarketMakingCycle() {
              rewardsMinSize: market.rewardsMinSize || 20
            });
 
-           // 更新该市场所有 tag 的计数
+           // 更新该市场所有 tag 的计数（无论新老，只要入选就占用配额，防止新市场扎堆）
            if (market.tags && market.tags.length > 0) {
              for (const tag of market.tags) {
                tagCounter[tag] = (tagCounter[tag] || 0) + 1;
              }
            }
+
+           if (!hasInventory) {
+             newMarketsCount++;
+           }
         }
       } catch (e) {
         // console.warn(`Error fetching orderbook for ${yesTokenId}`);
-      }
-
-      if (targetMarkets.length >= config.bot.targetMarketsCount) {
-        break; // 找够了我们设定数量的市场，跳出循环
       }
     }
 
@@ -487,39 +497,56 @@ export async function runMarketMakingCycle() {
     for (const tm of targetMarkets) {
       const midPrice = (tm.bestBid + tm.bestAsk) / 2;
 
+      // === 0. 获取当前库存与提前判定止损 ===
+      const invYes = inventory[tm.yesTokenId] || { yes: 0, no: 0, pnlPct: 0 };
+      const invNo = inventory[tm.noTokenId] || { yes: 0, no: 0, pnlPct: 0 };
+      
+      // 净方向风险敞口 (YES 等效股数)
+      const currentNetYes = invYes.yes - invNo.no;
+      
+      let isHardStopTriggered = false;
+      const mainLegInv = currentNetYes > 0 ? invYes : invNo;
+      const currentPnlPct = mainLegInv.pnlPct || 0;
+      
+      if (currentNetYes !== 0 && currentPnlPct <= config.bot.hardStopLossPct) {
+        isHardStopTriggered = true;
+      }
+
       // === 1. 快照级事后熔断 (Circuit Breaker) ===
       const lastMid = lastMidPrices[tm.yesTokenId];
       if (lastMid !== undefined) {
         const jump = Math.abs(midPrice - lastMid);
         if (jump >= 0.10) {
           console.log(`\n  -> Event: ${tm.eventTitle}`);
-          console.log(`     [!] Circuit Breaker: Price jumped by ${jump.toFixed(3)} (Last: ${lastMid.toFixed(3)}, Current: ${midPrice.toFixed(3)})`);
-          console.log(`     [!] Skipping market for this cycle.`);
-          dailyStats.circuitBreakTriggers++;
-          lastMidPrices[tm.yesTokenId] = midPrice; // Update for next cycle
-          continue;
+          if (isHardStopTriggered) {
+             console.log(`     [!] Circuit Breaker: Price jumped by ${jump.toFixed(3)}, but HARD STOP triggered. Proceeding to liquidate.`);
+          } else {
+             console.log(`     [!] Circuit Breaker: Price jumped by ${jump.toFixed(3)} (Last: ${lastMid.toFixed(3)}, Current: ${midPrice.toFixed(3)})`);
+             console.log(`     [!] Skipping market for this cycle.`);
+             dailyStats.circuitBreakTriggers++;
+             lastMidPrices[tm.yesTokenId] = midPrice; // Update for next cycle
+             continue;
+          }
         }
       }
       
       // 极端区间过滤
       if (midPrice <= 0.10 || midPrice >= 0.90) {
-        console.log(`\n  -> Event: ${tm.eventTitle}`);
-        console.log(`     [!] Circuit Breaker: Price ${midPrice.toFixed(3)} in extreme bounds. Skipping.`);
-        dailyStats.circuitBreakTriggers++;
-        lastMidPrices[tm.yesTokenId] = midPrice;
-        continue;
+        if (!isHardStopTriggered && currentNetYes === 0) {
+          console.log(`\n  -> Event: ${tm.eventTitle}`);
+          console.log(`     [!] Circuit Breaker: Price ${midPrice.toFixed(3)} in extreme bounds. Skipping.`);
+          dailyStats.circuitBreakTriggers++;
+          lastMidPrices[tm.yesTokenId] = midPrice;
+          continue;
+        } else if (isHardStopTriggered) {
+          console.log(`\n  -> Event: ${tm.eventTitle}`);
+          console.log(`     [!] Extreme Bounds: Price ${midPrice.toFixed(3)}, but HARD STOP triggered. Proceeding to liquidate.`);
+        }
       }
       
       lastMidPrices[tm.yesTokenId] = midPrice;
 
       // === 2. 资金比例与库存上限计算 ===
-      // 获取当前库存 (YES 腿和 NO 腿)
-      const invYes = inventory[tm.yesTokenId] || { yes: 0, no: 0 };
-      const invNo = inventory[tm.noTokenId] || { yes: 0, no: 0 };
-      
-      // 净方向风险敞口 (YES 等效股数)
-      // 持有 YES 代表多头 (+)，持有 NO 代表空头 (等效卖出 YES, -)
-      const currentNetYes = invYes.yes - invNo.no;
       const currentExposureUSDC = Math.abs(currentNetYes) * (currentNetYes > 0 ? midPrice : (1 - midPrice));
       
       // 更新单日最大仓位占比统计
@@ -595,12 +622,9 @@ export async function runMarketMakingCycle() {
       dailyStats.spreadHalfUsedCount++;
 
       // C. 硬止损 (Hard Stop-Loss) 抢一档平仓
-      let isHardStopTriggered = false;
-      const mainLegInv = currentNetYes > 0 ? invYes : invNo;
-      const currentPnlPct = mainLegInv.pnlPct || 0;
+      // `isHardStopTriggered` 已经在循环开头判定过了
       
-      if (currentNetYes !== 0 && currentPnlPct <= config.bot.hardStopLossPct) {
-        isHardStopTriggered = true;
+      if (isHardStopTriggered) {
         console.log(`     [!] HARD STOP LOSS TRIGGERED (PnL: ${(currentPnlPct*100).toFixed(2)}%). Placing aggressive exit orders.`);
       }
 
@@ -635,14 +659,16 @@ export async function runMarketMakingCycle() {
           }
         }
 
-        // 避免我们的挂单变成市价吃单 (Taker)
-        if (myBidPrice >= tm.bestAsk || myAskPrice <= tm.bestBid) {
-          if (i === 0) {
-            console.log(`\n  -> Event: ${tm.eventTitle}`);
-            console.log(`     Skipping: Quote prices would cross the book (Taker).`);
-          }
-          continue;
+        // 避免我们的挂单变成市价吃单 (Taker)，将价格钳制在盘口内 (Maker)
+        if (myBidPrice >= tm.bestAsk) {
+          myBidPrice = Math.max(tm.bestAsk - 0.01, 0.01);
         }
+        if (myAskPrice <= tm.bestBid) {
+          myAskPrice = Math.min(tm.bestBid + 0.01, 0.99);
+        }
+        
+        myBidPrice = Number(myBidPrice.toFixed(2));
+        myAskPrice = Number(myAskPrice.toFixed(2));
 
         if (i === 0) {
           console.log(`\n  -> Event: ${tm.eventTitle}`);
