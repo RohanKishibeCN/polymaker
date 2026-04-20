@@ -28,6 +28,14 @@ export const config = {
 
     // 做市策略配置 (Market Making)
     targetMarketsCount: 5, // 想要同时做市的市场数量
+    
+    // 【第二轮迭代】风控与扩容配置
+    tagQuota: Number(process.env.POLYMARKET_TAG_QUOTA) || 1, // 单个赛道(Tag)最多允许的市场数量，实现横向分散
+    hardStopLossPct: Number(process.env.POLYMARKET_HARD_STOP_LOSS_PCT) || -0.15, // 硬止损线 (-15%)
+    timeDecayDays: Number(process.env.POLYMARKET_TIME_DECAY_DAYS) || 7, // 死仓时间衰减阈值 (7天)
+    timeDecaySkewFactor: Number(process.env.POLYMARKET_TIME_DECAY_SKEW) || 0.05, // 死仓衰减后的激进倾斜因子
+    enableDualLayerGrid: process.env.POLYMARKET_ENABLE_DUAL_LAYER === 'true', // 是否开启 2000U 级别的双层网格
+    
     // 【第一轮迭代】极低频宽价差防守
     spreadHalfBase: 0.02, // 保守基准半价差 (总价差 4%)
     spreadHalfMax: 0.06, // 最大允许半价差
