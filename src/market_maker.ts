@@ -409,6 +409,7 @@ export async function runMarketMakingCycle() {
     
     // 我们需要把 Gamma events 展平为可做市的 markets 数组
     let events: any[] = [];
+    let nextCachedInventoryMarkets: any[] = [];
     for (const ge of gammaEvents) {
       if (ge.markets) {
         for (const gm of ge.markets) {
@@ -439,7 +440,14 @@ export async function runMarketMakingCycle() {
     const targetMarkets = [];
     const tagCounter: Record<string, number> = {};
     let newMarketsCount = 0;
-    
+
+    // 将上一轮缓存的有库存市场合并到本轮处理列表中，防止分页漏扫
+    for (const cachedMarket of cachedInventoryMarkets) {
+      if (!events.some(e => e.token_id === cachedMarket.token_id)) {
+        events.push(cachedMarket);
+      }
+    }
+
     for (const market of events) {
       if (market.active !== true && market.active !== "true") continue;
       
@@ -785,6 +793,7 @@ export async function runMarketMakingCycle() {
               } else {
                 console.log(`     [Layer ${i+1}] [+] Placed SELL NO (Eq Bid) for ${safeSellSize} shares at $${sellNoPrice}`);
                 dailyStats.ordersPosted++;
+                invNo.no -= safeSellSize; // 更新本地库存，防止下一层网格重复卖出
               }
             } catch (e: any) {
               console.log(`     [Layer ${i+1}] [!] Failed to place SELL NO order: ${e.message}`);
@@ -854,6 +863,7 @@ export async function runMarketMakingCycle() {
               } else {
                 console.log(`     [Layer ${i+1}] [-] Placed SELL YES (Ask) for ${safeSellSize} shares at $${sellYesPrice}`);
                 dailyStats.ordersPosted++;
+                invYes.yes -= safeSellSize; // 更新本地库存，防止下一层网格重复卖出
               }
             } catch (e: any) {
               console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${e.message}`);
