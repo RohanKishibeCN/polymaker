@@ -18,23 +18,23 @@ export const config = {
   bot: {
     // 基础配置
     // 初始投入资金 (用于计算盈亏)
-    initialCapital: Number(process.env.POLYMARKET_INITIAL_CAPITAL) || 70,
+    initialCapital: Number(process.env.POLYMARKET_INITIAL_CAPITAL) || 500,
     // 【第一轮迭代】资金比例 Size
     sizePct: Number(process.env.POLYMARKET_SIZE_PCT) || 0.05, // 每次挂单金额占总权益比例（5%）
     maxMarketPct: Number(process.env.POLYMARKET_MAX_MARKET_PCT) || 0.15, // 单市场占用资金上限（15%）
-    
+
     // 如果没有在 .env 里设置，默认改为每 30 分钟扫描一次，大幅节省代理流量成本
-    scanInterval: 1000 * 60 * (Number(process.env.POLYMARKET_SCAN_INTERVAL_MINUTES) || 30), 
+    scanInterval: 1000 * 60 * (Number(process.env.POLYMARKET_SCAN_INTERVAL_MINUTES) || 30),
 
     // 做市策略配置 (Market Making)
-    targetMarketsCount: 5, // 想要同时做市的市场数量
-    
+    targetMarketsCount: 7, // 想要同时做市的市场数量
+
     // 【第二轮迭代】风控与扩容配置
-    tagQuota: Number(process.env.POLYMARKET_TAG_QUOTA) || 1, // 单个赛道(Tag)最多允许的市场数量，实现横向分散
+    tagQuota: Number(process.env.POLYMARKET_TAG_QUOTA) || 2, // 单个赛道(Tag)最多允许的市场数量，实现横向分散
     hardStopLossPct: Number(process.env.POLYMARKET_HARD_STOP_LOSS_PCT) || -0.15, // 硬止损线 (-15%)
     timeDecayDays: Number(process.env.POLYMARKET_TIME_DECAY_DAYS) || 7, // 死仓时间衰减阈值 (7天)
     timeDecaySkewFactor: Number(process.env.POLYMARKET_TIME_DECAY_SKEW) || 0.05, // 死仓衰减后的激进倾斜因子
-    enableDualLayerGrid: process.env.POLYMARKET_ENABLE_DUAL_LAYER === 'true', // 是否开启 2000U 级别的双层网格
+    enableDualLayerGrid: process.env.POLYMARKET_ENABLE_DUAL_LAYER !== 'false', // 开启 500U 级别的双层网格 (默认 true)
     
     // 【第一轮迭代】极低频宽价差防守
     spreadHalfBase: 0.02, // 保守基准半价差 (总价差 4%)

@@ -685,10 +685,22 @@ export async function runMarketMakingCycle() {
         // 挂 Bid 腿 (低买 YES，或高卖 NO 等效)
         if (invNo.no > 0) {
           const sellSize = Math.min(invNo.no, currentLayerSize);
-          const safeSellSize = Math.max(sellSize, 5);
+          let safeSellSize = Math.max(sellSize, 5);
+          let sellNoPrice = Number((1 - myBidPrice).toFixed(2));
 
-          const sellNoPrice = Number((1 - myBidPrice).toFixed(2));
-          if (sellNoPrice > 0 && sellNoPrice < 1) {
+          if (safeSellSize > invNo.no) {
+            safeSellSize = invNo.no;
+            if (safeSellSize * sellNoPrice >= 1) {
+              sellNoPrice = Number((1 - tm.bestAsk).toFixed(2));
+              if (sellNoPrice <= 0) sellNoPrice = 0.01;
+              console.log(`     [Layer ${i+1}] [i] Dust inventory (${safeSellSize.toFixed(4)} NO). Forcing Taker order at $${sellNoPrice}`);
+            } else {
+              console.log(`     [Layer ${i+1}] [i] Dust inventory (${safeSellSize.toFixed(4)} NO). Value < $1, skipping SELL.`);
+              safeSellSize = 0;
+            }
+          }
+
+          if (safeSellSize > 0 && sellNoPrice > 0 && sellNoPrice < 1) {
             try {
               const res = await clobClient.createAndPostOrder({
                 tokenID: tm.noTokenId,
@@ -736,25 +748,40 @@ export async function runMarketMakingCycle() {
         // 挂 Ask 腿 (高卖 YES，或低买 NO 等效)
         if (invYes.yes > 0) {
           const sellSize = Math.min(invYes.yes, currentLayerSize);
-          const safeSellSize = Math.max(sellSize, 5);
+          let safeSellSize = Math.max(sellSize, 5);
+          let sellYesPrice = myAskPrice;
 
-          try {
-            const res = await clobClient.createAndPostOrder({
-              tokenID: tm.yesTokenId,
-              price: myAskPrice,
-              side: Side.SELL,
-              size: safeSellSize,
-              feeRateBps: 0,
-            });
-
-            if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-              console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+          if (safeSellSize > invYes.yes) {
+            safeSellSize = invYes.yes;
+            if (safeSellSize * sellYesPrice >= 1) {
+              sellYesPrice = tm.bestBid;
+              if (sellYesPrice <= 0) sellYesPrice = 0.01;
+              console.log(`     [Layer ${i+1}] [i] Dust inventory (${safeSellSize.toFixed(4)} YES). Forcing Taker order at $${sellYesPrice}`);
             } else {
-              console.log(`     [Layer ${i+1}] [-] Placed SELL YES (Ask) for ${safeSellSize} shares at $${myAskPrice}`);
-              dailyStats.ordersPosted++;
+              console.log(`     [Layer ${i+1}] [i] Dust inventory (${safeSellSize.toFixed(4)} YES). Value < $1, skipping SELL.`);
+              safeSellSize = 0;
             }
-          } catch (e: any) {
-            console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${e.message}`);
+          }
+
+          if (safeSellSize > 0 && sellYesPrice > 0 && sellYesPrice < 1) {
+            try {
+              const res = await clobClient.createAndPostOrder({
+                tokenID: tm.yesTokenId,
+                price: sellYesPrice,
+                side: Side.SELL,
+                size: safeSellSize,
+                feeRateBps: 0,
+              });
+
+              if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+                console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+              } else {
+                console.log(`     [Layer ${i+1}] [-] Placed SELL YES (Ask) for ${safeSellSize} shares at $${sellYesPrice}`);
+                dailyStats.ordersPosted++;
+              }
+            } catch (e: any) {
+              console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${e.message}`);
+            }
           }
         } else {
           if (canIncreaseExposure) {
