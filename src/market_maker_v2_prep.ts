@@ -1,4 +1,6 @@
-import { ClobClient, Side, SignatureType } from '@polymarket/clob-client';
+// ===== V2 SDK 准备版本 (未挂载到主流程) =====
+// 在 4 月 28 日停机维护后，将 index.ts 指向此文件即可完成热切
+import { ClobClient, Side, SignatureType } from '@polymarket/clob-client-v2'; // 注意：需在 package.json 安装此新库
 import { Wallet } from 'ethers';
 import { config } from './config';
 import { logTrade, logDailySummary } from './notion';
@@ -53,20 +55,21 @@ const wallet = new Wallet(privateKey);
 // 定制化的 axios httpsAgent，供 clob-client 内部使用
 const axiosHttpsAgent = proxyAgent ? proxyAgent : new https.Agent();
 
-const clobClient = new ClobClient(
-  'https://clob.polymarket.com',
-  137,
+// 初始化 V2 Client
+const clobClient = new ClobClient({
+  host: 'https://clob.polymarket.com',
+  chain: 137,
   // @ts-ignore
   wallet,
-  {
+  creds: {
     key: config.polymarket.apiKey,
     secret: config.polymarket.secret,
     passphrase: config.polymarket.passphrase,
   },
-  SignatureType.POLY_GNOSIS_SAFE, // Polymarket 网页端生成的 API Key 必须使用这个 Gnosis Safe 签名类型，否则报 Unauthorized
-  config.polymarket.funderAddress,
-  config.polymarket.geoBlockToken // 添加 geoBlockToken (可选) 绕过地区限制
-);
+  signatureType: SignatureType.POLY_GNOSIS_SAFE,
+  funderAddress: config.polymarket.funderAddress,
+  geoBlockToken: config.polymarket.geoBlockToken // (可选)
+});
 
 // 覆盖 clobClient 内部的 axios 实例配置，让其走代理
 // @ts-ignore
@@ -735,7 +738,6 @@ export async function runMarketMakingCycle() {
                 price: sellNoPrice,
                 side: Side.SELL,
                 size: safeSellSize,
-                feeRateBps: 0,
               });
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
@@ -756,7 +758,6 @@ export async function runMarketMakingCycle() {
                 price: myBidPrice,
                 side: Side.BUY,
                 size: currentLayerSize,
-                feeRateBps: 0,
               });
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
@@ -798,7 +799,6 @@ export async function runMarketMakingCycle() {
                 price: sellYesPrice,
                 side: Side.SELL,
                 size: safeSellSize,
-                feeRateBps: 0,
               });
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
@@ -821,7 +821,6 @@ export async function runMarketMakingCycle() {
                   price: buyNoPrice,
                   side: Side.BUY,
                   size: currentLayerSize,
-                  feeRateBps: 0,
                 });
 
                 if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
