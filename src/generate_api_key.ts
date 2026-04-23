@@ -1,5 +1,8 @@
 import { ClobClient } from '@polymarket/clob-client';
 import { createWalletClient, http } from 'viem';
+
+// 通过环境变量决定是否使用 V2 SDK 生成 Key
+const USE_V2_SDK = process.env.USE_V2_SDK === 'true';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -95,15 +98,27 @@ async function main() {
       transport: http('https://polygon-rpc.com'),
     });
 
-    const clobClient = new ClobClient(
-      'https://clob.polymarket.com',
-      137,
-      // @ts-ignore (viem WalletClient is supported but types might clash)
-      walletClient,
-      undefined,
-      2, // SignatureType.POLY_GNOSIS_SAFE
-      process.env.POLYMARKET_FUNDER_ADDRESS?.trim()
-    );
+    let clobClient: any;
+    if (USE_V2_SDK) {
+      const { ClobClient: ClobClientV2, SignatureType: SigTypeV2 } = require('@polymarket/clob-client-v2');
+      clobClient = new ClobClientV2({
+        host: 'https://clob.polymarket.com',
+        chain: 137,
+        wallet: walletClient,
+        signatureType: SigTypeV2.POLY_GNOSIS_SAFE,
+        funderAddress: process.env.POLYMARKET_FUNDER_ADDRESS?.trim()
+      });
+    } else {
+      clobClient = new ClobClient(
+        'https://clob.polymarket.com',
+        137,
+        // @ts-ignore (viem WalletClient is supported but types might clash)
+        walletClient,
+        undefined,
+        2, // SignatureType.POLY_GNOSIS_SAFE
+        process.env.POLYMARKET_FUNDER_ADDRESS?.trim()
+      );
+    }
 
     // 3. 通过私钥对签名消息 (EIP-712) 派生出一组绝对匹配的 API Credentials
     console.log(`[+] Sending signature to Polymarket to derive API credentials...`);

@@ -1,5 +1,9 @@
 import { ClobClient, Side, SignatureType } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
+
+// 通过环境变量开关来决定是否使用 V2 语法和新参数，以便 4 月 28 日平滑过渡
+// 4月28日前，我们使用旧版本；4月28日后，通过配置 USE_V2_SDK=true 来切换新特性
+const USE_V2_SDK = process.env.USE_V2_SDK === 'true';
 import { config } from './config';
 import { logTrade, logDailySummary } from './notion';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -53,20 +57,39 @@ const wallet = new Wallet(privateKey);
 // 定制化的 axios httpsAgent，供 clob-client 内部使用
 const axiosHttpsAgent = proxyAgent ? proxyAgent : new https.Agent();
 
-const clobClient = new ClobClient(
-  'https://clob.polymarket.com',
-  137,
-  // @ts-ignore
-  wallet,
-  {
-    key: config.polymarket.apiKey,
-    secret: config.polymarket.secret,
-    passphrase: config.polymarket.passphrase,
-  },
-  SignatureType.POLY_GNOSIS_SAFE, // Polymarket 网页端生成的 API Key 必须使用这个 Gnosis Safe 签名类型，否则报 Unauthorized
-  config.polymarket.funderAddress,
-  config.polymarket.geoBlockToken // 添加 geoBlockToken (可选) 绕过地区限制
-);
+let clobClient: any;
+
+if (USE_V2_SDK) {
+  // @ts-ignore - 兼容未来安装的 @polymarket/clob-client-v2
+  clobClient = new ClobClient({
+    host: 'https://clob.polymarket.com',
+    chain: 137,
+    wallet: wallet,
+    creds: {
+      key: config.polymarket.apiKey,
+      secret: config.polymarket.secret,
+      passphrase: config.polymarket.passphrase,
+    },
+    signatureType: SignatureType.POLY_GNOSIS_SAFE,
+    funderAddress: config.polymarket.funderAddress,
+    geoBlockToken: config.polymarket.geoBlockToken // (可选)
+  });
+} else {
+  clobClient = new ClobClient(
+    'https://clob.polymarket.com',
+    137,
+    // @ts-ignore
+    wallet,
+    {
+      key: config.polymarket.apiKey,
+      secret: config.polymarket.secret,
+      passphrase: config.polymarket.passphrase,
+    },
+    SignatureType.POLY_GNOSIS_SAFE,
+    config.polymarket.funderAddress,
+    config.polymarket.geoBlockToken
+  );
+}
 
 // 覆盖 clobClient 内部的 axios 实例配置，让其走代理
 // @ts-ignore
@@ -335,6 +358,11 @@ async function syncInventoryFromChain(): Promise<number> {
 // 用于 Gamma Keyset 分页增量轮转拉取
 let lastEventCursor: string | null = null;
 
+// 用于 Gamma Keyset 分页增量轮转拉取
+let lastEventCursor: string | null = null;
+// 持久化保存所有有库存的市场元数据，防止分页轮转期间被跳过导致断单被套
+let cachedInventoryMarkets: any[] = [];
+
 export async function runMarketMakingCycle() {
   console.log(`\n[${new Date().toISOString()}] =====================================`);
   console.log(`[Market Maker] Starting liquidity rewards & grid cycle...`);
@@ -423,6 +451,14 @@ export async function runMarketMakingCycle() {
       const invYes = inventory[yesTokenId] || { yes: 0, no: 0 };
       const invNo = inventory[noTokenId] || { yes: 0, no: 0 };
       const hasInventory = invYes.yes > 0 || invNo.no > 0;
+      
+      // ==========================================
+      // [核心修复] 如果该市场有库存，将其加入下一次缓存中
+      // 确保下一轮分页轮转即使没扫到它，也能继续保护订单
+      // ==========================================
+      if (hasInventory) {
+          nextCachedInventoryMarkets.push(market);
+      }
 
       // 如果没有库存，且新开市场数量已经达到上限，跳过该市场
       if (!hasInventory && newMarketsCount >= config.bot.targetMarketsCount) {
@@ -507,6 +543,9 @@ export async function runMarketMakingCycle() {
     }
 
     console.log(`[Market Maker] Selected ${targetMarkets.length} target markets for liquidity provision.`);
+    
+    // 更新持久化缓存
+    cachedInventoryMarkets = nextCachedInventoryMarkets;
 
     // 3. 开始撤单与重挂 (Re-quoting)
     console.log(`[Market Maker] Canceling old orders to avoid stale quotes...`);
@@ -730,13 +769,16 @@ export async function runMarketMakingCycle() {
 
           if (safeSellSize > 0 && sellNoPrice > 0 && sellNoPrice < 1) {
             try {
-              const res = await clobClient.createAndPostOrder({
+              const orderPayload: any = {
                 tokenID: tm.noTokenId,
                 price: sellNoPrice,
                 side: Side.SELL,
                 size: safeSellSize,
-                feeRateBps: 0,
-              });
+              };
+              if (!USE_V2_SDK) {
+                orderPayload.feeRateBps = 0;
+              }
+              const res = await clobClient.createAndPostOrder(orderPayload);
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [Layer ${i+1}] [!] Failed to place SELL NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -751,13 +793,16 @@ export async function runMarketMakingCycle() {
         } else {
           if (canIncreaseExposure) {
             try {
-              const res = await clobClient.createAndPostOrder({
+              const orderPayload: any = {
                 tokenID: tm.yesTokenId,
                 price: myBidPrice,
                 side: Side.BUY,
                 size: currentLayerSize,
-                feeRateBps: 0,
-              });
+              };
+              if (!USE_V2_SDK) {
+                orderPayload.feeRateBps = 0;
+              }
+              const res = await clobClient.createAndPostOrder(orderPayload);
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [Layer ${i+1}] [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -793,13 +838,16 @@ export async function runMarketMakingCycle() {
 
           if (safeSellSize > 0 && sellYesPrice > 0 && sellYesPrice < 1) {
             try {
-              const res = await clobClient.createAndPostOrder({
+              const orderPayload: any = {
                 tokenID: tm.yesTokenId,
                 price: sellYesPrice,
                 side: Side.SELL,
                 size: safeSellSize,
-                feeRateBps: 0,
-              });
+              };
+              if (!USE_V2_SDK) {
+                orderPayload.feeRateBps = 0;
+              }
+              const res = await clobClient.createAndPostOrder(orderPayload);
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -816,13 +864,16 @@ export async function runMarketMakingCycle() {
             const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
             if (buyNoPrice > 0 && buyNoPrice < 1) {
               try {
-                const res = await clobClient.createAndPostOrder({
+                const orderPayload: any = {
                   tokenID: tm.noTokenId,
                   price: buyNoPrice,
                   side: Side.BUY,
                   size: currentLayerSize,
-                  feeRateBps: 0,
-                });
+                };
+                if (!USE_V2_SDK) {
+                  orderPayload.feeRateBps = 0;
+                }
+                const res = await clobClient.createAndPostOrder(orderPayload);
 
                 if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                   console.log(`     [Layer ${i+1}] [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
