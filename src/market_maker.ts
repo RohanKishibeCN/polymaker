@@ -646,7 +646,7 @@ export async function runMarketMakingCycle() {
         dailyStats.maxPositionPctEquity = currentPctEquity;
       }
       
-      // 检查当前市场的资金占用是否超限 (总权益 15%)
+      // 计算当前市场的资金占用是否超限 (总权益 15%)
       const maxMarketUSDC = totalEquity * config.bot.maxMarketPct;
       let isExposureMaxedOut = false;
       if (currentExposureUSDC >= maxMarketUSDC && maxMarketUSDC > 0) {
@@ -655,8 +655,12 @@ export async function runMarketMakingCycle() {
         isExposureMaxedOut = true;
       }
 
+      // 如果 currentExposureUSDC > maxMarketUSDC，Math.max 保证 availableExposureUSDC 为 0
       const availableExposureUSDC = Math.max(maxMarketUSDC - currentExposureUSDC, 0);
-      const targetSizeUSDC = Math.min(cashBalance * config.bot.sizePct, availableExposureUSDC);
+      
+      // 我们用 cashBalance 和 maxMarketUSDC（而不是 availableExposureUSDC）来计算想要做市的【目标大小】
+      // 否则，如果 availableExposureUSDC 很小，我们的 minRequiredSize 会被严重压缩
+      const targetSizeUSDC = Math.min(cashBalance * config.bot.sizePct, maxMarketUSDC);
       
       // 转换为基础目标股数
       let baseTargetSize = Math.floor(targetSizeUSDC / Math.max(midPrice, 0.01));
@@ -739,10 +743,16 @@ export async function runMarketMakingCycle() {
         // 重新计算该层是否能正常开仓
         const layerBuyYesCostUSDC = currentLayerSize * midPrice;
         const layerBuyNoCostUSDC = currentLayerSize * (1 - midPrice);
+        const epsilon = 0.05; // 增加一定的缓冲，应对微小超出（比如计算需要 75.02 USDC，实际可用 75 USDC）
+        
+        // 只要不是已经爆仓 (isExposureMaxedOut) 或者硬止损，且余额和敞口都够这“一层”的单子，就可以挂单。
         const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut && 
                                     (layerBuyYesCostUSDC <= availableExposureUSDC + epsilon) && 
-                                    (layerBuyNoCostUSDC <= availableExposureUSDC + epsilon) &&
-                                    (Math.max(layerBuyYesCostUSDC, layerBuyNoCostUSDC) <= cashBalance + epsilon);
+                                    (layerBuyNoCostUSDC <= availableExposureUSDC + epsilon);
+                                    
+        if (!canIncreaseExposure) {
+          console.log(`     [Layer ${i+1}] [DEBUG] canIncreaseExposure=false: isHardStop=${isHardStopTriggered}, isMaxed=${isExposureMaxedOut}, YEScost=${layerBuyYesCostUSDC.toFixed(2)}, NOcost=${layerBuyNoCostUSDC.toFixed(2)}, maxCost=${Math.max(layerBuyYesCostUSDC, layerBuyNoCostUSDC).toFixed(2)}, availExp=${availableExposureUSDC.toFixed(2)}, cash=${cashBalance.toFixed(2)}`);
+        }
 
         let layerDynamicSpreadHalf = dynamicSpreadHalf * layer.spreadMult;
         
