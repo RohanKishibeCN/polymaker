@@ -16,24 +16,19 @@ export const config = {
     databaseId: (process.env.NOTION_DATABASE_ID || '').trim(),
   },
   bot: {
-    // 基础配置
-    // 初始投入资金 (用于计算盈亏)
-    initialCapital: Number(process.env.POLYMARKET_INITIAL_CAPITAL) || 70,
-    // 【第一轮迭代】资金比例 Size
-    sizePct: Number(process.env.POLYMARKET_SIZE_PCT) || 0.05, // 每次挂单金额占总权益比例（5%）
-    maxMarketPct: Number(process.env.POLYMARKET_MAX_MARKET_PCT) || 0.15, // 单市场占用资金上限（15%）
-    
-    // 如果没有在 .env 里设置，默认改为每 30 分钟扫描一次，大幅节省代理流量成本
-    scanInterval: 1000 * 60 * (Number(process.env.POLYMARKET_SCAN_INTERVAL_MINUTES) || 30), 
-
-    // 做市策略配置 (Market Making)
-    targetMarketsCount: 5, // 想要同时做市的市场数量
-    // 【第一轮迭代】极低频宽价差防守
-    spreadHalfBase: 0.02, // 保守基准半价差 (总价差 4%)
-    spreadHalfMax: 0.06, // 最大允许半价差
-    inventorySkewFactor: Number(process.env.POLYMARKET_INVENTORY_SKEW_FACTOR) || 0.02, // 库存倾斜的最大降价幅度（默认 0.02 即 2 美分）
-    minLiquidity: 10, // 再次放宽下限，因为官方 API 返回的 liquidity 计算方式和实际订单簿深度有差异
-    maxLiquidity: 500000, // 放宽上限
+    scanIntervalMs: 3600 * 1000,
+    targetMarketsCount: 7,
+    tagQuota: 2,
+    sizePct: 0.05,
+    maxMarketPct: 0.15,
+    spreadHalfBase: 0.02,
+    spreadHalfMax: 0.04,
+    inventorySkewFactor: 0.02,
+    timeDecayDays: 2, // 缩短为 2 天清理死仓
+    timeDecaySkewFactor: 0.06, // 加大出清力度
+    hardStopLossPct: -0.15,
+    enableDualLayerGrid: true,
+    initialCapital: 500 
   }
 };
 

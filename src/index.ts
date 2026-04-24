@@ -4,7 +4,7 @@ import { runMarketMakingCycle, runDailySummary } from './market_maker';
 async function main() {
   console.log('==========================================');
   console.log(' Polymarket Market Maker & LP Rewards Bot');
-  console.log(` Scan Interval: ${config.bot.scanInterval / 1000}s`);
+  console.log(` Scan Interval: ${config.bot.scanIntervalMs / 1000}s`);
   console.log(` Target Markets: ${config.bot.targetMarketsCount}`);
   console.log(` Size Pct: ${config.bot.sizePct * 100}%, Max Market Pct: ${config.bot.maxMarketPct * 100}%`);
   console.log('==========================================');
@@ -23,7 +23,7 @@ async function runCycleLoop() {
     console.error(`[Market Maker] Cycle error: ${e.message}`);
   }
   // Schedule next cycle only after the current one completes
-  setTimeout(runCycleLoop, config.bot.scanInterval);
+  setTimeout(runCycleLoop, config.bot.scanIntervalMs);
 }
 
 function scheduleDailySummary() {

@@ -379,9 +379,20 @@ export async function runMarketMakingCycle() {
         // 过滤极端概率市场（避免被单边打穿，适当放宽到 0.01 到 0.99，因为长尾市场很多都在这个区间）
         if (bestAsk > 0.99 || bestBid < 0.01) continue;
 
-        // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单)
+        const invYes = inventory[yesTokenId] || { yes: 0, no: 0 };
+        const invNo = inventory[noTokenId] || { yes: 0, no: 0 };
+        const hasInventory = invYes.yes > 0 || invYes.no > 0 || invNo.yes > 0 || invNo.no > 0;
+
+        // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单) (有库存的放行)
         // 并且价差必须足够大，至少容得下我们的 spreadHalf
-        if ((bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
+        if (hasInventory || (bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
+           // 【核心改进 1】准入过滤：流动性深度校验 (Liquidity/Volume Filter)
+           // 我们计划下的基础仓位（至少 5 股/1U）。如果盘口连 15 股的深度都没有，说明是死水一潭，进去就变死仓。
+           // 有库存的无条件放行（为了能平仓）。
+           if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) {
+             continue;
+           }
+
            targetMarkets.push({
              eventTitle: market.question || market.market || "Unknown Market", 
              yesTokenId,
@@ -471,21 +482,51 @@ export async function runMarketMakingCycle() {
         continue;
       }
 
-      // 计算单笔挂单大小 (总权益 5%~10%，且不能超过剩余可用敞口)
-      const targetSizeUSDC = totalEquity * config.bot.sizePct;
-      const availableExposureUSDC = maxMarketUSDC - currentExposureUSDC;
-      const actualOrderUSDC = Math.min(targetSizeUSDC, availableExposureUSDC);
+      // 计算单笔挂单大小 (动态分配：不再依赖总权益，而是用【当前剩余 Cash】按比例下注)
+      // 避免 Cash 被抽干导致 "not enough balance" 错误。Cash 越多下单越大，Cash 越少自然萎缩。
+      const dynamicSizePct = config.bot.sizePct; // 比如 5%
+      const targetSizeUSDC = Math.max(cashBalance * dynamicSizePct, 0);
+      const availableExposureUSDC = Math.max(maxMarketUSDC - currentExposureUSDC, 0);
       
-      // 转换为股数 (Size)
-      // 注意: size 必须是整数，且至少为 1
-      // Polymarket 上，买入 YES 成本约等于 midPrice * size，买入 NO 成本约等于 (1 - midPrice) * size
-      // 为了简单，我们统一按 0.5 估算，或者直接按 midPrice 估算
-      const size = Math.max(Math.floor(actualOrderUSDC / Math.max(midPrice, 0.01)), 1);
+      // 转换为基础目标股数
+      let baseTargetSize = Math.floor(targetSizeUSDC / Math.max(midPrice, 0.01));
+      let minRequiredSize = Math.max(baseTargetSize, 5); // 满足 Polymarket 最低 5 股限制
+      const minSizeFor1USD = Math.ceil(1.00 / Math.max(midPrice, 0.01));
+      minRequiredSize = Math.max(minRequiredSize, minSizeFor1USD); // 满足 $1 限制
+
+      // 如果算出来的挂单金额超过了可用敞口，或者当前 Cash 根本买不起 5 股（穷得叮当响），
+      // 我们依然允许计算出一个 minRequiredSize，但在后续下单时，会通过 `canIncreaseExposure` 拒绝买入，只允许卖出平仓。
+      const buyYesCostUSDC = minRequiredSize * midPrice;
+      const buyNoCostUSDC = minRequiredSize * (1 - midPrice);
+      const size = minRequiredSize;
+
+      // === 3. 风控机制与价差防守 ===
+      
+      // A. 时间衰减 (Time-Decay) 判定：对于老仓位启动清道夫模式
+      let isTimeDecayed = false;
+      const mainAsset = currentNetYes > 0 ? tm.yesTokenId : tm.noTokenId;
+      // @ts-ignore
+      let firstAcquiredAt: number | undefined;
+      // @ts-ignore
+      if (typeof positionState !== 'undefined' && positionState[mainAsset]) {
+        // @ts-ignore
+        firstAcquiredAt = positionState[mainAsset].firstAcquiredAt;
+      }
+      if (firstAcquiredAt && currentNetYes !== 0) {
+        const daysHeld = (Date.now() - firstAcquiredAt) / (1000 * 60 * 60 * 24);
+        // 如果持仓超过设定天数（例如 3 天）
+        if (daysHeld >= config.bot.timeDecayDays) {
+          isTimeDecayed = true;
+          console.log(`     [!] Time-Decay Triggered: Position held for ${daysHeld.toFixed(1)} days. Activating scavenger mode.`);
+        }
+      }
 
       // 计算库存倾斜系数 (Inventory Skew)
       // 倾斜比例 = 净敞口 USDC / 最大允许敞口 USDC (范围 -1 到 1)
       const skewRatio = Math.max(-1, Math.min(currentExposureUSDC / maxMarketUSDC, 1)) * (currentNetYes > 0 ? 1 : -1);
-      const skewAdjustment = skewRatio * config.bot.inventorySkewFactor; // 最大降幅
+      // 如果触发了时间衰减（死仓），大幅放大倾斜系数（如 0.05 甚至更高），迫使挂单价格逼近对手盘以求出清
+      const currentSkewFactor = isTimeDecayed ? config.bot.timeDecaySkewFactor : config.bot.inventorySkewFactor;
+      const skewAdjustment = skewRatio * currentSkewFactor;
 
       // === 3. 极低频宽价差防守 ===
       let dynamicSpreadHalf = config.bot.spreadHalfBase;
