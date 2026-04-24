@@ -649,7 +649,7 @@ export async function runMarketMakingCycle() {
       // 检查当前市场的资金占用是否超限 (总权益 15%)
       const maxMarketUSDC = totalEquity * config.bot.maxMarketPct;
       let isExposureMaxedOut = false;
-      if (currentExposureUSDC >= maxMarketUSDC) {
+      if (currentExposureUSDC >= maxMarketUSDC && maxMarketUSDC > 0) {
         console.log(`\n  -> Event: ${tm.eventTitle}`);
         console.log(`     [!] Exposure Maxed Out: ${currentExposureUSDC.toFixed(2)} USDC >= Limit ${maxMarketUSDC.toFixed(2)} USDC. Will only place reducing orders.`);
         isExposureMaxedOut = true;
@@ -715,10 +715,12 @@ export async function runMarketMakingCycle() {
       // `isHardStopTriggered` 已经在循环开头判定过了
       
       // 如果为了满足最小 Size 导致挂单金额超过了可用敞口（且不是为了减仓），并且不是在减仓模式下，则跳过挂单
+      // 注意：由于 JavaScript 的浮点数精度问题，我们需要添加一个微小的宽容度 (epsilon)
+      const epsilon = 0.0001;
       const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut && 
-                                  (buyYesCostUSDC <= availableExposureUSDC + 0.5) && 
-                                  (buyNoCostUSDC <= availableExposureUSDC + 0.5) &&
-                                  (Math.max(buyYesCostUSDC, buyNoCostUSDC) <= cashBalance + 0.5);
+                                  (buyYesCostUSDC <= availableExposureUSDC + epsilon) && 
+                                  (buyNoCostUSDC <= availableExposureUSDC + epsilon) &&
+                                  (Math.max(buyYesCostUSDC, buyNoCostUSDC) <= cashBalance + epsilon);
 
       if (isTimeDecayed && !isHardStopTriggered) {
         console.log(`     [!] Time-Decay Triggered: Increasing skew factor to ${currentSkewFactor}`);
