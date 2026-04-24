@@ -21,18 +21,18 @@ function testLogic() {
     
     for (const layer of layers) {
       const currentLayerSize = layer.size;
-      const buyYesCostUSDC = currentLayerSize * midPrice; // 5 * 0.5 = 2.5
-      const buyNoCostUSDC = currentLayerSize * (1 - midPrice); // 5 * 0.5 = 2.5
-      
       const epsilon = 0.0001;
+      const layerBuyYesCostUSDC = currentLayerSize * midPrice; // 5 * 0.5 = 2.5
+      const layerBuyNoCostUSDC = currentLayerSize * (1 - midPrice); // 5 * 0.5 = 2.5
+      
       const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut && 
-                                  (buyYesCostUSDC <= availableExposureUSDC + epsilon) && 
-                                  (buyNoCostUSDC <= availableExposureUSDC + epsilon) &&
-                                  (Math.max(buyYesCostUSDC, buyNoCostUSDC) <= cashBalance + epsilon);
+                                  (layerBuyYesCostUSDC <= availableExposureUSDC + epsilon) && 
+                                  (layerBuyNoCostUSDC <= availableExposureUSDC + epsilon) &&
+                                  (Math.max(layerBuyYesCostUSDC, layerBuyNoCostUSDC) <= cashBalance + epsilon);
       
       console.log(`Layer size: ${currentLayerSize}`);
-      console.log(`buyYesCostUSDC: ${buyYesCostUSDC}`);
-      console.log(`buyNoCostUSDC: ${buyNoCostUSDC}`);
+      console.log(`buyYesCostUSDC: ${layerBuyYesCostUSDC}`);
+      console.log(`buyNoCostUSDC: ${layerBuyNoCostUSDC}`);
       console.log(`availableExposureUSDC: ${availableExposureUSDC}`);
       console.log(`cashBalance: ${cashBalance}`);
       console.log(`canIncreaseExposure: ${canIncreaseExposure}`);

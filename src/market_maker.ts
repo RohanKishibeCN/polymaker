@@ -664,11 +664,6 @@ export async function runMarketMakingCycle() {
       const minSizeFor1USD = Math.ceil(1.00 / Math.max(midPrice, 0.01));
       minRequiredSize = Math.max(minRequiredSize, minSizeFor1USD); // 满足 $1 限制
 
-      // 计算买入 YES 的实际资金消耗
-      const buyYesCostUSDC = minRequiredSize * midPrice;
-      // 计算买入 NO 的实际资金消耗
-      const buyNoCostUSDC = minRequiredSize * (1 - midPrice);
-
       // === 双层网格拆分逻辑 (2-Layer Grid) ===
       let layers = [];
       if (config.bot.enableDualLayerGrid && minRequiredSize >= 20) {
@@ -683,6 +678,14 @@ export async function runMarketMakingCycle() {
         // 单层网格 (默认)
         layers.push({ size: minRequiredSize, spreadMult: 1.0 });
       }
+
+      // 计算整个市场做市所需的总股数 (所有 layer size 之和)
+      const totalRequiredSize = layers.reduce((acc, layer) => acc + layer.size, 0);
+
+      // 计算买入 YES 的实际资金消耗 (按 totalRequiredSize)
+      const totalBuyYesCostUSDC = totalRequiredSize * midPrice;
+      // 计算买入 NO 的实际资金消耗 (按 totalRequiredSize)
+      const totalBuyNoCostUSDC = totalRequiredSize * (1 - midPrice);
 
       // === 3. 风控机制与价差防守 ===
       
@@ -713,14 +716,14 @@ export async function runMarketMakingCycle() {
 
       // C. 硬止损 (Hard Stop-Loss) 抢一档平仓
       // `isHardStopTriggered` 已经在循环开头判定过了
-      
-      // 如果为了满足最小 Size 导致挂单金额超过了可用敞口（且不是为了减仓），并且不是在减仓模式下，则跳过挂单
-      // 注意：由于 JavaScript 的浮点数精度问题，我们需要添加一个微小的宽容度 (epsilon)
+
+      // 提前判定整个市场级别的 Exposure 是否允许开仓，避免每层网格重复报这个日志
+      // 这个总判定用于决定一些全局的预警日志
       const epsilon = 0.0001;
-      const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut && 
-                                  (buyYesCostUSDC <= availableExposureUSDC + epsilon) && 
-                                  (buyNoCostUSDC <= availableExposureUSDC + epsilon) &&
-                                  (Math.max(buyYesCostUSDC, buyNoCostUSDC) <= cashBalance + epsilon);
+      const canIncreaseExposureOverall = !isHardStopTriggered && !isExposureMaxedOut && 
+                                  (totalBuyYesCostUSDC <= availableExposureUSDC + epsilon) && 
+                                  (totalBuyNoCostUSDC <= availableExposureUSDC + epsilon) &&
+                                  (Math.max(totalBuyYesCostUSDC, totalBuyNoCostUSDC) <= cashBalance + epsilon);
 
       if (isTimeDecayed && !isHardStopTriggered) {
         console.log(`     [!] Time-Decay Triggered: Increasing skew factor to ${currentSkewFactor}`);
@@ -732,6 +735,14 @@ export async function runMarketMakingCycle() {
         const layer = layers[i];
         const currentLayerSize = layer.size;
         if (currentLayerSize <= 0) continue;
+
+        // 重新计算该层是否能正常开仓
+        const layerBuyYesCostUSDC = currentLayerSize * midPrice;
+        const layerBuyNoCostUSDC = currentLayerSize * (1 - midPrice);
+        const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut && 
+                                    (layerBuyYesCostUSDC <= availableExposureUSDC + epsilon) && 
+                                    (layerBuyNoCostUSDC <= availableExposureUSDC + epsilon) &&
+                                    (Math.max(layerBuyYesCostUSDC, layerBuyNoCostUSDC) <= cashBalance + epsilon);
 
         let layerDynamicSpreadHalf = dynamicSpreadHalf * layer.spreadMult;
         
@@ -778,7 +789,6 @@ export async function runMarketMakingCycle() {
           console.log(`     [Layer ${i+1}] Skipping: Quote prices out of valid bounds.`);
           continue;
         }
-      
         // 挂 Bid 腿 (低买 YES，或高卖 NO 等效)
         if (invNo.no > 0) {
           const sellSize = Math.min(invNo.no, currentLayerSize);
@@ -839,7 +849,9 @@ export async function runMarketMakingCycle() {
               console.log(`     [Layer ${i+1}] [!] Failed to place BUY YES order: ${e.message}`);
             }
           } else {
-            console.log(`     [Layer ${i+1}] [i] Skipping BUY YES (Bid): Exposure limits reached and no NO inventory to sell.`);
+            if (!canIncreaseExposure) {
+              console.log(`     [Layer ${i+1}] [i] Skipping BUY YES (Bid): Exposure limits reached and no NO inventory to sell.`);
+            }
           }
         }
 
@@ -906,7 +918,9 @@ export async function runMarketMakingCycle() {
               }
             }
           } else {
-            console.log(`     [Layer ${i+1}] [i] Skipping BUY NO (Ask): Exposure limits reached and no YES inventory to sell.`);
+            if (!canIncreaseExposure) {
+              console.log(`     [Layer ${i+1}] [i] Skipping BUY NO (Ask): Exposure limits reached and no YES inventory to sell.`);
+            }
           }
         }
       }
