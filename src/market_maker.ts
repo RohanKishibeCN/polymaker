@@ -124,6 +124,25 @@ function saveState() {
     console.warn("Failed to save state.json");
   }
 }
+
+const feeRateOverrideByTokenId: Record<string, number> = {};
+
+async function createAndPostOrderWithFeeFallback(orderPayload: any, yesTokenId: string, noTokenId: string) {
+  if (!USE_V2_SDK) {
+    orderPayload.feeRateBps = feeRateOverrideByTokenId[orderPayload.tokenID] ?? 0;
+  }
+
+  const res = await clobClient.createAndPostOrder(orderPayload);
+  const msg = `${res?.error || ''} ${res?.errorMessage || ''} ${res?.message || ''}`;
+  if (!USE_V2_SDK && orderPayload.feeRateBps !== 1000 && msg.includes('fee rate for the market must be 1000')) {
+    feeRateOverrideByTokenId[yesTokenId] = 1000;
+    feeRateOverrideByTokenId[noTokenId] = 1000;
+    orderPayload.feeRateBps = 1000;
+    return await clobClient.createAndPostOrder(orderPayload);
+  }
+
+  return res;
+}
 // Notion 总结需要的数据
 let dailyStats = {
   fillsBuy: 0,
@@ -447,6 +466,7 @@ export async function runMarketMakingCycle() {
       const invYes = inventory[yesTokenId] || { yes: 0, no: 0 };
       const invNo = inventory[noTokenId] || { yes: 0, no: 0 };
       const hasInventory = invYes.yes > 0 || invNo.no > 0;
+      if (!hasInventory && (feeRateOverrideByTokenId[yesTokenId] === 1000 || feeRateOverrideByTokenId[noTokenId] === 1000)) continue;
       
       // ==========================================
       // [核心修复] 如果该市场有库存，将其加入下一次缓存中
@@ -780,10 +800,7 @@ export async function runMarketMakingCycle() {
                 side: Side.SELL,
                 size: safeSellSize,
               };
-              if (!USE_V2_SDK) {
-                orderPayload.feeRateBps = 0;
-              }
-              const res = await clobClient.createAndPostOrder(orderPayload);
+              const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [Layer ${i+1}] [!] Failed to place SELL NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -805,10 +822,7 @@ export async function runMarketMakingCycle() {
                 side: Side.BUY,
                 size: currentLayerSize,
               };
-              if (!USE_V2_SDK) {
-                orderPayload.feeRateBps = 0;
-              }
-              const res = await clobClient.createAndPostOrder(orderPayload);
+              const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [Layer ${i+1}] [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -850,10 +864,7 @@ export async function runMarketMakingCycle() {
                 side: Side.SELL,
                 size: safeSellSize,
               };
-              if (!USE_V2_SDK) {
-                orderPayload.feeRateBps = 0;
-              }
-              const res = await clobClient.createAndPostOrder(orderPayload);
+              const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -877,10 +888,7 @@ export async function runMarketMakingCycle() {
                   side: Side.BUY,
                   size: currentLayerSize,
                 };
-                if (!USE_V2_SDK) {
-                  orderPayload.feeRateBps = 0;
-                }
-                const res = await clobClient.createAndPostOrder(orderPayload);
+                const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
 
                 if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                   console.log(`     [Layer ${i+1}] [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
