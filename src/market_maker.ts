@@ -364,8 +364,8 @@ async function syncInventoryFromChain(): Promise<number> {
   return portfolioValue;
 }
 
-// 用于 Gamma Keyset 分页增量轮转拉取
-let lastEventCursor: string | null = null;
+// 用于 Gamma 分页增量轮转拉取
+let lastMarketOffset: number = 0;
 // 持久化保存所有有库存的市场元数据，防止分页轮转期间被跳过导致断单被套
 let cachedInventoryMarkets: any[] = [];
 
@@ -380,66 +380,69 @@ export async function runMarketMakingCycle() {
     const totalEquity = Math.max(cashBalance + portfolioValue, config.bot.initialCapital); // 保底，避免获取失败导致 size=0
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} USDC`);
 
-    // 1. 根据开源社区的最佳实践，做市机器人通常使用 Gamma API (/events) 获取带元数据的市场
-    // 我们已升级到 /keyset 端点并采用增量轮转拉取，以支持全量市场并控制 API 速率
-    console.log("[Market Maker] Fetching active events from Gamma API (Keyset Pagination)...");
+    // 1. 获取 Gamma 市场数据
+    // Polymarket 最近在 /events 端点中移除了 clobRewards 数据，因此我们改用 /markets 端点
+    console.log("[Market Maker] Fetching active markets from Gamma API (Offset Pagination)...");
     
-    // 我们每个做市周期拉取 3 页 (约 300 个事件)，以滚动覆盖所有市场
+    // 我们每个做市周期拉取 3 页 (约 300 个市场)，以滚动覆盖所有市场
     const PAGES_TO_FETCH = 3;
-    let gammaEvents: any[] = [];
+    let gammaMarkets: any[] = [];
     
     for (let i = 0; i < PAGES_TO_FETCH; i++) {
-      const cursorParam = lastEventCursor ? `&after_cursor=${lastEventCursor}` : '';
-      const url = `https://gamma-api.polymarket.com/events/keyset?limit=100&active=true${cursorParam}`;
+      const url = `https://gamma-api.polymarket.com/markets?limit=100&active=true&closed=false&offset=${lastMarketOffset}`;
       
       try {
         const response = await fetch(url, { agent: proxyAgent });
-        const gammaData = (await response.json()) as any;
+        const pageMarkets = (await response.json()) as any[];
         
-        // 新接口将数组包装在 events 字段中
-        const pageEvents = gammaData.events || [];
-        gammaEvents = gammaEvents.concat(pageEvents);
+        if (!Array.isArray(pageMarkets)) {
+          console.warn(`[Market Maker] Unexpected API response format`);
+          break;
+        }
         
-        lastEventCursor = gammaData.next_cursor || null;
+        gammaMarkets = gammaMarkets.concat(pageMarkets);
         
-        if (!lastEventCursor) {
-          console.log("[Market Maker] Reached the end of active events. Will restart from beginning next cycle.");
-          break; // 扫到末尾了，本周期提前结束拉取
+        if (pageMarkets.length < 100) {
+          lastMarketOffset = 0;
+          console.log("[Market Maker] Reached the end of active markets. Will restart from beginning next cycle.");
+          break; 
+        } else {
+          lastMarketOffset += 100;
         }
       } catch (e: any) {
-         console.warn(`[Market Maker] Failed to fetch events page ${i+1}: ${e.message}`);
+         console.warn(`[Market Maker] Failed to fetch markets page ${i+1}: ${e.message}`);
          break;
       }
     }
-    console.log(`[Market Maker] Fetched ${gammaEvents.length} events in this cycle. Current cursor: ${lastEventCursor || 'START'}`);
+    console.log(`[Market Maker] Fetched ${gammaMarkets.length} markets in this cycle. Next offset: ${lastMarketOffset}`);
     
-    // 我们需要把 Gamma events 展平为可做市的 markets 数组
+    // 我们需要把 Gamma markets 展平为可做市的 events 数组 (为了兼容旧代码命名)
     let events: any[] = [];
     let nextCachedInventoryMarkets: any[] = [];
-    for (const ge of gammaEvents) {
-      if (ge.markets) {
-        for (const gm of ge.markets) {
-          const isActive = gm.active === true || gm.active === "true";
-          const isClosed = gm.closed === true || gm.closed === "true";
-          if (!isClosed && isActive && gm.clobTokenIds) {
-            // Extract tags
-            let tags = [];
-            if (ge.tags && Array.isArray(ge.tags)) {
-              tags = ge.tags.map((t: any) => (t.label || t.id || String(t)).toLowerCase());
-            }
-
-            const formattedMarket = {
-              question: gm.question || ge.title,
-              token_id: gm.clobTokenIds, // 传递整个字符串或数组给 getValidTokenId 处理，切勿加 [0]
-              active: true,
-              rewards: gm.clobRewards || [],
-              rewardsMinSize: gm.rewardsMinSize || 0,
-              rewardsMaxSpread: gm.rewardsMaxSpread || 0,
-              tags: tags
-            };
-            events.push(formattedMarket);
-          }
+    
+    for (const gm of gammaMarkets) {
+      const isActive = gm.active === true || gm.active === "true";
+      const isClosed = gm.closed === true || gm.closed === "true";
+      
+      if (!isClosed && isActive && gm.clobTokenIds) {
+        // Extract tags (使用 groupItemTitle 或 events[0].slug 作为同质化分类标签)
+        let tags = [];
+        if (gm.groupItemTitle) {
+          tags.push(gm.groupItemTitle.toLowerCase());
+        } else if (gm.events && gm.events.length > 0) {
+          tags.push((gm.events[0].slug || gm.events[0].title || "unknown").toLowerCase());
         }
+
+        const formattedMarket = {
+          question: gm.question,
+          token_id: gm.clobTokenIds,
+          active: true,
+          rewards: gm.clobRewards || [],
+          rewardsMinSize: gm.rewardsMinSize || 0,
+          rewardsMaxSpread: gm.rewardsMaxSpread || 0,
+          tags: tags
+        };
+        events.push(formattedMarket);
       }
     }
 
