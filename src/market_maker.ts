@@ -124,8 +124,6 @@ function saveState() {
     console.warn("Failed to save state.json");
   }
 }
-
->>>>>>> origin/feature/polymarket-v2-migration
 // Notion 总结需要的数据
 let dailyStats = {
   fillsBuy: 0,
@@ -516,12 +514,7 @@ export async function runMarketMakingCycle() {
         // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单) (有库存的放行)
         // 并且价差必须足够大，至少容得下我们的 spreadHalf
         if (hasInventory || (bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
-           // 【核心改进 1】准入过滤：流动性深度校验 (Liquidity/Volume Filter)
-           // 我们计划下的基础仓位（至少 5 股/1U）。如果盘口连 15 股的深度都没有，说明是死水一潭，进去就变死仓。
-           // 有库存的无条件放行（为了能平仓）。
-           if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) {
-             continue;
-           }
+           if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) continue;
 
            targetMarkets.push({
              eventTitle: market.question || market.market || "Unknown Market", 
@@ -632,18 +625,6 @@ export async function runMarketMakingCycle() {
       
       // 检查当前市场的资金占用是否超限 (总权益 15%)
       const maxMarketUSDC = totalEquity * config.bot.maxMarketPct;
-<<<<<<< HEAD
-      if (currentExposureUSDC >= maxMarketUSDC) {
-        console.log(`\n  -> Event: ${tm.eventTitle}`);
-        console.log(`     [!] Exposure Maxed Out: ${currentExposureUSDC.toFixed(2)} USDC >= Limit ${maxMarketUSDC.toFixed(2)} USDC`);
-        continue;
-      }
-
-      // 计算单笔挂单大小 (动态分配：不再依赖总权益，而是用【当前剩余 Cash】按比例下注)
-      // 避免 Cash 被抽干导致 "not enough balance" 错误。Cash 越多下单越大，Cash 越少自然萎缩。
-      const dynamicSizePct = config.bot.sizePct; // 比如 5%
-      const targetSizeUSDC = Math.max(cashBalance * dynamicSizePct, 0);
-=======
       let isExposureMaxedOut = false;
       if (currentExposureUSDC >= maxMarketUSDC) {
         console.log(`\n  -> Event: ${tm.eventTitle}`);
@@ -651,43 +632,11 @@ export async function runMarketMakingCycle() {
         isExposureMaxedOut = true;
       }
 
-      // 计算单笔挂单大小 (总权益 5%~10%，且不能超过剩余可用敞口，除非是减仓单)
-      const targetSizeUSDC = totalEquity * config.bot.sizePct;
->>>>>>> origin/feature/polymarket-v2-migration
       const availableExposureUSDC = Math.max(maxMarketUSDC - currentExposureUSDC, 0);
+      const targetSizeUSDC = Math.min(cashBalance * config.bot.sizePct, availableExposureUSDC);
       
       // 转换为基础目标股数
       let baseTargetSize = Math.floor(targetSizeUSDC / Math.max(midPrice, 0.01));
-<<<<<<< HEAD
-      let minRequiredSize = Math.max(baseTargetSize, 5); // 满足 Polymarket 最低 5 股限制
-      const minSizeFor1USD = Math.ceil(1.00 / Math.max(midPrice, 0.01));
-      minRequiredSize = Math.max(minRequiredSize, minSizeFor1USD); // 满足 $1 限制
-
-      // 如果算出来的挂单金额超过了可用敞口，或者当前 Cash 根本买不起 5 股（穷得叮当响），
-      // 我们依然允许计算出一个 minRequiredSize，但在后续下单时，会通过 `canIncreaseExposure` 拒绝买入，只允许卖出平仓。
-      const buyYesCostUSDC = minRequiredSize * midPrice;
-      const buyNoCostUSDC = minRequiredSize * (1 - midPrice);
-      const size = minRequiredSize;
-
-      // === 3. 风控机制与价差防守 ===
-      
-      // A. 时间衰减 (Time-Decay) 判定：对于老仓位启动清道夫模式
-      let isTimeDecayed = false;
-      const mainAsset = currentNetYes > 0 ? tm.yesTokenId : tm.noTokenId;
-      // @ts-ignore
-      let firstAcquiredAt: number | undefined;
-      // @ts-ignore
-      if (typeof positionState !== 'undefined' && positionState[mainAsset]) {
-        // @ts-ignore
-        firstAcquiredAt = positionState[mainAsset].firstAcquiredAt;
-      }
-      if (firstAcquiredAt && currentNetYes !== 0) {
-        const daysHeld = (Date.now() - firstAcquiredAt) / (1000 * 60 * 60 * 24);
-        // 如果持仓超过设定天数（例如 3 天）
-        if (daysHeld >= config.bot.timeDecayDays) {
-          isTimeDecayed = true;
-          console.log(`     [!] Time-Decay Triggered: Position held for ${daysHeld.toFixed(1)} days. Activating scavenger mode.`);
-=======
       let minRequiredSize = Math.max(baseTargetSize, 5); // 满足 5 股限制
       const minSizeFor1USD = Math.ceil(1.00 / Math.max(midPrice, 0.01));
       minRequiredSize = Math.max(minRequiredSize, minSizeFor1USD); // 满足 $1 限制
@@ -722,124 +671,10 @@ export async function runMarketMakingCycle() {
         const daysHeld = (Date.now() - firstAcquiredAt) / (1000 * 60 * 60 * 24);
         if (daysHeld >= config.bot.timeDecayDays) {
           isTimeDecayed = true;
->>>>>>> origin/feature/polymarket-v2-migration
         }
       }
 
       // 计算库存倾斜系数 (Inventory Skew)
-<<<<<<< HEAD
-      // 倾斜比例 = 净敞口 USDC / 最大允许敞口 USDC (范围 -1 到 1)
-      const skewRatio = Math.max(-1, Math.min(currentExposureUSDC / maxMarketUSDC, 1)) * (currentNetYes > 0 ? 1 : -1);
-      // 如果触发了时间衰减（死仓），大幅放大倾斜系数（如 0.05 甚至更高），迫使挂单价格逼近对手盘以求出清
-      const currentSkewFactor = isTimeDecayed ? config.bot.timeDecaySkewFactor : config.bot.inventorySkewFactor;
-      const skewAdjustment = skewRatio * currentSkewFactor;
-
-      // === 3. 极低频宽价差防守 ===
-      let dynamicSpreadHalf = config.bot.spreadHalfBase;
-      // 惩罚机制：盘口原生价差大，或顶层深度极低，加宽价差
-      if (tm.spread > 0.06) dynamicSpreadHalf += 0.01;
-      if (tm.bidSizeTop < 50 || tm.askSizeTop < 50) dynamicSpreadHalf += 0.01;
-      
-      // 钳制价差范围
-      dynamicSpreadHalf = Math.max(config.bot.spreadHalfBase, Math.min(dynamicSpreadHalf, config.bot.spreadHalfMax));
-
-      // 记录统计
-      dailyStats.avgSpreadHalfUsed = (dailyStats.avgSpreadHalfUsed * dailyStats.spreadHalfUsedCount + dynamicSpreadHalf) / (dailyStats.spreadHalfUsedCount + 1);
-      dailyStats.spreadHalfUsedCount++;
-
-      // 动态计算挂单价：基础网格 + 库存倾斜
-      const myBidPrice = Number((midPrice - dynamicSpreadHalf - skewAdjustment).toFixed(2));
-      const myAskPrice = Number((midPrice + dynamicSpreadHalf - skewAdjustment).toFixed(2));
-
-      // 避免我们的挂单变成市价吃单 (Taker)
-      if (myBidPrice >= tm.bestAsk || myAskPrice <= tm.bestBid) {
-        console.log(`\n  -> Event: ${tm.eventTitle}`);
-        console.log(`     Skipping: Quote prices would cross the book (Taker).`);
-        continue;
-      }
-
-      console.log(`\n  -> Event: ${tm.eventTitle}`);
-      console.log(`     Market Spread: Bid ${tm.bestBid} | Mid ${midPrice.toFixed(3)} | Ask ${tm.bestAsk}`);
-      console.log(`     My Quotes    : Bid ${myBidPrice} | Ask ${myAskPrice} (Spread: ±${dynamicSpreadHalf.toFixed(3)}, Skew: -${skewAdjustment.toFixed(3)})`);
-      console.log(`     Net Exposure : ${currentNetYes} YES eq (~${currentExposureUSDC.toFixed(2)} USDC)`);
-
-      if (myBidPrice <= 0 || myAskPrice >= 1) {
-        console.log(`     Skipping: Quote prices out of valid bounds.`);
-        continue;
-      }
-
-      // === 4. 执行挂单 (双腿解封) ===
-      // 挂 Bid 腿 (买入 YES)
-      // 条件: 只要还没达到最大正向敞口，就可以买入 YES
-      if (currentNetYes >= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / midPrice)) {
-        try {
-          const res = await clobClient.createAndPostOrder({
-            tokenID: tm.yesTokenId,
-            price: myBidPrice,
-            side: Side.BUY,
-            size: size,
-            feeRateBps: 0,
-          });
-
-          if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-            console.log(`     [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
-          } else {
-            console.log(`     [+] Placed BUY YES (Bid) for ${size} shares at $${myBidPrice}`);
-            dailyStats.ordersPosted++;
-          }
-        } catch (e: any) {
-          console.log(`     [!] Failed to place BUY YES order: ${e.message}`);
-        }
-      }
-
-      // 挂 Ask 腿 (卖出 YES，如果不足则 买入 NO)
-      // 条件: 只要还没达到最大负向敞口，就可以提供 Ask
-      if (currentNetYes <= 0 || Math.abs(currentNetYes) < (maxMarketUSDC / (1 - midPrice))) {
-        if (invYes.yes >= size) {
-          // 有足够的 YES 库存，直接挂 SELL YES
-          try {
-            const res = await clobClient.createAndPostOrder({
-              tokenID: tm.yesTokenId,
-              price: myAskPrice,
-              side: Side.SELL,
-              size: size,
-              feeRateBps: 0,
-            });
-
-            if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-              console.log(`     [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
-            } else {
-              console.log(`     [-] Placed SELL YES (Ask) for ${size} shares at $${myAskPrice}`);
-              dailyStats.ordersPosted++;
-            }
-          } catch (e: any) {
-            console.log(`     [!] Failed to place SELL YES order: ${e.message}`);
-          }
-        } else {
-          // 没有足够的 YES 库存，启用最小双腿：通过 BUY NO 提供等效的 Ask
-          // 等效价格: 买入 NO 的价格 = 1 - 卖出 YES 的价格
-          const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
-          
-          if (buyNoPrice > 0 && buyNoPrice < 1) {
-            try {
-              const res = await clobClient.createAndPostOrder({
-                tokenID: tm.noTokenId,
-                price: buyNoPrice,
-                side: Side.BUY, // 买入 NO 相当于卖出 YES
-                size: size,
-                feeRateBps: 0,
-              });
-
-              if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-                console.log(`     [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
-              } else {
-                console.log(`     [-] Placed BUY NO (Eq Ask) for ${size} shares at $${buyNoPrice} (Eq YES Ask $${myAskPrice})`);
-                dailyStats.ordersPosted++;
-              }
-            } catch (e: any) {
-              console.log(`     [!] Failed to place BUY NO order: ${e.message}`);
-            }
-=======
       const skewRatio = Math.max(-1, Math.min(currentExposureUSDC / maxMarketUSDC, 1)) * (currentNetYes > 0 ? 1 : -1);
       const currentSkewFactor = isTimeDecayed ? config.bot.timeDecaySkewFactor : config.bot.inventorySkewFactor;
       const skewAdjustment = skewRatio * currentSkewFactor;
@@ -856,14 +691,11 @@ export async function runMarketMakingCycle() {
       // C. 硬止损 (Hard Stop-Loss) 抢一档平仓
       // `isHardStopTriggered` 已经在循环开头判定过了
       
-      if (isHardStopTriggered) {
-        console.log(`     [!] HARD STOP LOSS TRIGGERED (PnL: ${(currentPnlPct*100).toFixed(2)}%). Placing aggressive exit orders.`);
-      }
-
       // 如果为了满足最小 Size 导致挂单金额超过了可用敞口（且不是为了减仓），并且不是在减仓模式下，则跳过挂单
       const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut && 
                                   (buyYesCostUSDC <= availableExposureUSDC + 0.5) && 
-                                  (buyNoCostUSDC <= availableExposureUSDC + 0.5);
+                                  (buyNoCostUSDC <= availableExposureUSDC + 0.5) &&
+                                  (Math.max(buyYesCostUSDC, buyNoCostUSDC) <= cashBalance + 0.5);
 
       if (isTimeDecayed && !isHardStopTriggered) {
         console.log(`     [!] Time-Decay Triggered: Increasing skew factor to ${currentSkewFactor}`);
@@ -888,6 +720,14 @@ export async function runMarketMakingCycle() {
              myAskPrice = Math.max(tm.bestBid + 0.01, 0.01);
           } else {
              myBidPrice = Math.min(tm.bestAsk - 0.01, 0.99);
+          }
+        }
+        
+        if (isTimeDecayed && !isHardStopTriggered) {
+          if (currentNetYes > 0) {
+            myAskPrice = Math.max(tm.bestBid + 0.01, 0.01);
+          } else if (currentNetYes < 0) {
+            myBidPrice = Math.min(tm.bestAsk - 0.01, 0.99);
           }
         }
 
@@ -1054,7 +894,6 @@ export async function runMarketMakingCycle() {
             }
           } else {
             console.log(`     [Layer ${i+1}] [i] Skipping BUY NO (Ask): Exposure limits reached and no YES inventory to sell.`);
->>>>>>> origin/feature/polymarket-v2-migration
           }
         }
       }
