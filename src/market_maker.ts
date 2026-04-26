@@ -125,6 +125,7 @@ function saveState() {
   }
 }
 
+// 全局记录哪些市场必须使用 1000 费率，避免重复报错
 const feeRateOverrideByTokenId: Record<string, number> = {};
 
 async function createAndPostOrderWithFeeFallback(orderPayload: any, yesTokenId: string, noTokenId: string) {
@@ -132,13 +133,27 @@ async function createAndPostOrderWithFeeFallback(orderPayload: any, yesTokenId: 
     orderPayload.feeRateBps = feeRateOverrideByTokenId[orderPayload.tokenID] ?? 0;
   }
 
-  const res = await clobClient.createAndPostOrder(orderPayload);
+  let res;
+  try {
+    res = await clobClient.createAndPostOrder(orderPayload);
+  } catch (e: any) {
+    res = { error: e.message };
+  }
+
   const msg = `${res?.error || ''} ${res?.errorMessage || ''} ${res?.message || ''}`;
-  if (!USE_V2_SDK && orderPayload.feeRateBps !== 1000 && msg.includes('fee rate for the market must be 1000')) {
+  if (res && res.success === false) {
+     // success is false, but no error message, let's just say failed
+  }
+
+  if (!USE_V2_SDK && orderPayload.feeRateBps !== 1000 && msg.includes('must be 1000')) {
     feeRateOverrideByTokenId[yesTokenId] = 1000;
     feeRateOverrideByTokenId[noTokenId] = 1000;
     orderPayload.feeRateBps = 1000;
-    return await clobClient.createAndPostOrder(orderPayload);
+    try {
+      res = await clobClient.createAndPostOrder(orderPayload);
+    } catch (retryErr: any) {
+      res = { error: retryErr.message };
+    }
   }
 
   return res;
