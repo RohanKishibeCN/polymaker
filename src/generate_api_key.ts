@@ -1,4 +1,4 @@
-import { ClobClient } from '@polymarket/clob-client';
+import { Chain, ClobClient, SignatureTypeV2 } from '@polymarket/clob-client';
 import { createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
@@ -95,15 +95,14 @@ async function main() {
       transport: http('https://polygon-rpc.com'),
     });
 
-    const clobClient = new ClobClient(
-      'https://clob.polymarket.com',
-      137,
+    const clobClient = new ClobClient({
+      host: 'https://clob.polymarket.com',
+      chain: Chain.POLYGON,
       // @ts-ignore (viem WalletClient is supported but types might clash)
-      walletClient,
-      undefined,
-      2, // SignatureType.POLY_GNOSIS_SAFE
-      process.env.POLYMARKET_FUNDER_ADDRESS?.trim()
-    );
+      signer: walletClient,
+      signatureType: SignatureTypeV2.POLY_GNOSIS_SAFE,
+      funderAddress: process.env.POLYMARKET_FUNDER_ADDRESS?.trim(),
+    });
 
     // 3. 通过私钥对签名消息 (EIP-712) 派生出一组绝对匹配的 API Credentials
     console.log(`[+] Sending signature to Polymarket to derive API credentials...`);

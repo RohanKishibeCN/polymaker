@@ -1,4 +1,4 @@
-import { ClobClient, Side, SignatureType } from '@polymarket/clob-client';
+import { Chain, ClobClient, Side, SignatureTypeV2 } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
 
 // 通过环境变量开关来决定是否使用 V2 语法和新参数，以便 4 月 28 日平滑过渡
@@ -58,39 +58,18 @@ const wallet = new Wallet(privateKey);
 // 定制化的 axios httpsAgent，供 clob-client 内部使用
 const axiosHttpsAgent = proxyAgent ? proxyAgent : new https.Agent();
 
-let clobClient: any;
-
-if (USE_V2_SDK) {
-  // @ts-ignore - 兼容未来安装的 @polymarket/clob-client-v2
-  clobClient = new ClobClient({
-    host: 'https://clob.polymarket.com',
-    chain: 137,
-    wallet: wallet,
-    creds: {
-      key: config.polymarket.apiKey,
-      secret: config.polymarket.secret,
-      passphrase: config.polymarket.passphrase,
-    },
-    signatureType: SignatureType.POLY_GNOSIS_SAFE,
-    funderAddress: config.polymarket.funderAddress,
-    geoBlockToken: config.polymarket.geoBlockToken // (可选)
-  });
-} else {
-  clobClient = new ClobClient(
-    'https://clob.polymarket.com',
-    137,
-    // @ts-ignore
-    wallet,
-    {
-      key: config.polymarket.apiKey,
-      secret: config.polymarket.secret,
-      passphrase: config.polymarket.passphrase,
-    },
-    SignatureType.POLY_GNOSIS_SAFE,
-    config.polymarket.funderAddress,
-    config.polymarket.geoBlockToken
-  );
-}
+const clobClient: any = new ClobClient({
+  host: 'https://clob.polymarket.com',
+  chain: Chain.POLYGON,
+  signer: wallet,
+  creds: {
+    key: config.polymarket.apiKey,
+    secret: config.polymarket.secret,
+    passphrase: config.polymarket.passphrase,
+  },
+  signatureType: SignatureTypeV2.POLY_GNOSIS_SAFE,
+  funderAddress: config.polymarket.funderAddress,
+});
 
 // 覆盖 clobClient 内部的 axios 实例配置，让其走代理
 // @ts-ignore
