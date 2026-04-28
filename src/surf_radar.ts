@@ -7,6 +7,7 @@ const RADAR_FILE = path.join(__dirname, '../radar_signals.json');
 const TMP_FILE = path.join(__dirname, '../radar_signals.tmp');
 const SOS_FILE = path.join(__dirname, '../radar_sos.json');
 const QUOTA_LOCK_FILE = path.join(__dirname, '../.quota_exhausted_until');
+const SURF_BIN = 'npx --yes surf';
 
 interface RadarSignals {
   last_updated: number;
@@ -77,6 +78,20 @@ function writeAtomic(data: RadarSignals) {
   fs.renameSync(TMP_FILE, RADAR_FILE);
 }
 
+function runSurf(commandArgs: string): string {
+  return execSync(`${SURF_BIN} ${commandArgs}`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+function formatExecError(e: any): string {
+  const parts: string[] = [];
+  if (typeof e?.status !== 'undefined') parts.push(`status=${e.status}`);
+  if (e?.signal) parts.push(`signal=${e.signal}`);
+  if (e?.message) parts.push(`message=${String(e.message).split('\n')[0]}`);
+  const stderr = e?.stderr ? String(e.stderr).trim() : '';
+  if (stderr) parts.push(`stderr=${stderr.slice(0, 300)}`);
+  return parts.join(' | ') || 'unknown error';
+}
+
 // Action 1: Smart Money Scan
 function runAction1() {
   if (checkQuotaLock()) return;
@@ -97,7 +112,7 @@ function runAction1() {
   for (const conditionId of topMarkets.slice(0, 3)) {
     try {
       console.log(`[Surf Radar] Scanning Smart Money for condition: ${conditionId}`);
-      const output = execSync(`npx surf polymarket-smart-money --condition-id ${conditionId} --view summary`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+      const output = runSurf(`polymarket-smart-money --condition-id ${conditionId} --view summary`);
       
       let bias: 'YES' | 'NO' | 'NEUTRAL' = 'NEUTRAL';
       const outputLower = output.toLowerCase();
@@ -120,7 +135,7 @@ function runAction1() {
         handleQuotaExhausted();
         break;
       }
-      console.warn(`[Surf Radar] Error scanning smart money for ${conditionId}`);
+      console.warn(`[Surf Radar] Error scanning smart money for ${conditionId}: ${formatExecError(e)}`);
     }
   }
   writeAtomic(signals);
@@ -133,7 +148,7 @@ function runAction2() {
   
   const signals = readRadarSignals();
   try {
-    const output = execSync(`npx surf matching-market-pairs --active-only true --sort-by price_diff_pct --order desc --limit 5`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+    const output = runSurf(`matching-market-pairs --active-only true --sort-by price_diff_pct --order desc --limit 5`);
     
     const regex = /0x[a-fA-F0-9]{64}/g;
     let match;
@@ -145,7 +160,7 @@ function runAction2() {
     if (e.status === 4) {
       handleQuotaExhausted();
     } else {
-      console.warn(`[Surf Radar] Error scanning arbitrage pairs`);
+      console.warn(`[Surf Radar] Error scanning arbitrage pairs: ${formatExecError(e)}`);
     }
   }
   writeAtomic(signals);
@@ -163,7 +178,7 @@ function runAction3(conditionId: string, title: string) {
   try {
     // Search for breaking news that might explain the spread/jump
     const cleanTitle = title.replace(/[^a-zA-Z0-9\s]/g, '').substring(0, 50);
-    const output = execSync(`npx surf search-news --q "${cleanTitle}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+    const output = runSurf(`search-news --q "${cleanTitle}"`);
     
     const outputLower = output.toLowerCase();
     // A simple heuristic: if news mentions "breaking", "confirmed", "suspended", "sold", "scandal", "arrested" etc.
@@ -195,7 +210,7 @@ function runAction3(conditionId: string, title: string) {
     if (e.status === 4) {
       handleQuotaExhausted();
     } else {
-      console.warn(`[Surf Radar] Error processing SOS for ${conditionId}`);
+      console.warn(`[Surf Radar] Error processing SOS for ${conditionId}: ${formatExecError(e)}`);
     }
   }
   writeAtomic(signals);
