@@ -529,12 +529,15 @@ export async function runMarketMakingCycle() {
       let isWhitelisted = false;
       if (radarData && market.condition_id) {
          const marketSignal = radarData.markets?.[market.condition_id];
-         if (marketSignal && marketSignal.status === 'HALTED' && radarAge <= 10 * 60 * 1000) {
+         // TTL: HALTED 有效期 10 分钟
+         if (marketSignal && marketSignal.status === 'HALTED' && marketSignal.updated_at && (Date.now() - marketSignal.updated_at <= 10 * 60 * 1000)) {
             isHalted = true;
             console.log(`[Market Maker] [Surf] Market ${market.condition_id} is HALTED by Radar! Reason: ${marketSignal.reason || 'Unknown'}`);
          }
          
-         if (radarAge <= 6 * 60 * 60 * 1000 && radarData.target_whitelist && radarData.target_whitelist.includes(market.condition_id)) {
+         // TTL: 白名单有效期 6 小时
+         const wlSignal = radarData.target_whitelist?.[market.condition_id];
+         if (wlSignal && wlSignal.updated_at && (Date.now() - wlSignal.updated_at <= 6 * 60 * 60 * 1000)) {
             isWhitelisted = true;
             console.log(`[Market Maker] [Surf] Market ${market.condition_id} is in Whitelist! Prioritizing.`);
          }
@@ -606,10 +609,14 @@ export async function runMarketMakingCycle() {
            if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) continue;
 
            let smartMoneyBias = 'NEUTRAL';
-           if (radarData && market.condition_id && radarAge <= 6 * 60 * 60 * 1000) {
-              const bias = radarData.markets?.[market.condition_id]?.smart_money_bias;
-              if (bias === 'YES' || bias === 'NO') {
-                 smartMoneyBias = bias;
+           if (radarData && market.condition_id) {
+              const marketSignal = radarData.markets?.[market.condition_id];
+              // TTL: Smart Money Bias 有效期 6 小时
+              if (marketSignal && marketSignal.updated_at && (Date.now() - marketSignal.updated_at <= 6 * 60 * 60 * 1000)) {
+                  const bias = marketSignal.smart_money_bias;
+                  if (bias === 'YES' || bias === 'NO') {
+                     smartMoneyBias = bias;
+                  }
               }
            }
 
@@ -690,6 +697,25 @@ export async function runMarketMakingCycle() {
         const jump = Math.abs(midPrice - lastMid);
         if (jump >= 0.10) {
           console.log(`\n  -> Event: ${tm.eventTitle}`);
+          
+          // [V2 升级] 触发 Action 3 (SOS Wakeup)
+          try {
+             const sosFile = path.join(__dirname, '../radar_sos.json');
+             let sosData = { requests: [] as any[] };
+             if (fs.existsSync(sosFile)) {
+                sosData = JSON.parse(fs.readFileSync(sosFile, 'utf8'));
+             }
+             sosData.requests.push({
+                condition_id: tm.condition_id,
+                title: tm.eventTitle,
+                timestamp: Date.now()
+             });
+             fs.writeFileSync(sosFile, JSON.stringify(sosData), 'utf8');
+             console.log(`     [Surf Radar] Dispatched SOS request due to massive price jump.`);
+          } catch(e) {
+             // ignore
+          }
+
           if (isHardStopTriggered) {
              console.log(`     [!] Circuit Breaker: Price jumped by ${jump.toFixed(3)}, but HARD STOP triggered. Proceeding to liquidate.`);
           } else {
@@ -894,6 +920,25 @@ export async function runMarketMakingCycle() {
         // 如果触发了止损，且市场买卖价差过大（流动性极差），暂停止损防止被坑
         if ((isHardStopTriggered || isTimeDecayed) && (tm.bestAsk - tm.bestBid) > 0.3) {
            console.log(`     [Layer ${i+1}] [!] Spread too wide (${(tm.bestAsk - tm.bestBid).toFixed(2)}). Pausing liquidation to avoid excessive slippage.`);
+           
+           // [V2 升级] 触发 Action 3 (SOS Wakeup)
+           try {
+              const sosFile = path.join(__dirname, '../radar_sos.json');
+              let sosData = { requests: [] as any[] };
+              if (fs.existsSync(sosFile)) {
+                 sosData = JSON.parse(fs.readFileSync(sosFile, 'utf8'));
+              }
+              sosData.requests.push({
+                 condition_id: tm.condition_id,
+                 title: tm.eventTitle,
+                 timestamp: Date.now()
+              });
+              fs.writeFileSync(sosFile, JSON.stringify(sosData), 'utf8');
+              console.log(`     [Surf Radar] Dispatched SOS request due to illiquid spread during liquidation.`);
+           } catch(e) {
+              // ignore
+           }
+
            continue;
         }
 
