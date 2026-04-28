@@ -778,17 +778,25 @@ export async function runMarketMakingCycle() {
         // C. 硬止损 (Hard Stop-Loss) 抢一档平仓
         if (isHardStopTriggered) {
           if (currentNetYes > 0) {
-             myAskPrice = Math.max(tm.bestBid + 0.01, 0.01);
+             // 止损：不再无脑砸 0.01，而是以 MidPrice - 宽价差 作为安全地板价，防止滑点割肉
+             const floorPrice = Math.max(0.01, Number((midPrice - config.bot.spreadHalfMax * 2).toFixed(2)));
+             myAskPrice = Math.max(tm.bestBid + 0.01, floorPrice);
           } else {
-             myBidPrice = Math.min(tm.bestAsk - 0.01, 0.99);
+             // 止损买回：不再无脑追 0.99，而是以 MidPrice + 宽价差 作为安全天花板
+             const ceilingPrice = Math.min(0.99, Number((midPrice + config.bot.spreadHalfMax * 2).toFixed(2)));
+             myBidPrice = Math.min(tm.bestAsk - 0.01, ceilingPrice);
           }
         }
         
         if (isTimeDecayed && !isHardStopTriggered) {
           if (currentNetYes > 0) {
-            myAskPrice = Math.max(tm.bestBid + 0.01, 0.01);
+            // 时间衰减：以 MidPrice - 宽价差 作为安全地板价
+            const floorPrice = Math.max(0.01, Number((midPrice - config.bot.spreadHalfMax * 1.5).toFixed(2)));
+            myAskPrice = Math.max(tm.bestBid + 0.01, floorPrice);
           } else if (currentNetYes < 0) {
-            myBidPrice = Math.min(tm.bestAsk - 0.01, 0.99);
+            // 时间衰减买回：以 MidPrice + 宽价差 作为安全天花板
+            const ceilingPrice = Math.min(0.99, Number((midPrice + config.bot.spreadHalfMax * 1.5).toFixed(2)));
+            myBidPrice = Math.min(tm.bestAsk - 0.01, ceilingPrice);
           }
         }
 
@@ -808,6 +816,13 @@ export async function runMarketMakingCycle() {
           console.log(`     Market Spread: Bid ${tm.bestBid} | Mid ${midPrice.toFixed(3)} | Ask ${tm.bestAsk}`);
           console.log(`     Net Exposure : ${currentNetYes} YES eq (~${currentExposureUSDC.toFixed(2)} USDC)`);
         }
+        
+        // 如果触发了止损，且市场买卖价差过大（流动性极差），暂停止损防止被坑
+        if ((isHardStopTriggered || isTimeDecayed) && (tm.bestAsk - tm.bestBid) > 0.3) {
+           console.log(`     [Layer ${i+1}] [!] Spread too wide (${(tm.bestAsk - tm.bestBid).toFixed(2)}). Pausing liquidation to avoid excessive slippage.`);
+           continue;
+        }
+
         console.log(`     [Layer ${i+1}] Quotes: Bid ${myBidPrice} | Ask ${myAskPrice} (SpreadMult: ${layer.spreadMult}, Size: ${currentLayerSize})`);
 
         if (myBidPrice <= 0 || myAskPrice >= 1) {
