@@ -7,7 +7,7 @@ const RADAR_FILE = path.join(__dirname, '../radar_signals.json');
 const TMP_FILE = path.join(__dirname, '../radar_signals.tmp');
 const SOS_FILE = path.join(__dirname, '../radar_sos.json');
 const QUOTA_LOCK_FILE = path.join(__dirname, '../.quota_exhausted_until');
-const SURF_BIN = 'npx --yes surf';
+const SURF_BIN = 'npx --yes skills surf';
 
 interface RadarSignals {
   last_updated: number;
