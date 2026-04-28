@@ -1,6 +1,24 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+function parseNumberEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function parseIntEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+const scanIntervalMinutesEnv = parseNumberEnv('POLYMARKET_SCAN_INTERVAL_MINUTES');
+const targetMarketsCountEnv = parseIntEnv('POLYMARKET_TARGET_MARKETS_COUNT');
+const tagQuotaEnv = parseIntEnv('POLYMARKET_TAG_QUOTA');
+
 export const config = {
   polymarket: {
     apiKey: (process.env.POLYMARKET_API_KEY || '').trim(),
@@ -16,9 +34,9 @@ export const config = {
     databaseId: (process.env.NOTION_DATABASE_ID || '').trim(),
   },
   bot: {
-    scanIntervalMs: 3600 * 1000,
-    targetMarketsCount: 7,
-    tagQuota: 2,
+    scanIntervalMs: (scanIntervalMinutesEnv && scanIntervalMinutesEnv > 0 ? scanIntervalMinutesEnv * 60 * 1000 : 3600 * 1000),
+    targetMarketsCount: (targetMarketsCountEnv && targetMarketsCountEnv > 0 ? targetMarketsCountEnv : 7),
+    tagQuota: (tagQuotaEnv && tagQuotaEnv > 0 ? tagQuotaEnv : 2),
     sizePct: 0.05,
     maxMarketPct: 0.15,
     spreadHalfBase: 0.02,

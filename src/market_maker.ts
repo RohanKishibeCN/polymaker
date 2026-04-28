@@ -198,11 +198,15 @@ let lastSummaryDateStr = '';
 // 获取 USDC 余额辅助函数
 async function getCashBalance(): Promise<number> {
   try {
-    const collateralAddress = USE_V2_SDK 
-      ? '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174' // V2: USDC.e
-      : '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // V1: USDC.e
-    const userAddress = wallet.address;
-    const data = `0x70a08231000000000000000000000000${userAddress.replace('0x', '')}`;
+    const envCollateral = (process.env.POLYMARKET_COLLATERAL_ADDRESS || '').trim();
+    const collateralAddress = envCollateral
+      ? envCollateral
+      : (USE_V2_SDK
+          ? '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'
+          : '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174');
+    const userAddress = config.polymarket.funderAddress;
+    const cleanAddress = userAddress.replace(/^0x/i, '').padStart(64, '0');
+    const data = `0x70a08231${cleanAddress}`;
     
     const rpcUrl = process.env.RPC_URL || 'https://polygon-rpc.com';
     const response = await fetch(rpcUrl, {
