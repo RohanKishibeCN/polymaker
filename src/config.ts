@@ -18,6 +18,7 @@ function parseIntEnv(name: string): number | undefined {
 const scanIntervalMinutesEnv = parseNumberEnv('POLYMARKET_SCAN_INTERVAL_MINUTES');
 const targetMarketsCountEnv = parseIntEnv('POLYMARKET_TARGET_MARKETS_COUNT');
 const tagQuotaEnv = parseIntEnv('POLYMARKET_TAG_QUOTA');
+const initialCapitalEnv = parseNumberEnv('POLYMARKET_INITIAL_CAPITAL');
 
 export const config = {
   polymarket: {
@@ -46,7 +47,7 @@ export const config = {
     timeDecaySkewFactor: 0.06, // 加大出清力度
     hardStopLossPct: -0.15,
     enableDualLayerGrid: true,
-    initialCapital: 500 
+    initialCapital: (initialCapitalEnv && initialCapitalEnv > 0 ? initialCapitalEnv : 500)
   }
 };
 

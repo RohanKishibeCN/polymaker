@@ -261,7 +261,7 @@ export async function runDailySummary() {
     }
 
     const totalEquity = cashBalance + portfolioValue;
-    const initialCapital = config.bot.initialCapital || 70;
+    const initialCapital = config.bot.initialCapital;
     const totalPnL = totalEquity - initialCapital;
     const pnlPercent = (totalPnL / initialCapital) * 100;
 
