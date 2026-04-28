@@ -62,6 +62,8 @@ const clobClient: any = new ClobClient({
   host: 'https://clob.polymarket.com',
   chain: Chain.POLYGON,
   signer: wallet,
+  throwOnError: true,
+  retryOnError: true,
   creds: {
     key: config.polymarket.apiKey,
     secret: config.polymarket.secret,

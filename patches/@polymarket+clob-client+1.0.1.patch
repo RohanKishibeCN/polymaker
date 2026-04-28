@@ -1,0 +1,34 @@
+diff --git a/node_modules/@polymarket/clob-client/dist/index.cjs b/node_modules/@polymarket/clob-client/dist/index.cjs
+index 82e1c99..6939778 100644
+--- a/node_modules/@polymarket/clob-client/dist/index.cjs
++++ b/node_modules/@polymarket/clob-client/dist/index.cjs
+@@ -372,13 +372,28 @@ var del = async (endpoint, options) => {
+ var errorHandling = (err) => {
+   if (import_axios.default.isAxiosError(err)) {
+     if (err.response) {
++      const safeConfig = (() => {
++        try {
++          const cfg = err.response?.config;
++          if (!cfg || typeof cfg !== "object") return cfg;
++          const headers = cfg.headers && typeof cfg.headers === "object" ? { ...cfg.headers } : void 0;
++          if (headers) {
++            for (const k of Object.keys(headers)) {
++              if (k.toUpperCase().startsWith("POLY_")) headers[k] = "***";
++            }
++          }
++          return { ...cfg, headers };
++        } catch (e) {
++          return void 0;
++        }
++      })();
+       console.error(
+         "[CLOB Client] request error",
+         JSON.stringify({
+           status: err.response?.status,
+           statusText: err.response?.statusText,
+           data: err.response?.data,
+-          config: err.response?.config
++          config: safeConfig
+         })
+       );
+       if (err.response?.data) {

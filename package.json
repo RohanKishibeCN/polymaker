@@ -8,7 +8,8 @@
     "start": "ts-node src/index.ts",
     "build": "tsc",
     "radar": "ts-node src/surf_radar.ts",
-    "pm2": "pm2 start npm --name 'polymarket-bot' -- start"
+    "pm2": "pm2 start npm --name 'polymarket-bot' -- start",
+    "postinstall": "patch-package"
   },
   "keywords": [],
   "author": "",
@@ -24,6 +25,7 @@
     "undici": "^8.0.2"
   },
   "devDependencies": {
+    "patch-package": "^8.0.0",
     "@types/node": "^25.6.0",
     "@types/node-fetch": "^2.6.13",
     "ts-node": "^10.9.2",
