@@ -384,11 +384,40 @@ let lastMarketOffset: number = 0;
 // 持久化保存所有有库存的市场元数据，防止分页轮转期间被跳过导致断单被套
 let cachedInventoryMarkets: any[] = [];
 
+// [V2 升级] 雷达信号读取辅助函数
+function getRadarSignals(): any {
+  const radarPath = path.join(__dirname, '../radar_signals.json');
+  try {
+    if (fs.existsSync(radarPath)) {
+      const data = JSON.parse(fs.readFileSync(radarPath, 'utf8'));
+      const age = Date.now() - data.last_updated;
+      if (age > 12 * 60 * 60 * 1000) {
+        console.log(`[Market Maker] [!] Radar signals expired (age > 12h). Falling back to basic Gamma API.`);
+        return null;
+      }
+      return { data, age };
+    }
+  } catch (e) {
+    // ignore
+  }
+  return null;
+}
+
 export async function runMarketMakingCycle() {
   console.log(`\n[${new Date().toISOString()}] =====================================`);
   console.log(`[Market Maker] Starting liquidity rewards & grid cycle...`);
 
   try {
+    // [V2 升级] 读取雷达信号
+    const radar = getRadarSignals();
+    let radarData: any = null;
+    let radarAge: number = 0;
+    if (radar) {
+      radarData = radar.data;
+      radarAge = radar.age;
+      console.log(`[Market Maker] Surf Radar signals loaded. Age: ${Math.floor(radarAge/1000/60)} mins.`);
+    }
+
     // 0. 从链上/API 同步真实的持仓数据
     const portfolioValue = await syncInventoryFromChain();
     const cashBalance = await getCashBalance();
@@ -451,6 +480,7 @@ export async function runMarketMakingCycle() {
         const formattedMarket = {
           question: gm.question,
           token_id: gm.clobTokenIds,
+          condition_id: gm.conditionId,
           active: true,
           rewards: gm.clobRewards || [],
           rewardsMinSize: gm.rewardsMinSize || 0,
@@ -494,8 +524,29 @@ export async function runMarketMakingCycle() {
           nextCachedInventoryMarkets.push(market);
       }
 
-      // 如果没有库存，且新开市场数量已经达到上限，跳过该市场
-      if (!hasInventory && newMarketsCount >= config.bot.targetMarketsCount) {
+      // [V2 升级] 读取雷达状态
+      let isHalted = false;
+      let isWhitelisted = false;
+      if (radarData && market.condition_id) {
+         const marketSignal = radarData.markets?.[market.condition_id];
+         if (marketSignal && marketSignal.status === 'HALTED' && radarAge <= 10 * 60 * 1000) {
+            isHalted = true;
+            console.log(`[Market Maker] [Surf] Market ${market.condition_id} is HALTED by Radar! Reason: ${marketSignal.reason || 'Unknown'}`);
+         }
+         
+         if (radarAge <= 6 * 60 * 60 * 1000 && radarData.target_whitelist && radarData.target_whitelist.includes(market.condition_id)) {
+            isWhitelisted = true;
+            console.log(`[Market Maker] [Surf] Market ${market.condition_id} is in Whitelist! Prioritizing.`);
+         }
+      }
+
+      // 如果雷达挂了红牌，直接拉黑该市场，跳过做市（撤单由全局 cancelAll 负责，或后续新增）
+      if (isHalted) {
+         continue;
+      }
+
+      // 如果没有库存，且未被白名单标记，且新开市场数量已经达到上限，跳过该市场
+      if (!hasInventory && !isWhitelisted && newMarketsCount >= config.bot.targetMarketsCount) {
         continue;
       }
 
@@ -554,8 +605,17 @@ export async function runMarketMakingCycle() {
         if (hasInventory || (bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
            if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) continue;
 
+           let smartMoneyBias = 'NEUTRAL';
+           if (radarData && market.condition_id && radarAge <= 6 * 60 * 60 * 1000) {
+              const bias = radarData.markets?.[market.condition_id]?.smart_money_bias;
+              if (bias === 'YES' || bias === 'NO') {
+                 smartMoneyBias = bias;
+              }
+           }
+
            targetMarkets.push({
              eventTitle: market.question || market.market || "Unknown Market", 
+             condition_id: market.condition_id,
              yesTokenId,
              noTokenId,
              bestBid,
@@ -563,7 +623,8 @@ export async function runMarketMakingCycle() {
              bidSizeTop,
              askSizeTop,
              spread: bestAsk - bestBid,
-             rewardsMinSize: market.rewardsMinSize || 20
+             rewardsMinSize: market.rewardsMinSize || 20,
+             smartMoneyBias
            });
 
            // 更新该市场所有 tag 的计数（无论新老，只要入选就占用配额，防止新市场扎堆）
@@ -775,6 +836,19 @@ export async function runMarketMakingCycle() {
         let myBidPrice = Number((midPrice - layerDynamicSpreadHalf - skewAdjustment).toFixed(2));
         let myAskPrice = Number((midPrice + layerDynamicSpreadHalf - skewAdjustment).toFixed(2));
 
+        // [V2 升级] 应用 Smart Money Bias (跟随巨鲸)
+        if (tm.smartMoneyBias === 'YES') {
+           // 巨鲸在买 YES，我们提高卖出价 (惜售) 并压低买入价 (防接盘)
+           myAskPrice = Math.min(0.99, Number((myAskPrice + config.bot.spreadHalfMax).toFixed(2)));
+           myBidPrice = Math.max(0.01, Number((myBidPrice - config.bot.spreadHalfMax).toFixed(2)));
+           if (i === 0) console.log(`     [!] Smart Money is buying YES. Adjusting quotes to be defensive.`);
+        } else if (tm.smartMoneyBias === 'NO') {
+           // 巨鲸在买 NO (等效于卖 YES)，我们压低买入价 (防接盘) 并调低卖出价 (跟着跑)
+           myBidPrice = Math.max(0.01, Number((myBidPrice - config.bot.spreadHalfMax).toFixed(2)));
+           myAskPrice = Math.max(0.01, Number((myAskPrice - config.bot.spreadHalfMax).toFixed(2)));
+           if (i === 0) console.log(`     [!] Smart Money is buying NO. Adjusting quotes to be defensive.`);
+        }
+
         // C. 硬止损 (Hard Stop-Loss) 抢一档平仓
         if (isHardStopTriggered) {
           if (currentNetYes > 0) {
@@ -967,6 +1041,34 @@ export async function runMarketMakingCycle() {
     }
 
     console.log(`[Market Maker] Cycle complete. Waiting for next interval.`);
+
+    // ==========================================
+    // [V2 升级] 导出重仓市场的 condition_id 供 Surf Radar 读取
+    // ==========================================
+    try {
+      const topInventoryMarkets = targetMarkets
+        .filter(tm => {
+           const currentNetYes = (inventory[tm.yesTokenId]?.yes || 0) - (inventory[tm.noTokenId]?.yes || 0) + (inventory[tm.noTokenId]?.no || 0) - (inventory[tm.yesTokenId]?.no || 0);
+           return Math.abs(currentNetYes) > 0;
+        })
+        .map(tm => {
+           const currentNetYes = (inventory[tm.yesTokenId]?.yes || 0) - (inventory[tm.noTokenId]?.yes || 0) + (inventory[tm.noTokenId]?.no || 0) - (inventory[tm.yesTokenId]?.no || 0);
+           const midPrice = (tm.bestBid + tm.bestAsk) / 2;
+           const exposure = Math.abs(currentNetYes) * (currentNetYes > 0 ? midPrice : (1 - midPrice));
+           return { conditionId: tm.condition_id, exposure };
+        })
+        .sort((a, b) => b.exposure - a.exposure)
+        .map(tm => tm.conditionId)
+        .filter(id => id !== undefined);
+
+      fs.writeFileSync(path.join(__dirname, '../inventory_state.json'), JSON.stringify({
+        last_updated: Date.now(),
+        top_markets: topInventoryMarkets
+      }, null, 2), 'utf8');
+    } catch (e) {
+      console.warn(`[Market Maker] Failed to write inventory_state.json`);
+    }
+
   } catch (error) {
     console.error('[Market Maker] Fatal error in cycle:', error);
   }
