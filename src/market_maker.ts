@@ -543,10 +543,9 @@ export async function runMarketMakingCycle() {
          }
       }
 
-      // 如果雷达挂了红牌，直接拉黑该市场，跳过做市（撤单由全局 cancelAll 负责，或后续新增）
-      if (isHalted) {
-         continue;
-      }
+      // 如果雷达挂了红牌，不仅不应该跳过，反而应该强行清仓！
+      // 将 isHalted 标记传递给 targetMarkets，在下游挂单逻辑中触发 Hard Stop
+      // ==========================================
 
       // 如果没有库存，且未被白名单标记，且新开市场数量已经达到上限，跳过该市场
       if (!hasInventory && !isWhitelisted && newMarketsCount >= config.bot.targetMarketsCount) {
@@ -631,7 +630,8 @@ export async function runMarketMakingCycle() {
              askSizeTop,
              spread: bestAsk - bestBid,
              rewardsMinSize: market.rewardsMinSize || 20,
-             smartMoneyBias
+             smartMoneyBias,
+             isHalted
            });
 
            // 更新该市场所有 tag 的计数（无论新老，只要入选就占用配额，防止新市场扎堆）
@@ -689,6 +689,13 @@ export async function runMarketMakingCycle() {
         console.log(`\n  -> Event: ${tm.eventTitle}`);
         console.log(`     [!] HARD STOP LOSS TRIGGERED! PnL: YES=${(invYes.pnlPct!*100).toFixed(2)}%, NO=${(invNo.pnlPct!*100).toFixed(2)}%`);
         console.log(`     [!] Will place aggressive reduce-only orders.`);
+        isHardStopTriggered = true;
+      }
+      
+      // [V2 升级] 如果被雷达挂了 HALTED 红牌，强制触发硬止损清仓！
+      if (tm.isHalted) {
+        console.log(`\n  -> Event: ${tm.eventTitle}`);
+        console.log(`     [!] RADAR HALT TRIGGERED! Forcing liquidation to withdraw funds.`);
         isHardStopTriggered = true;
       }
       // === 1. 快照级事后熔断 (Circuit Breaker) ===

@@ -97,7 +97,7 @@ function runAction1() {
   for (const conditionId of topMarkets.slice(0, 3)) {
     try {
       console.log(`[Surf Radar] Scanning Smart Money for condition: ${conditionId}`);
-      const output = execSync(`surf polymarket-smart-money --condition-id ${conditionId} --view summary`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+      const output = execSync(`npx surf polymarket-smart-money --condition-id ${conditionId} --view summary`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
       
       let bias: 'YES' | 'NO' | 'NEUTRAL' = 'NEUTRAL';
       const outputLower = output.toLowerCase();
@@ -133,7 +133,7 @@ function runAction2() {
   
   const signals = readRadarSignals();
   try {
-    const output = execSync(`surf matching-market-pairs --active-only true --sort-by price_diff_pct --order desc --limit 5`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+    const output = execSync(`npx surf matching-market-pairs --active-only true --sort-by price_diff_pct --order desc --limit 5`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
     
     const regex = /0x[a-fA-F0-9]{64}/g;
     let match;
@@ -163,7 +163,7 @@ function runAction3(conditionId: string, title: string) {
   try {
     // Search for breaking news that might explain the spread/jump
     const cleanTitle = title.replace(/[^a-zA-Z0-9\s]/g, '').substring(0, 50);
-    const output = execSync(`surf search-news --q "${cleanTitle}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+    const output = execSync(`npx surf search-news --q "${cleanTitle}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
     
     const outputLower = output.toLowerCase();
     // A simple heuristic: if news mentions "breaking", "confirmed", "suspended", "sold", "scandal", "arrested" etc.
