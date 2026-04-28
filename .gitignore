@@ -2,3 +2,9 @@ node_modules/
 dist/
 .env
 *.log
+radar_signals.json
+radar_sos.json
+inventory_state.json
+.quota_exhausted_until
+radar_signals.tmp
+*.tmp
