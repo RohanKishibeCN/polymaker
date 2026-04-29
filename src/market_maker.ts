@@ -405,7 +405,7 @@ export async function runMarketMakingCycle() {
 
     // 0. 从链上/API 同步真实的持仓数据
     const portfolioValue = await syncInventoryFromChain();
-    const cashBalance = await getCashBalance();
+    let cashBalance = await getCashBalance();
     const totalEquity = Math.max(cashBalance + portfolioValue, config.bot.initialCapital); // 保底，避免获取失败导致 size=0
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} USDC`);
 
@@ -981,23 +981,29 @@ export async function runMarketMakingCycle() {
           }
         } else {
           if (canIncreaseExposure) {
-            try {
-              const orderPayload: any = {
-                tokenID: tm.yesTokenId,
-                price: myBidPrice,
-                side: Side.BUY,
-                size: currentLayerSize,
-              };
-              const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
-
-              if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-                console.log(`     [Layer ${i+1}] [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
-              } else {
-                console.log(`     [Layer ${i+1}] [+] Placed BUY YES (Bid) for ${currentLayerSize} shares at $${myBidPrice}`);
-                dailyStats.ordersPosted++;
+            const cost = currentLayerSize * myBidPrice;
+            if (cost > cashBalance) {
+              console.log(`     [Layer ${i+1}] [i] Skipping BUY YES (Bid): Cost (${cost.toFixed(2)}) exceeds available cash (${cashBalance.toFixed(2)}).`);
+            } else {
+              try {
+                const orderPayload: any = {
+                  tokenID: tm.yesTokenId,
+                  price: myBidPrice,
+                  side: Side.BUY,
+                  size: currentLayerSize,
+                };
+                const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
+  
+                if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+                  console.log(`     [Layer ${i+1}] [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+                } else {
+                  console.log(`     [Layer ${i+1}] [+] Placed BUY YES (Bid) for ${currentLayerSize} shares at $${myBidPrice}`);
+                  dailyStats.ordersPosted++;
+                  cashBalance -= cost; // 扣减本地可用余额
+                }
+              } catch (e: any) {
+                console.log(`     [Layer ${i+1}] [!] Failed to place BUY YES order: ${e.message}`);
               }
-            } catch (e: any) {
-              console.log(`     [Layer ${i+1}] [!] Failed to place BUY YES order: ${e.message}`);
             }
           } else {
             if (!canIncreaseExposure) {
@@ -1049,23 +1055,29 @@ export async function runMarketMakingCycle() {
           if (canIncreaseExposure) {
             const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
             if (buyNoPrice > 0 && buyNoPrice < 1) {
-              try {
-                const orderPayload: any = {
-                  tokenID: tm.noTokenId,
-                  price: buyNoPrice,
-                  side: Side.BUY,
-                  size: currentLayerSize,
-                };
-                const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
-
-                if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
-                  console.log(`     [Layer ${i+1}] [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
-                } else {
-                  console.log(`     [Layer ${i+1}] [-] Placed BUY NO (Eq Ask) for ${currentLayerSize} shares at $${buyNoPrice}`);
-                  dailyStats.ordersPosted++;
+              const cost = currentLayerSize * buyNoPrice;
+              if (cost > cashBalance) {
+                console.log(`     [Layer ${i+1}] [i] Skipping BUY NO (Ask): Cost (${cost.toFixed(2)}) exceeds available cash (${cashBalance.toFixed(2)}).`);
+              } else {
+                try {
+                  const orderPayload: any = {
+                    tokenID: tm.noTokenId,
+                    price: buyNoPrice,
+                    side: Side.BUY,
+                    size: currentLayerSize,
+                  };
+                  const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
+  
+                  if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
+                    console.log(`     [Layer ${i+1}] [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
+                  } else {
+                    console.log(`     [Layer ${i+1}] [-] Placed BUY NO (Eq Ask) for ${currentLayerSize} shares at $${buyNoPrice}`);
+                    dailyStats.ordersPosted++;
+                    cashBalance -= cost; // 扣减本地可用余额
+                  }
+                } catch (e: any) {
+                  console.log(`     [Layer ${i+1}] [!] Failed to place BUY NO order: ${e.message}`);
                 }
-              } catch (e: any) {
-                console.log(`     [Layer ${i+1}] [!] Failed to place BUY NO order: ${e.message}`);
               }
             }
           } else {
