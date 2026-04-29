@@ -871,7 +871,7 @@ export async function runMarketMakingCycle() {
       let isExposureMaxedOut = false;
       if (currentExposureUSDC >= maxMarketUSDC && maxMarketUSDC > 0) {
         console.log(`\n  -> Event: ${tm.eventTitle}`);
-        console.log(`     [!] Exposure Maxed Out: ${currentExposureUSDC.toFixed(2)} USDC >= Limit ${maxMarketUSDC.toFixed(2)} USDC. Will only place reducing orders.`);
+        console.log(`     [!] Exposure Maxed Out: ${currentExposureUSDC.toFixed(2)} ${COLLATERAL_SYMBOL} >= Limit ${maxMarketUSDC.toFixed(2)} ${COLLATERAL_SYMBOL}. Will only place reducing orders.`);
         isExposureMaxedOut = true;
       }
 
@@ -964,7 +964,7 @@ export async function runMarketMakingCycle() {
         // 重新计算该层是否能正常开仓
         const layerBuyYesCostUSDC = currentLayerSize * midPrice;
         const layerBuyNoCostUSDC = currentLayerSize * (1 - midPrice);
-        const epsilon = 0.05; // 增加一定的缓冲，应对微小超出（比如计算需要 75.02 USDC，实际可用 75 USDC）
+        const epsilon = 0.05; // 增加一定的缓冲，应对微小超出（比如计算需要 75.02，实际可用 75）
 
         const cashAvailableForBuys = Math.max(0, cashBalance - reserveCashUsdc);
         const isHardFrozen = tm.spread > freezeAddSpreadHard;
@@ -1040,7 +1040,7 @@ export async function runMarketMakingCycle() {
         if (i === 0) {
           console.log(`\n  -> Event: ${tm.eventTitle}`);
           console.log(`     Market Spread: Bid ${tm.bestBid} | Mid ${midPrice.toFixed(3)} | Ask ${tm.bestAsk}`);
-          console.log(`     Net Exposure : ${currentNetYes} YES eq (~${currentExposureUSDC.toFixed(2)} USDC)`);
+          console.log(`     Net Exposure : ${currentNetYes} YES eq (~${currentExposureUSDC.toFixed(2)} ${COLLATERAL_SYMBOL})`);
         }
         
         // 如果触发了止损，且市场买卖价差过大（流动性极差），暂停止损防止被坑
