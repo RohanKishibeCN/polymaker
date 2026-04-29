@@ -176,7 +176,43 @@ function getValidTokenIds(rawTokenId: any): [string, string] | null {
 // 记录每天是否已经推送过总结
 let lastSummaryDateStr = '';
 
-// 获取 USDC 余额辅助函数
+const COLLATERAL_SYMBOL = (process.env.POLYMARKET_COLLATERAL_SYMBOL || 'USDC').trim() || 'USDC';
+let cachedCollateralDecimals: number | undefined;
+
+async function getCollateralDecimals(collateralAddress: string): Promise<number> {
+  const envDecimalsRaw = (process.env.POLYMARKET_COLLATERAL_DECIMALS || '').trim();
+  if (envDecimalsRaw) {
+    const n = parseInt(envDecimalsRaw, 10);
+    if (Number.isFinite(n) && n >= 0 && n <= 36) return n;
+  }
+
+  if (cachedCollateralDecimals !== undefined) return cachedCollateralDecimals;
+
+  const rpcUrl = process.env.RPC_URL || 'https://polygon-rpc.com';
+  const response = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "eth_call",
+      params: [{ to: collateralAddress, data: "0x313ce567" }, "latest"]
+    })
+  });
+  const rpcData = await response.json();
+  if (rpcData && rpcData.result) {
+    const decimals = parseInt(rpcData.result, 16);
+    if (Number.isFinite(decimals) && decimals >= 0 && decimals <= 36) {
+      cachedCollateralDecimals = decimals;
+      return decimals;
+    }
+  }
+
+  cachedCollateralDecimals = 6;
+  return 6;
+}
+
+// 获取稳定币余额辅助函数
 async function getCashBalance(): Promise<number> {
   try {
     const envCollateral = (process.env.POLYMARKET_COLLATERAL_ADDRESS || '').trim();
@@ -202,7 +238,12 @@ async function getCashBalance(): Promise<number> {
     });
     const rpcData = await response.json();
     if (rpcData && rpcData.result) {
-      return parseInt(rpcData.result, 16) / 1e6;
+      const decimals = await getCollateralDecimals(collateralAddress);
+      const raw = BigInt(rpcData.result);
+      const divisor = 10n ** BigInt(decimals);
+      const whole = raw / divisor;
+      const frac = raw % divisor;
+      return Number(whole) + Number(frac) / Number(divisor);
     }
   } catch (e) {
     console.warn("Failed to get cash balance");
@@ -214,7 +255,7 @@ export async function runDailySummary() {
   try {
     console.log(`[Daily Summary] Generating daily summary...`);
 
-    // 1. 获取 USDC 余额
+    // 1. 获取稳定币余额
     let cashBalance = await getCashBalance();
 
     // 2. 获取真实的各事件持仓明细和未实现盈亏
@@ -245,7 +286,7 @@ export async function runDailySummary() {
             // Truncate title to save Notion chars
             const shortTitle = pos.title ? pos.title.substring(0, 40) + (pos.title.length > 40 ? '...' : '') : 'Unknown';
             const pnlSign = cashPnl >= 0 ? '+' : '';
-            positionsDetail += `${index}. [${shortTitle}] - ${size} ${pos.outcome} (Eq ~${currentValue.toFixed(2)} USDC) - PnL: ${pnlSign}${cashPnl.toFixed(2)}\n`;
+            positionsDetail += `${index}. [${shortTitle}] - ${size} ${pos.outcome} (Eq ~${currentValue.toFixed(2)} ${COLLATERAL_SYMBOL}) - PnL: ${pnlSign}${cashPnl.toFixed(2)}\n`;
           }
           index++;
         }
@@ -269,8 +310,8 @@ export async function runDailySummary() {
 
     // 3. 构建 Content (Notion Scheme A)
     let content = `📊 [ACCOUNT]\n`;
-    content += `Equity: ~${totalEquity.toFixed(2)} USDC | Cash: ${cashBalance.toFixed(2)} USDC\n`;
-    content += `PnL: ${totalPnL >= 0 ? '+' : ''}${totalPnL.toFixed(2)} USDC (${totalPnL >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%) | MaxDD: N/A\n\n`;
+    content += `Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL} | Cash: ${cashBalance.toFixed(2)} ${COLLATERAL_SYMBOL}\n`;
+    content += `PnL: ${totalPnL >= 0 ? '+' : ''}${totalPnL.toFixed(2)} ${COLLATERAL_SYMBOL} (${totalPnL >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%) | MaxDD: N/A\n\n`;
     
     content += `🔄 [FLOW]\n`;
     content += `Orders Posted: ${dailyStats.ordersPosted} | Canceled: ${dailyStats.ordersCanceled}\n`;
@@ -407,7 +448,7 @@ export async function runMarketMakingCycle() {
     const portfolioValue = await syncInventoryFromChain();
     let cashBalance = await getCashBalance();
     const totalEquity = Math.max(cashBalance + portfolioValue, config.bot.initialCapital); // 保底，避免获取失败导致 size=0
-    console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} USDC`);
+    console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
 
     // 1. 获取 Gamma 市场数据
     // Polymarket 最近在 /events 端点中移除了 clobRewards 数据，因此我们改用 /markets 端点
