@@ -19,6 +19,10 @@ const scanIntervalMinutesEnv = parseNumberEnv('POLYMARKET_SCAN_INTERVAL_MINUTES'
 const targetMarketsCountEnv = parseIntEnv('POLYMARKET_TARGET_MARKETS_COUNT');
 const tagQuotaEnv = parseIntEnv('POLYMARKET_TAG_QUOTA');
 const initialCapitalEnv = parseNumberEnv('POLYMARKET_INITIAL_CAPITAL');
+const reserveCashUsdcEnv = parseNumberEnv('POLYMARKET_RESERVE_CASH_USDC');
+const freezeAddSpreadSoftEnv = parseNumberEnv('POLYMARKET_FREEZE_ADD_SPREAD_SOFT');
+const freezeAddSpreadHardEnv = parseNumberEnv('POLYMARKET_FREEZE_ADD_SPREAD_HARD');
+const reallocateMaxMarketsEnv = parseIntEnv('POLYMARKET_REALLOCATE_MAX_MARKETS');
 
 export const config = {
   polymarket: {
@@ -47,7 +51,11 @@ export const config = {
     timeDecaySkewFactor: 0.06, // 加大出清力度
     hardStopLossPct: -0.15,
     enableDualLayerGrid: true,
-    initialCapital: (initialCapitalEnv && initialCapitalEnv > 0 ? initialCapitalEnv : 500)
+    initialCapital: (initialCapitalEnv && initialCapitalEnv > 0 ? initialCapitalEnv : 500),
+    reserveCashUsdc: (reserveCashUsdcEnv && reserveCashUsdcEnv > 0 ? reserveCashUsdcEnv : 50),
+    freezeAddSpreadSoft: (freezeAddSpreadSoftEnv && freezeAddSpreadSoftEnv > 0 ? freezeAddSpreadSoftEnv : 0.5),
+    freezeAddSpreadHard: (freezeAddSpreadHardEnv && freezeAddSpreadHardEnv > 0 ? freezeAddSpreadHardEnv : 0.8),
+    reallocateMaxMarkets: (reallocateMaxMarketsEnv && reallocateMaxMarketsEnv > 0 ? reallocateMaxMarketsEnv : 2)
   }
 };
 

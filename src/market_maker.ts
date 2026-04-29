@@ -477,7 +477,7 @@ export async function runMarketMakingCycle() {
     }
 
     // 2. 筛选适合我们做市的冷门长尾市场
-    const targetMarkets = [];
+    let targetMarkets: any[] = [];
     const tagCounter: Record<string, number> = {};
     let newMarketsCount = 0;
 
@@ -592,6 +592,9 @@ export async function runMarketMakingCycle() {
         if (hasInventory || (bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
            if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) continue;
 
+           const spread = bestAsk - bestBid;
+           if (!hasInventory && !isWhitelisted && spread > config.bot.freezeAddSpreadHard) continue;
+
            let smartMoneyBias = 'NEUTRAL';
            if (radarData && market.condition_id) {
               const marketSignal = radarData.markets?.[market.condition_id];
@@ -604,7 +607,7 @@ export async function runMarketMakingCycle() {
               }
            }
 
-           targetMarkets.push({
+          targetMarkets.push({
              eventTitle: market.question || market.market || "Unknown Market", 
              condition_id: market.condition_id,
              yesTokenId,
@@ -613,10 +616,12 @@ export async function runMarketMakingCycle() {
              bestAsk,
              bidSizeTop,
              askSizeTop,
-             spread: bestAsk - bestBid,
+             spread,
              rewardsMinSize: market.rewardsMinSize || 20,
              smartMoneyBias,
-             isHalted
+             isHalted,
+             isWhitelisted,
+             hasInventory
            });
 
            // 更新该市场所有 tag 的计数（无论新老，只要入选就占用配额，防止新市场扎堆）
@@ -643,17 +648,70 @@ export async function runMarketMakingCycle() {
     // 更新持久化缓存
     cachedInventoryMarkets = nextCachedInventoryMarkets;
 
-    // 3. 开始撤单与重挂 (Re-quoting)
+    const reserveCashUsdc = config.bot.reserveCashUsdc;
+    const freezeAddSpreadSoft = config.bot.freezeAddSpreadSoft;
+    const freezeAddSpreadHard = config.bot.freezeAddSpreadHard;
+
+    const hasWhitelistMarket = targetMarkets.some((m: any) => m.isWhitelisted);
+    let reallocatedMarketIds = new Set<string>();
+
+    if (hasWhitelistMarket && cashBalance < reserveCashUsdc) {
+      const candidates = targetMarkets
+        .filter((m: any) => !m.isWhitelisted && !m.hasInventory && !m.isHalted)
+        .sort((a: any, b: any) => {
+          const aHard = a.spread > freezeAddSpreadHard ? 1 : 0;
+          const bHard = b.spread > freezeAddSpreadHard ? 1 : 0;
+          if (aHard !== bHard) return bHard - aHard;
+          if (a.spread !== b.spread) return b.spread - a.spread;
+          return (a.rewardsMinSize || 0) - (b.rewardsMinSize || 0);
+        })
+        .slice(0, config.bot.reallocateMaxMarkets);
+
+      for (const c of candidates) {
+        if (c?.condition_id) reallocatedMarketIds.add(c.condition_id);
+      }
+    }
+
     console.log(`[Market Maker] Canceling old orders to avoid stale quotes...`);
     try {
-      const canceled = await clobClient.cancelAll();
-      if (canceled && canceled.length) {
-        dailyStats.ordersCanceled += canceled.length;
-      } else {
-        dailyStats.ordersCanceled++; // Just an approximation if length is not available
+      const openOrders = await clobClient.getOpenOrders(undefined, false);
+      const targetMarketIdSet = new Set<string>(targetMarkets.map((m: any) => m.condition_id).filter(Boolean));
+      const cancelIds: string[] = [];
+      let freedCashEstimate = 0;
+
+      for (const o of openOrders || []) {
+        const marketId = o.market;
+        if (!marketId || !targetMarketIdSet.has(marketId)) continue;
+
+        if (reallocatedMarketIds.has(marketId)) {
+          if (String(o.side).toUpperCase() === 'BUY') {
+            cancelIds.push(o.id);
+            const price = Number(o.price);
+            const size = Number(o.original_size);
+            if (Number.isFinite(price) && Number.isFinite(size)) freedCashEstimate += price * size;
+          }
+        } else {
+          cancelIds.push(o.id);
+          if (String(o.side).toUpperCase() === 'BUY') {
+            const price = Number(o.price);
+            const size = Number(o.original_size);
+            if (Number.isFinite(price) && Number.isFinite(size)) freedCashEstimate += price * size;
+          }
+        }
+      }
+
+      const uniqueCancelIds = Array.from(new Set(cancelIds));
+      if (uniqueCancelIds.length > 0) {
+        await clobClient.cancelOrders(uniqueCancelIds);
+        dailyStats.ordersCanceled += uniqueCancelIds.length;
+        if (freedCashEstimate > 0) cashBalance += freedCashEstimate;
       }
     } catch (e) {
       console.log(`[Market Maker] No old orders to cancel or error canceling.`);
+    }
+
+    if (reallocatedMarketIds.size > 0) {
+      targetMarkets = targetMarkets.filter((m: any) => !reallocatedMarketIds.has(m.condition_id));
     }
 
     // 为每个选定的市场挂单
@@ -818,10 +876,11 @@ export async function runMarketMakingCycle() {
       // 提前判定整个市场级别的 Exposure 是否允许开仓，避免每层网格重复报这个日志
       // 这个总判定用于决定一些全局的预警日志
       const epsilon = 0.0001;
+      const cashAvailableForBuysOverall = Math.max(0, cashBalance - reserveCashUsdc);
       const canIncreaseExposureOverall = !isHardStopTriggered && !isExposureMaxedOut && 
                                   (totalBuyYesCostUSDC <= availableExposureUSDC + epsilon) && 
                                   (totalBuyNoCostUSDC <= availableExposureUSDC + epsilon) &&
-                                  (Math.max(totalBuyYesCostUSDC, totalBuyNoCostUSDC) <= cashBalance + epsilon);
+                                  (Math.max(totalBuyYesCostUSDC, totalBuyNoCostUSDC) <= cashAvailableForBuysOverall + epsilon);
 
       if (isTimeDecayed && !isHardStopTriggered) {
         console.log(`     [!] Time-Decay Triggered: Increasing skew factor to ${currentSkewFactor}`);
@@ -838,14 +897,21 @@ export async function runMarketMakingCycle() {
         const layerBuyYesCostUSDC = currentLayerSize * midPrice;
         const layerBuyNoCostUSDC = currentLayerSize * (1 - midPrice);
         const epsilon = 0.05; // 增加一定的缓冲，应对微小超出（比如计算需要 75.02 USDC，实际可用 75 USDC）
+
+        const cashAvailableForBuys = Math.max(0, cashBalance - reserveCashUsdc);
+        const isHardFrozen = tm.spread > freezeAddSpreadHard;
+        const isSoftFrozen = tm.spread > freezeAddSpreadSoft && !isHardFrozen;
+        const freezeBlocksBuys = isHardFrozen || (isSoftFrozen && !tm.isWhitelisted) || (isSoftFrozen && tm.isWhitelisted && i > 0);
         
         // 只要不是已经爆仓 (isExposureMaxedOut) 或者硬止损，且余额和敞口都够这“一层”的单子，就可以挂单。
-        const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut && 
-                                    (layerBuyYesCostUSDC <= availableExposureUSDC + epsilon) && 
-                                    (layerBuyNoCostUSDC <= availableExposureUSDC + epsilon);
+        const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut &&
+                                    !freezeBlocksBuys &&
+                                    (layerBuyYesCostUSDC <= availableExposureUSDC + epsilon) &&
+                                    (layerBuyNoCostUSDC <= availableExposureUSDC + epsilon) &&
+                                    (Math.max(layerBuyYesCostUSDC, layerBuyNoCostUSDC) <= cashAvailableForBuys + epsilon);
                                     
         if (!canIncreaseExposure) {
-          console.log(`     [Layer ${i+1}] [DEBUG] canIncreaseExposure=false: isHardStop=${isHardStopTriggered}, isMaxed=${isExposureMaxedOut}, YEScost=${layerBuyYesCostUSDC.toFixed(2)}, NOcost=${layerBuyNoCostUSDC.toFixed(2)}, maxCost=${Math.max(layerBuyYesCostUSDC, layerBuyNoCostUSDC).toFixed(2)}, availExp=${availableExposureUSDC.toFixed(2)}, cash=${cashBalance.toFixed(2)}`);
+          console.log(`     [Layer ${i+1}] [DEBUG] canIncreaseExposure=false: isHardStop=${isHardStopTriggered}, isMaxed=${isExposureMaxedOut}, YEScost=${layerBuyYesCostUSDC.toFixed(2)}, NOcost=${layerBuyNoCostUSDC.toFixed(2)}, maxCost=${Math.max(layerBuyYesCostUSDC, layerBuyNoCostUSDC).toFixed(2)}, availExp=${availableExposureUSDC.toFixed(2)}, cash=${Math.max(0, cashBalance - reserveCashUsdc).toFixed(2)}`);
         }
 
         let layerDynamicSpreadHalf = dynamicSpreadHalf * layer.spreadMult;
@@ -982,8 +1048,9 @@ export async function runMarketMakingCycle() {
         } else {
           if (canIncreaseExposure) {
             const cost = currentLayerSize * myBidPrice;
-            if (cost > cashBalance) {
-              console.log(`     [Layer ${i+1}] [i] Skipping BUY YES (Bid): Cost (${cost.toFixed(2)}) exceeds available cash (${cashBalance.toFixed(2)}).`);
+            const cashAvailableForBuys = Math.max(0, cashBalance - reserveCashUsdc);
+            if (cost > cashAvailableForBuys) {
+              console.log(`     [Layer ${i+1}] [i] Skipping BUY YES (Bid): Cost (${cost.toFixed(2)}) exceeds available cash (${cashAvailableForBuys.toFixed(2)}).`);
             } else {
               try {
                 const orderPayload: any = {
@@ -1056,8 +1123,9 @@ export async function runMarketMakingCycle() {
             const buyNoPrice = Number((1 - myAskPrice).toFixed(2));
             if (buyNoPrice > 0 && buyNoPrice < 1) {
               const cost = currentLayerSize * buyNoPrice;
-              if (cost > cashBalance) {
-                console.log(`     [Layer ${i+1}] [i] Skipping BUY NO (Ask): Cost (${cost.toFixed(2)}) exceeds available cash (${cashBalance.toFixed(2)}).`);
+              const cashAvailableForBuys = Math.max(0, cashBalance - reserveCashUsdc);
+              if (cost > cashAvailableForBuys) {
+                console.log(`     [Layer ${i+1}] [i] Skipping BUY NO (Ask): Cost (${cost.toFixed(2)}) exceeds available cash (${cashAvailableForBuys.toFixed(2)}).`);
               } else {
                 try {
                   const orderPayload: any = {
