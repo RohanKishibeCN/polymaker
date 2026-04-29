@@ -703,13 +703,12 @@ export async function runMarketMakingCycle() {
     console.log(`[Market Maker] Canceling old orders to avoid stale quotes...`);
     try {
       const openOrders = await clobClient.getOpenOrders(undefined, false);
-      const targetMarketIdSet = new Set<string>(targetMarkets.map((m: any) => m.condition_id).filter(Boolean));
       const cancelIds: string[] = [];
       let freedCashEstimate = 0;
 
       for (const o of openOrders || []) {
         const marketId = o.market;
-        if (!marketId || !targetMarketIdSet.has(marketId)) continue;
+        if (!marketId) continue;
 
         if (reallocatedMarketIds.has(marketId)) {
           if (String(o.side).toUpperCase() === 'BUY') {
