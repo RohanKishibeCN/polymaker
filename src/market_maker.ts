@@ -480,6 +480,16 @@ export async function runMarketMakingCycle() {
     let targetMarkets: any[] = [];
     const tagCounter: Record<string, number> = {};
     let newMarketsCount = 0;
+    const activeWhitelistIds = new Set<string>();
+    const selectedWhitelistIds = new Set<string>();
+
+    if (radarData?.target_whitelist) {
+      for (const [conditionId, wl] of Object.entries<any>(radarData.target_whitelist)) {
+        if (wl?.updated_at && (Date.now() - wl.updated_at <= 6 * 60 * 60 * 1000)) {
+          activeWhitelistIds.add(conditionId);
+        }
+      }
+    }
 
     // 将上一轮缓存的有库存市场合并到本轮处理列表中，防止分页漏扫
     for (const cachedMarket of cachedInventoryMarkets) {
@@ -524,6 +534,7 @@ export async function runMarketMakingCycle() {
          const wlSignal = radarData.target_whitelist?.[market.condition_id];
          if (wlSignal && wlSignal.updated_at && (Date.now() - wlSignal.updated_at <= 6 * 60 * 60 * 1000)) {
             isWhitelisted = true;
+            selectedWhitelistIds.add(market.condition_id);
             console.log(`[Market Maker] [Surf] Market ${market.condition_id} is in Whitelist! Prioritizing.`);
          }
       }
@@ -638,9 +649,26 @@ export async function runMarketMakingCycle() {
       } catch (e) {
         // console.warn(`Error fetching orderbook for ${yesTokenId}`);
       }
-      if (targetMarkets.length >= config.bot.targetMarketsCount) {
-        break; // 找够了我们设定数量的市场，跳出循环
-      }
+      if (targetMarkets.length >= config.bot.targetMarketsCount && selectedWhitelistIds.size >= activeWhitelistIds.size) break;
+    }
+
+    const prioritized: any[] = [];
+    const seenMarketIds = new Set<string>();
+    const pushMarket = (m: any) => {
+      if (!m?.condition_id) return;
+      if (seenMarketIds.has(m.condition_id)) return;
+      seenMarketIds.add(m.condition_id);
+      prioritized.push(m);
+    };
+
+    for (const m of targetMarkets.filter((m: any) => m.hasInventory || m.isHalted)) pushMarket(m);
+    for (const m of targetMarkets.filter((m: any) => m.isWhitelisted && !(m.hasInventory || m.isHalted))) pushMarket(m);
+    for (const m of targetMarkets.filter((m: any) => !(m.hasInventory || m.isHalted) && !m.isWhitelisted)) pushMarket(m);
+
+    if (prioritized.length > config.bot.targetMarketsCount) {
+      targetMarkets = prioritized.filter((m: any) => m.hasInventory || m.isHalted || m.isWhitelisted);
+    } else {
+      targetMarkets = prioritized.slice(0, config.bot.targetMarketsCount);
     }
 
     console.log(`[Market Maker] Selected ${targetMarkets.length} target markets for liquidity provision.`);
