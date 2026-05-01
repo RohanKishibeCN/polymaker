@@ -369,10 +369,16 @@ async function syncInventoryFromChain(): Promise<number> {
         
         const size = parseFloat(pos.size) || 0;
         const avgPrice = parseFloat(pos.avgPrice) || 0;
-        const currentPrice = parseFloat(pos.currentPrice) || avgPrice;
         const cashPnl = parseFloat(pos.cashPnl) || 0;
-        
-        portfolioValue += size * currentPrice;
+
+        const currentValueRaw = parseFloat(pos.currentValue);
+        if (Number.isFinite(currentValueRaw)) {
+          portfolioValue += currentValueRaw;
+        } else {
+          const currentPriceRaw = parseFloat(pos.currentPrice);
+          const currentPrice = Number.isFinite(currentPriceRaw) ? currentPriceRaw : 0;
+          portfolioValue += size * currentPrice;
+        }
 
         if (size > 0) {
           if (!positionState[pos.asset]) {
