@@ -447,7 +447,8 @@ export async function runMarketMakingCycle() {
     // 0. 从链上/API 同步真实的持仓数据
     const portfolioValue = await syncInventoryFromChain();
     let cashBalance = await getCashBalance();
-    const totalEquity = Math.max(cashBalance + portfolioValue, config.bot.initialCapital); // 保底，避免获取失败导致 size=0
+    let totalEquity = cashBalance + portfolioValue;
+    if (!Number.isFinite(totalEquity) || totalEquity <= 0) totalEquity = config.bot.initialCapital;
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
 
     // 1. 获取 Gamma 市场数据
