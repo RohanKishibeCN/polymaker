@@ -123,6 +123,65 @@ Whitelist 触发挪仓时，需要淘汰（撤 BUY）1–2 个市场，排序如
 2. whitelist 触发“选择 1–2 个低质量市场并撤其 BUY 挂单”（R2 + R3）
 3. spread 两级冻结增仓逻辑（R3）
 
+## 9. 持仓管理与做市选品解耦（持续迭代优化，建议方案）
+
+### 9.1 背景
+
+当账户进入“持仓高度分散（几十到上百个市场）+ 每轮只选 N 个市场执行”的状态时，会出现一个结构性风险：
+
+- 亏损最大的仓位（Top losers）与资金占用最大的仓位（Top exposure）**不一定**会被选入每轮 `targetMarketsCount` 的执行集合；
+- 导致 Hard Stop / Time-Decay / SOS 等风险管理只覆盖“被抽样到”的市场，出现“PnL 下滑但日志里看不到对应动作”的盲区；
+- 在现金长期枯竭（Cash≈0）的阶段，这会让回笼现金的路径更依赖运气（市场恰好被选中且盘口恰好可交易）。
+
+本节方案的目标是：在不改变既有资金调度方向（Reserve Cash、Whitelist 优先、Spread 冻结、避免强制卖出）前提下，补齐“关键持仓必须被持续管理”的机制落地。
+
+### 9.2 核心思路
+
+将“做市选品”与“持仓管理”解耦为两条队列：
+
+- **做市队列（Maker Queue）**：数量受 `targetMarketsCount` 控制，用于挑选奖励市场/普通市场进行双边报价；
+- **持仓管理队列（Position Management Queue）**：每轮强制加入关键持仓市场，用于风险控制与回笼现金，不占用 `targetMarketsCount` 配额。
+
+### 9.3 具体规则（先用 5 + 5）
+
+每个做市周期，从 data-api 的 positions 中计算并构建持仓管理队列：
+
+- **Top 5 losers**：按 `cashPnl` 从小到大排序取前 5（最亏的 5 个仓位）
+- **Top 5 exposure**：按 `currentValue` 从大到小排序取前 5（资金占用最大的 5 个仓位）
+- 以上两组取并集（按 condition_id 去重）形成 **Position Management Queue**
+
+### 9.4 执行边界（严格遵守既有方向）
+
+Position Management Queue 只做“风险管理/回笼现金”，不做扩张：
+
+- **只允许 reduce-only 动作**：只允许 SELL / 对冲 / 撤单；不允许任何 BUY 增仓（仍受 Reserve Cash 与 Spread Freeze 约束）
+- **不强制卖仓**：若触发 Hard Stop 但盘口极差（spread 过大），依旧允许沿用“暂停清仓避免极端滑点”的保护逻辑
+
+做市队列继续遵循：
+
+- Reserve Cash（R1）
+- Whitelist 挪仓（R2）
+- Spread 两级冻结（R3）
+
+### 9.5 预期收益
+
+- **风控覆盖完整**：Hard Stop/Time-Decay/SOS 能稳定覆盖最关键的仓位（losers/exposure），减少风险盲区
+- **现金回笼更可预期**：当盘口恢复可交易时，系统无需“等抽中”即可立刻执行减仓/回款动作
+- **复盘更透明**：Daily Summary 中的 Top losers 能在 cycle 日志里对应到处理动作
+
+### 9.6 主要风险与缓解
+
+- **请求量上升**：每轮处理市场数增加（5 → 10~15）  
+  - 缓解：Position Management Queue 做轻量化处理，只在需要下单/撤单时拉取订单簿，设置硬上限与节流。
+- **撤单重挂导致成交概率下降**  
+  - 缓解：Position Management Queue 默认不做全量撤单，只在风险触发或需要挂出 reduce-only 订单时撤；或仅撤 BUY、尽量保留 SELL 以提高回款概率。
+
+### 9.7 验证口径（上线后 48 小时观测）
+
+- Daily Summary 中 Top losers 是否在 cycle 日志中稳定出现并被处理（至少能看到进入 Hard Stop / Time-Decay 分支）
+- `Cash` 是否更容易从 0 回升（哪怕从 0 → 5/10 都是进展）
+- `Canceled / Posted` 是否明显下降或保持可控（避免回到 1:1 大量 churn）
+
 ---
 
 ## Historical (Legacy Content, Preserved)
