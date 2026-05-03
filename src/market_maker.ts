@@ -273,6 +273,7 @@ export async function runDailySummary() {
         // Sort positions by currentValue (absolute exposure) descending to get Top 5
         const activePositions = positions.filter(p => parseFloat(p.size) > 0);
         activePositions.sort((a, b) => (parseFloat(b.currentValue) || 0) - (parseFloat(a.currentValue) || 0));
+        const losersPositions = [...activePositions].sort((a, b) => (parseFloat(a.cashPnl) || 0) - (parseFloat(b.cashPnl) || 0));
         
         for (const pos of activePositions) {
           const size = parseFloat(pos.size) || 0;
@@ -293,6 +294,20 @@ export async function runDailySummary() {
         
         if (activePositions.length > 5) {
           positionsDetail += `... and ${activePositions.length - 5} other smaller positions\n`;
+        }
+
+        if (losersPositions.length > 0) {
+          positionsDetail += `\n📉 [LOSERS_TOP5]\n`;
+          let loserIndex = 1;
+          for (const pos of losersPositions.slice(0, 5)) {
+            const size = parseFloat(pos.size) || 0;
+            const cashPnl = parseFloat(pos.cashPnl) || 0;
+            const currentValue = parseFloat(pos.currentValue) || 0;
+            const shortTitle = pos.title ? pos.title.substring(0, 40) + (pos.title.length > 40 ? '...' : '') : 'Unknown';
+            const pnlSign = cashPnl >= 0 ? '+' : '';
+            positionsDetail += `${loserIndex}. [${shortTitle}] - ${size} ${pos.outcome} (Eq ~${currentValue.toFixed(2)} ${COLLATERAL_SYMBOL}) - PnL: ${pnlSign}${cashPnl.toFixed(2)}\n`;
+            loserIndex++;
+          }
         }
       }
     } catch (e: any) {
@@ -411,6 +426,28 @@ async function syncInventoryFromChain(): Promise<number> {
   return portfolioValue;
 }
 
+async function getPositionPriorityTokenIds(): Promise<Set<string>> {
+  const tokenIds = new Set<string>();
+  try {
+    const res = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`, {
+      agent: proxyAgent
+    });
+    const positions = await res.json();
+    if (!Array.isArray(positions)) return tokenIds;
+
+    const activePositions = positions.filter(p => parseFloat(p.size) > 0);
+    const losers = [...activePositions].sort((a, b) => (parseFloat(a.cashPnl) || 0) - (parseFloat(b.cashPnl) || 0)).slice(0, 5);
+    const exposure = [...activePositions].sort((a, b) => (parseFloat(b.currentValue) || 0) - (parseFloat(a.currentValue) || 0)).slice(0, 5);
+
+    for (const p of [...losers, ...exposure]) {
+      const asset = (p.asset || '').toString();
+      if (asset) tokenIds.add(asset);
+    }
+  } catch (e) {
+  }
+  return tokenIds;
+}
+
 // 用于 Gamma 分页增量轮转拉取
 let lastMarketOffset: number = 0;
 // 持久化保存所有有库存的市场元数据，防止分页轮转期间被跳过导致断单被套
@@ -456,6 +493,7 @@ export async function runMarketMakingCycle() {
     let totalEquity = cashBalance + portfolioValue;
     if (!Number.isFinite(totalEquity) || totalEquity <= 0) totalEquity = config.bot.initialCapital;
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
+    const priorityTokenIds = await getPositionPriorityTokenIds();
 
     // 1. 获取 Gamma 市场数据
     // Polymarket 最近在 /events 端点中移除了 clobRewards 数据，因此我们改用 /markets 端点
@@ -526,6 +564,8 @@ export async function runMarketMakingCycle() {
 
     // 2. 筛选适合我们做市的冷门长尾市场
     let targetMarkets: any[] = [];
+    const managementMarketsById = new Map<string, any>();
+    let makerCandidates: any[] = [];
     const tagCounter: Record<string, number> = {};
     let newMarketsCount = 0;
     const activeWhitelistIds = new Set<string>();
@@ -556,7 +596,8 @@ export async function runMarketMakingCycle() {
       // 检查是否已有库存（持有仓位的市场享有特权，防止被过滤成死仓）
       const invYes = inventory[yesTokenId] || { yes: 0, no: 0 };
       const invNo = inventory[noTokenId] || { yes: 0, no: 0 };
-      const hasInventory = invYes.yes > 0 || invNo.no > 0;
+      const hasInventory = invYes.yes > 0 || invYes.no > 0 || invNo.yes > 0 || invNo.no > 0;
+      const isPriorityPosition = priorityTokenIds.has(yesTokenId) || priorityTokenIds.has(noTokenId);
       if (!hasInventory && (feeRateOverrideByTokenId[yesTokenId] === 1000 || feeRateOverrideByTokenId[noTokenId] === 1000)) continue;
       
       // ==========================================
@@ -587,21 +628,23 @@ export async function runMarketMakingCycle() {
          }
       }
 
+      const isManagement = isHalted || (isPriorityPosition && !isWhitelisted);
+
       // 如果雷达挂了红牌，不仅不应该跳过，反而应该强行清仓！
       // 将 isHalted 标记传递给 targetMarkets，在下游挂单逻辑中触发 Hard Stop
       // ==========================================
 
       // 如果没有库存，且未被白名单标记，且新开市场数量已经达到上限，跳过该市场
-      if (!hasInventory && !isWhitelisted && newMarketsCount >= config.bot.targetMarketsCount) {
+      if (!isManagement && !hasInventory && !isWhitelisted && newMarketsCount >= config.bot.targetMarketsCount) {
         continue;
       }
 
       // [LP Rewards Bot] 核心逻辑：只在官方有流动性补贴的市场做市！(有库存的市场强制放行，方便平仓)
-      if (!hasInventory && market.rewards && market.rewards.length === 0) continue;
+      if (!isManagement && !hasInventory && market.rewards && market.rewards.length === 0) continue;
 
       // 【第二轮迭代】Tag 多样性过滤（解决同质化事件扎堆）
       let skipForTagQuota = false;
-      if (!hasInventory && market.tags && market.tags.length > 0) {
+      if (!isManagement && !hasInventory && market.tags && market.tags.length > 0) {
         for (const tag of market.tags) {
           if ((tagCounter[tag] || 0) >= config.bot.tagQuota) {
             skipForTagQuota = true;
@@ -652,7 +695,7 @@ export async function runMarketMakingCycle() {
            if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) continue;
 
            const spread = bestAsk - bestBid;
-           if (!hasInventory && !isWhitelisted && spread > config.bot.freezeAddSpreadHard) continue;
+           if (!isManagement && !hasInventory && !isWhitelisted && spread > config.bot.freezeAddSpreadHard) continue;
 
            let smartMoneyBias = 'NEUTRAL';
            if (radarData && market.condition_id) {
@@ -666,7 +709,7 @@ export async function runMarketMakingCycle() {
               }
            }
 
-          targetMarkets.push({
+          const tm: any = {
              eventTitle: market.question || market.market || "Unknown Market", 
              condition_id: market.condition_id,
              yesTokenId,
@@ -680,26 +723,36 @@ export async function runMarketMakingCycle() {
              smartMoneyBias,
              isHalted,
              isWhitelisted,
-             hasInventory
-           });
+             hasInventory,
+             isManagement
+          };
+
+          if (isManagement) {
+            if (tm.condition_id) {
+              managementMarketsById.set(tm.condition_id, tm);
+            }
+          } else {
+            makerCandidates.push(tm);
+          }
 
            // 更新该市场所有 tag 的计数（无论新老，只要入选就占用配额，防止新市场扎堆）
-           if (market.tags && market.tags.length > 0) {
+          if (!isManagement && market.tags && market.tags.length > 0) {
              for (const tag of market.tags) {
                tagCounter[tag] = (tagCounter[tag] || 0) + 1;
              }
            }
 
-           if (!hasInventory) {
+          if (!isManagement && !hasInventory) {
              newMarketsCount++;
            }
         }
       } catch (e) {
         // console.warn(`Error fetching orderbook for ${yesTokenId}`);
       }
-      if (targetMarkets.length >= config.bot.targetMarketsCount && selectedWhitelistIds.size >= activeWhitelistIds.size) break;
+      if (makerCandidates.length >= config.bot.targetMarketsCount && selectedWhitelistIds.size >= activeWhitelistIds.size) break;
     }
 
+    const managementMarkets = Array.from(managementMarketsById.values());
     const prioritized: any[] = [];
     const seenMarketIds = new Set<string>();
     const pushMarket = (m: any) => {
@@ -709,15 +762,32 @@ export async function runMarketMakingCycle() {
       prioritized.push(m);
     };
 
-    for (const m of targetMarkets.filter((m: any) => m.hasInventory || m.isHalted)) pushMarket(m);
-    for (const m of targetMarkets.filter((m: any) => m.isWhitelisted && !(m.hasInventory || m.isHalted))) pushMarket(m);
-    for (const m of targetMarkets.filter((m: any) => !(m.hasInventory || m.isHalted) && !m.isWhitelisted)) pushMarket(m);
+    for (const m of makerCandidates.filter((m: any) => m.hasInventory || m.isHalted)) pushMarket(m);
+    for (const m of makerCandidates.filter((m: any) => m.isWhitelisted && !(m.hasInventory || m.isHalted))) pushMarket(m);
+    for (const m of makerCandidates.filter((m: any) => !(m.hasInventory || m.isHalted) && !m.isWhitelisted)) pushMarket(m);
 
+    let makerMarkets: any[] = [];
     if (prioritized.length > config.bot.targetMarketsCount) {
-      targetMarkets = prioritized.filter((m: any) => m.hasInventory || m.isHalted || m.isWhitelisted);
+      makerMarkets = prioritized.filter((m: any) => m.hasInventory || m.isHalted || m.isWhitelisted);
     } else {
-      targetMarkets = prioritized.slice(0, config.bot.targetMarketsCount);
+      makerMarkets = prioritized.slice(0, config.bot.targetMarketsCount);
     }
+
+    const allMarkets: any[] = [];
+    const allIds = new Set<string>();
+    for (const m of managementMarkets) {
+      if (m?.condition_id && !allIds.has(m.condition_id)) {
+        allIds.add(m.condition_id);
+        allMarkets.push(m);
+      }
+    }
+    for (const m of makerMarkets) {
+      if (m?.condition_id && !allIds.has(m.condition_id)) {
+        allIds.add(m.condition_id);
+        allMarkets.push(m);
+      }
+    }
+    targetMarkets = allMarkets;
 
     console.log(`[Market Maker] Selected ${targetMarkets.length} target markets for liquidity provision.`);
     
@@ -976,7 +1046,7 @@ export async function runMarketMakingCycle() {
         const cashAvailableForBuys = Math.max(0, cashBalance - reserveCashUsdc);
         const isHardFrozen = tm.spread > freezeAddSpreadHard;
         const isSoftFrozen = tm.spread > freezeAddSpreadSoft && !isHardFrozen;
-        const freezeBlocksBuys = isHardFrozen || (isSoftFrozen && !tm.isWhitelisted) || (isSoftFrozen && tm.isWhitelisted && i > 0);
+        const freezeBlocksBuys = tm.isManagement || isHardFrozen || (isSoftFrozen && !tm.isWhitelisted) || (isSoftFrozen && tm.isWhitelisted && i > 0);
         
         // 只要不是已经爆仓 (isExposureMaxedOut) 或者硬止损，且余额和敞口都够这“一层”的单子，就可以挂单。
         const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut &&
