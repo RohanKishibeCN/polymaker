@@ -325,12 +325,18 @@ Avg Spread: ±0.025
 1. [Trump wins 2024...] - 25 YES (Eq ~12.50 USDC) - PnL: +1.25
 2. [MicroStrategy...] - 10 NO (Eq ~4.50 USDC) - PnL: -0.50
 ... and 2 other smaller positions
+
+📉 [LOSERS_TOP5]
+1. [Some market...] - YES/NO (Eq ~12.50 USDC) - PnL: -3.21
+2. ...
 ```
 
 #### 压缩规则（必须遵守，避免超过 2000 字符）
 *   只保留 Top 5 持仓（按 Absolute Exposure 资金占用绝对值倒序排列）。
+*   增加 Top 5 Losers（按 `cashPnl` 从小到大排序取前 5），用于快速定位拖累 PnL 的仓位。
 *   事件标题超长时自动截断为 40 字符以内。
 *   超出 Top 5 的持仓进行数量汇总，不再展示明细。
+*   Losers Top 5 也只保留 5 条，若不足 5 条则按实际数量输出。
 
 ### 3. 第一轮迭代的达标条件（满足则进入扩容或下一轮）
 *   连续 7 天运行无致命错误
