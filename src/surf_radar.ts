@@ -8,6 +8,13 @@ const TMP_FILE = path.join(__dirname, '../radar_signals.tmp');
 const SOS_FILE = path.join(__dirname, '../radar_sos.json');
 const QUOTA_LOCK_FILE = path.join(__dirname, '../.quota_exhausted_until');
 const SURF_BIN = 'npx --yes skills surf';
+const SOS_COOLDOWN_MS = (() => {
+  const raw = (process.env.SURF_SOS_COOLDOWN_MINUTES || process.env.POLYMARKET_SOS_COOLDOWN_MINUTES || '').trim();
+  const minutes = raw ? Number(raw) : 60;
+  if (!Number.isFinite(minutes) || minutes <= 0) return 60 * 60 * 1000;
+  return minutes * 60 * 1000;
+})();
+const lastSosAtByConditionId = new Map<string, number>();
 
 interface RadarSignals {
   last_updated: number;
@@ -172,6 +179,15 @@ function runAction3(conditionId: string, title: string) {
     console.log(`[Surf Radar] [Action 3] Quota locked. Cannot process SOS for ${conditionId}`);
     return;
   }
+
+  const now = Date.now();
+  const lastAt = lastSosAtByConditionId.get(conditionId);
+  if (lastAt && now - lastAt < SOS_COOLDOWN_MS) {
+    console.log(`[Surf Radar] [Action 3] Cooldown active for ${conditionId}. Skipping.`);
+    return;
+  }
+  lastSosAtByConditionId.set(conditionId, now);
+
   console.log(`[Surf Radar] [Action 3] SOS Triggered for market: ${conditionId} (${title})`);
   
   const signals = readRadarSignals();
