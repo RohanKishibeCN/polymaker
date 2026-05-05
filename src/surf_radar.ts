@@ -7,12 +7,19 @@ const RADAR_FILE = path.join(__dirname, '../radar_signals.json');
 const TMP_FILE = path.join(__dirname, '../radar_signals.tmp');
 const SOS_FILE = path.join(__dirname, '../radar_sos.json');
 const QUOTA_LOCK_FILE = path.join(__dirname, '../.quota_exhausted_until');
+const SOS_STATE_FILE = path.join(__dirname, '../.sos_state.json');
 const SURF_BIN = 'npx --yes skills surf';
 const SOS_COOLDOWN_MS = (() => {
   const raw = (process.env.SURF_SOS_COOLDOWN_MINUTES || process.env.POLYMARKET_SOS_COOLDOWN_MINUTES || '').trim();
   const minutes = raw ? Number(raw) : 60;
   if (!Number.isFinite(minutes) || minutes <= 0) return 60 * 60 * 1000;
   return minutes * 60 * 1000;
+})();
+const SOS_DAILY_MAX = (() => {
+  const raw = (process.env.SURF_SOS_DAILY_MAX || '').trim();
+  const n = raw ? parseInt(raw, 10) : 16;
+  if (!Number.isFinite(n) || n <= 0) return 16;
+  return n;
 })();
 const lastSosAtByConditionId = new Map<string, number>();
 
@@ -28,6 +35,33 @@ interface RadarSignals {
   target_whitelist: Record<string, {
     updated_at: number; // Fine-grained TTL
   }>;
+}
+
+function utcDayStr(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function readSosState(): { day: string; dailyCount: number; lastSosAt: Record<string, number> } {
+  const today = utcDayStr(Date.now());
+  const empty = { day: today, dailyCount: 0, lastSosAt: {} as Record<string, number> };
+  try {
+    if (!fs.existsSync(SOS_STATE_FILE)) return empty;
+    const raw = JSON.parse(fs.readFileSync(SOS_STATE_FILE, 'utf8'));
+    if (!raw || typeof raw !== 'object') return empty;
+    const day = typeof raw.day === 'string' ? raw.day : today;
+    const dailyCount = typeof raw.dailyCount === 'number' ? raw.dailyCount : 0;
+    const lastSosAt = raw.lastSosAt && typeof raw.lastSosAt === 'object' ? raw.lastSosAt : {};
+    if (day !== today) return empty;
+    return { day, dailyCount, lastSosAt };
+  } catch (e) {
+    return empty;
+  }
+}
+
+function writeSosState(state: { day: string; dailyCount: number; lastSosAt: Record<string, number> }) {
+  const tmp = `${SOS_STATE_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state), 'utf8');
+  fs.renameSync(tmp, SOS_STATE_FILE);
 }
 
 function checkQuotaLock(): boolean {
@@ -181,12 +215,23 @@ function runAction3(conditionId: string, title: string) {
   }
 
   const now = Date.now();
-  const lastAt = lastSosAtByConditionId.get(conditionId);
+  const sosState = readSosState();
+  if (sosState.dailyCount >= SOS_DAILY_MAX) {
+    console.log(`[Surf Radar] [Action 3] Daily SOS budget reached (${SOS_DAILY_MAX}). Skipping.`);
+    return;
+  }
+
+  const lastAtMem = lastSosAtByConditionId.get(conditionId);
+  const lastAtPersisted = sosState.lastSosAt[conditionId];
+  const lastAt = Math.max(lastAtMem || 0, lastAtPersisted || 0) || undefined;
   if (lastAt && now - lastAt < SOS_COOLDOWN_MS) {
     console.log(`[Surf Radar] [Action 3] Cooldown active for ${conditionId}. Skipping.`);
     return;
   }
   lastSosAtByConditionId.set(conditionId, now);
+  sosState.lastSosAt[conditionId] = now;
+  sosState.dailyCount += 1;
+  writeSosState(sosState);
 
   console.log(`[Surf Radar] [Action 3] SOS Triggered for market: ${conditionId} (${title})`);
   
