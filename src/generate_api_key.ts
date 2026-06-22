@@ -100,7 +100,7 @@ async function main() {
       chain: Chain.POLYGON,
       // @ts-ignore (viem WalletClient is supported but types might clash)
       signer: walletClient,
-      signatureType: SignatureTypeV2.POLY_GNOSIS_SAFE,
+      signatureType: SignatureTypeV2.POLY_1271,
       funderAddress: process.env.POLYMARKET_FUNDER_ADDRESS?.trim(),
     });
 

@@ -71,7 +71,8 @@ const clobClient: any = new ClobClient({
     if (envType === 'POLY_PROXY') return SignatureTypeV2.POLY_PROXY;
     if (envType === 'POLY_GNOSIS_SAFE') return SignatureTypeV2.POLY_GNOSIS_SAFE;
     if (envType === 'POLY_1271') return SignatureTypeV2.POLY_1271;
-    return SignatureTypeV2.POLY_GNOSIS_SAFE;
+    // 默认 POLY_1271: signer!=maker 的存款钱包场景
+    return SignatureTypeV2.POLY_1271;
   })(),
   funderAddress: config.polymarket.funderAddress,
 });
