@@ -65,7 +65,13 @@ const clobClient: any = new ClobClient({
     secret: config.polymarket.secret,
     passphrase: config.polymarket.passphrase,
   },
-  signatureType: SignatureTypeV2.POLY_GNOSIS_SAFE,
+  signatureType: (() => {
+    const envType = (process.env.POLYMARKET_SIGNATURE_TYPE || '').trim();
+    if (envType === 'EOA') return SignatureTypeV2.EOA;
+    if (envType === 'POLY_PROXY') return SignatureTypeV2.POLY_PROXY;
+    if (envType === 'POLY_1271') return SignatureTypeV2.POLY_1271;
+    return SignatureTypeV2.POLY_PROXY;
+  })(),
   funderAddress: config.polymarket.funderAddress,
 });
 
@@ -84,7 +90,11 @@ export function startHeartbeat() {
       const resp = await clobClient.postHeartbeat(heartbeatId);
       heartbeatId = resp.heartbeat_id || '';
     } catch (e: any) {
-      heartbeatId = '';
+      if (e?.response?.data?.heartbeat_id) {
+        heartbeatId = e.response.data.heartbeat_id;
+      } else {
+        heartbeatId = '';
+      }
     }
   }, 5000);
   console.log(`[Market Maker] Heartbeat started (5s interval).`);
