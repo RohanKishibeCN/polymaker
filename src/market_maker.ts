@@ -65,7 +65,7 @@ const clobClient: any = new ClobClient({
     secret: config.polymarket.secret,
     passphrase: config.polymarket.passphrase,
   },
-  signatureType: SignatureTypeV2.POLY_GNOSIS_SAFE,
+  signatureType: SignatureTypeV2.EOA,
   funderAddress: config.polymarket.funderAddress,
 });
 
@@ -1138,22 +1138,20 @@ export async function runMarketMakingCycle() {
         // C. 硬止损 (Hard Stop-Loss) 抢一档平仓
         if (isHardStopTriggered) {
           if (currentNetYes > 0) {
-             // 止损：不再无脑砸 0.01，而是以 MidPrice - 宽价差 作为安全地板价，防止滑点割肉
              const floorPrice = Math.max(0.01, Number((midPrice - config.bot.spreadHalfMax * 2).toFixed(2)));
              myAskPrice = Math.max(tm.bestBid + 0.01, floorPrice);
           } else {
-             // 止损买回：不再无脑追 0.99，而是以 MidPrice + 宽价差 作为安全天花板
              const ceilingPrice = Math.min(0.99, Number((midPrice + config.bot.spreadHalfMax * 2).toFixed(2)));
              myBidPrice = Math.min(tm.bestAsk - 0.01, ceilingPrice);
           }
         }
         
-        // 7 天强制清仓 (Force Close) — 不限价格，taker 价格直接卖
+        // 7 天强制清仓 (Force Close) — taker 价格，但钳制在 0.01-0.99 之间
         if (isForceClose && !isHardStopTriggered) {
           if (currentNetYes > 0) {
-             myAskPrice = tm.bestBid;
+             myAskPrice = Math.max(0.01, tm.bestBid);
           } else {
-             myBidPrice = tm.bestAsk;
+             myBidPrice = Math.min(0.99, tm.bestAsk);
           }
           if (i === 0) console.log(`     [!] FORCE CLOSE triggered (held >${config.bot.forceCloseDays}d). Using taker prices.`);
         }
@@ -1193,9 +1191,9 @@ export async function runMarketMakingCycle() {
              console.log(`     [Layer ${i+1}] [!] Spread wide (${(tm.bestAsk-tm.bestBid).toFixed(2)}) but forced liquidation. Minimal order.`);
              currentLayerSize = Math.min(currentLayerSize, 5);
              if (currentNetYes > 0) {
-               myAskPrice = tm.bestBid;
+               myAskPrice = Math.max(0.01, tm.bestBid);
              } else if (currentNetYes < 0) {
-               myBidPrice = tm.bestAsk;
+               myBidPrice = Math.min(0.99, tm.bestAsk);
              }
            } else {
              console.log(`     [Layer ${i+1}] [!] Spread too wide (${(tm.bestAsk - tm.bestBid).toFixed(2)}). Pausing liquidation to avoid excessive slippage.`);
