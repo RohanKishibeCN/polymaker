@@ -278,43 +278,13 @@ function runAction3(conditionId: string, title: string) {
 }
 
 // Daemon Mode
-console.log(`[Surf Radar] Daemon started.`);
+console.log(`[Surf Radar] Daemon started (Arbitrage Discovery + Smart Money fallback).`);
 
-// Create empty SOS file if not exists
-if (!fs.existsSync(SOS_FILE)) {
-  fs.writeFileSync(SOS_FILE, JSON.stringify({ requests: [] }), 'utf8');
-}
+// Schedule Action 1 (Every 12 hours — Smart Money fallback)
+setInterval(runAction1, 12 * 60 * 60 * 1000);
 
-// Watch SOS File
-let sosTimeout: NodeJS.Timeout | null = null;
-fs.watch(SOS_FILE, (eventType) => {
-  if (eventType === 'change') {
-    if (sosTimeout) clearTimeout(sosTimeout);
-    sosTimeout = setTimeout(() => {
-       try {
-         const data = JSON.parse(fs.readFileSync(SOS_FILE, 'utf8'));
-         if (data.requests && data.requests.length > 0) {
-           for (const req of data.requests) {
-             // Process requests that are less than 5 minutes old
-             if (Date.now() - req.timestamp < 5 * 60 * 1000) {
-               runAction3(req.condition_id, req.title);
-             }
-           }
-           // Clear processed requests
-           fs.writeFileSync(SOS_FILE, JSON.stringify({ requests: [] }), 'utf8');
-         }
-       } catch(e) {
-         // ignore parsing errors from partial writes
-       }
-    }, 1000); // Debounce 1s
-  }
-});
-
-// Schedule Action 1 (Every 6 hours)
-setInterval(runAction1, 6 * 60 * 60 * 1000);
-
-// Schedule Action 2 (Every 12 hours)
-setInterval(runAction2, 12 * 60 * 60 * 1000);
+// Schedule Action 2 (Every 24 hours)
+setInterval(runAction2, 24 * 60 * 60 * 1000);
 
 // Run initial scans
 runAction1();

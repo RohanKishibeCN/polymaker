@@ -1,10 +1,6 @@
 import { Chain, ClobClient, Side, SignatureTypeV2 } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
 
-// 通过环境变量开关来决定是否使用 V2 语法和新参数，以便 4 月 28 日平滑过渡
-// 4月28日前，我们使用旧版本；4月28日后，通过配置 USE_V2_SDK=true 来切换新特性
-const USE_V2_SDK = process.env.USE_V2_SDK === 'true';
-
 import { config } from './config';
 import { logTrade, logDailySummary } from './notion';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -80,6 +76,20 @@ if (clobClient.axiosInstance) {
   clobClient.axiosInstance.defaults.httpsAgent = axiosHttpsAgent;
 }
 
+// CLOB V2 要求每 10 秒发送 heartbeat，否则服务器自动取消所有订单
+let heartbeatId = '';
+export function startHeartbeat() {
+  setInterval(async () => {
+    try {
+      const resp = await clobClient.postHeartbeat(heartbeatId);
+      heartbeatId = resp.heartbeat_id || '';
+    } catch (e: any) {
+      heartbeatId = '';
+    }
+  }, 5000);
+  console.log(`[Market Maker] Heartbeat started (5s interval).`);
+}
+
 // 简单内存状态，记录我们在每个市场的持仓情况
 // 注意：VPS 重启后会清零。如果要严格风控，应该存在本地 SQLite 中
 const inventory: Record<string, { yes: number, no: number, avgCost?: number, pnlPct?: number }> = {};
@@ -89,6 +99,7 @@ const lastMidPrices: Record<string, number> = {};
 
 // 持仓时间状态 (用于时间衰减死仓清理)
 const STATE_FILE = path.join(__dirname, 'state.json');
+const BALANCE_LOG_FILE = path.join(__dirname, '../balance_log.json');
 let positionState: Record<string, { firstAcquiredAt: number }> = {};
 try {
   if (fs.existsSync(STATE_FILE)) {
@@ -106,38 +117,12 @@ function saveState() {
   }
 }
 
-// 全局记录哪些市场必须使用 1000 费率，避免重复报错
-const feeRateOverrideByTokenId: Record<string, number> = {};
-
-async function createAndPostOrderWithFeeFallback(orderPayload: any, yesTokenId: string, noTokenId: string) {
-  if (!USE_V2_SDK) {
-    orderPayload.feeRateBps = feeRateOverrideByTokenId[orderPayload.tokenID] ?? 0;
-  }
-
-  let res;
+async function createAndPostOrderWithFeeFallback(orderPayload: any, tickSize: string, negRisk: boolean) {
   try {
-    res = await clobClient.createAndPostOrder(orderPayload);
+    return await clobClient.createAndPostOrder(orderPayload, { tickSize, negRisk }, "GTC");
   } catch (e: any) {
-    res = { error: e.message };
+    return { error: e.message };
   }
-
-  const msg = `${res?.error || ''} ${res?.errorMessage || ''} ${res?.message || ''}`;
-  if (res && res.success === false) {
-     // success is false, but no error message, let's just say failed
-  }
-
-  if (!USE_V2_SDK && orderPayload.feeRateBps !== 1000 && msg.includes('must be 1000')) {
-    feeRateOverrideByTokenId[yesTokenId] = 1000;
-    feeRateOverrideByTokenId[noTokenId] = 1000;
-    orderPayload.feeRateBps = 1000;
-    try {
-      res = await clobClient.createAndPostOrder(orderPayload);
-    } catch (retryErr: any) {
-      res = { error: retryErr.message };
-    }
-  }
-
-  return res;
 }
 // Notion 总结需要的数据
 let dailyStats = {
@@ -150,6 +135,28 @@ let dailyStats = {
   avgSpreadHalfUsed: 0,
   spreadHalfUsedCount: 0,
 };
+
+let peakEquity = config.bot.initialCapital;
+let priorInventorySnapshot: Map<string, number> = new Map();
+
+let yesterdayBalance: number | null = null;
+try {
+  if (fs.existsSync(BALANCE_LOG_FILE)) {
+    const log = JSON.parse(fs.readFileSync(BALANCE_LOG_FILE, 'utf8'));
+    yesterdayBalance = log.balance;
+  }
+} catch (e) {}
+
+function saveBalanceLog(balance: number) {
+  try {
+    fs.writeFileSync(BALANCE_LOG_FILE, JSON.stringify({ balance, date: new Date().toISOString().split('T')[0] }), 'utf8');
+  } catch (e) {}
+}
+
+function roundToTickSize(price: number, tickSize: string): number {
+  const ts = parseFloat(tickSize) || 0.01;
+  return Number((Math.round(price / ts) * ts).toFixed(4));
+}
 
 function getValidTokenIds(rawTokenId: any): [string, string] | null {
   if (!rawTokenId) return null;
@@ -178,6 +185,13 @@ let lastSummaryDateStr = '';
 
 const COLLATERAL_SYMBOL = (process.env.POLYMARKET_COLLATERAL_SYMBOL || 'USDC').trim() || 'USDC';
 let cachedCollateralDecimals: number | undefined;
+
+const haltedMarkets = new Map<string, { triggeredAt: number }>();
+const HALTED_TTL = 30 * 60 * 1000;
+
+// Smart Money 扫描限速
+let lastSmartMoneyScan = 0;
+const SMART_MONEY_INTERVAL = 4 * 60 * 60 * 1000;
 
 async function getCollateralDecimals(collateralAddress: string): Promise<number> {
   const envDecimalsRaw = (process.env.POLYMARKET_COLLATERAL_DECIMALS || '').trim();
@@ -218,9 +232,7 @@ async function getCashBalance(): Promise<number> {
     const envCollateral = (process.env.POLYMARKET_COLLATERAL_ADDRESS || '').trim();
     const collateralAddress = envCollateral
       ? envCollateral
-      : (USE_V2_SDK
-          ? '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'
-          : '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174');
+      : '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';  // pUSD
     const userAddress = config.polymarket.funderAddress;
     const cleanAddress = userAddress.replace(/^0x/i, '').padStart(64, '0');
     const data = `0x70a08231${cleanAddress}`;
@@ -262,6 +274,7 @@ export async function runDailySummary() {
     let portfolioValue = 0;
     let positionsDetail = '';
     
+    let activePositions: any[] = [];
     try {
       const positionsRes = await fetch(`https://data-api.polymarket.com/positions?user=${config.polymarket.funderAddress}`, {
         agent: proxyAgent
@@ -271,7 +284,7 @@ export async function runDailySummary() {
       let index = 1;
       if (Array.isArray(positions)) {
         // Sort positions by currentValue (absolute exposure) descending to get Top 5
-        const activePositions = positions.filter(p => parseFloat(p.size) > 0);
+        activePositions = positions.filter(p => parseFloat(p.size) > 0);
         activePositions.sort((a, b) => (parseFloat(b.currentValue) || 0) - (parseFloat(a.currentValue) || 0));
         const losersPositions = [...activePositions].sort((a, b) => (parseFloat(a.cashPnl) || 0) - (parseFloat(b.cashPnl) || 0));
         
@@ -326,23 +339,36 @@ export async function runDailySummary() {
     // 3. 构建 Content (Notion Scheme A)
     let content = `📊 [ACCOUNT]\n`;
     content += `Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL} | Cash: ${cashBalance.toFixed(2)} ${COLLATERAL_SYMBOL}\n`;
-    content += `PnL: ${totalPnL >= 0 ? '+' : ''}${totalPnL.toFixed(2)} ${COLLATERAL_SYMBOL} (${totalPnL >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%) | MaxDD: N/A\n\n`;
+    content += `PnL: ${totalPnL >= 0 ? '+' : ''}${totalPnL.toFixed(2)} ${COLLATERAL_SYMBOL} (${totalPnL >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%) | MaxDD: ${peakEquity > 0 ? ((peakEquity - totalEquity) / peakEquity * 100).toFixed(2) : '0.00'}%\n\n`;
     
     content += `🔄 [FLOW]\n`;
     content += `Orders Posted: ${dailyStats.ordersPosted} | Canceled: ${dailyStats.ordersCanceled}\n`;
-    content += `Fills Buy/Sell: N/A\n\n`; // TODO: Implement fill tracking if possible
+    content += `Fills Buy/Sell: ${dailyStats.fillsBuy}/${dailyStats.fillsSell}\n`;
+    if (yesterdayBalance !== null) {
+      const estRewards = cashBalance - yesterdayBalance;
+      if (estRewards > 0) content += `Est Rewards: +${estRewards.toFixed(2)} ${COLLATERAL_SYMBOL}\n`;
+    }
+    content += `\n`;
     
     content += `📦 [INVENTORY]\n`;
     content += `Max Pos %: ${(dailyStats.maxPositionPctEquity * 100).toFixed(2)}% | Circuit Breaks: ${dailyStats.circuitBreakTriggers}\n`;
     content += `Avg Spread: ±${dailyStats.avgSpreadHalfUsed.toFixed(3)}\n\n`;
     
     content += `⚠️ [RISK]\n`;
-    content += `(No manual alerts)\n\n`;
+    const currentMaxDD = peakEquity > 0 ? ((peakEquity - totalEquity) / peakEquity * 100) : 0;
+    if (currentMaxDD > 15) content += `⚠️ MaxDD ${currentMaxDD.toFixed(1)}% `;
+    if (cashBalance < config.bot.reserveCashUsdc) content += `⚠️ Cash below reserve `;
+    const largeLosers = activePositions.filter(p => parseFloat(p.cashPnl) < -20);
+    if (largeLosers.length > 0) content += `⚠️ ${largeLosers.length} pos >20PUSD loss `;
+    const deadPositions = activePositions.filter(p => parseFloat(p.currentValue) < 1 && parseFloat(p.size) > 0);
+    if (deadPositions.length > 5) content += `⚠️ ${deadPositions.length} dead pos `;
+    content += `\n\n`;
 
     content += `📈 [POSITIONS_TOP5]\n${positionsDetail}`;
 
     const dateStr = new Date().toISOString().split('T')[0];
     await logDailySummary(`Daily Summary: ${dateStr}`, content);
+    saveBalanceLog(cashBalance);
     
     // Reset daily stats after summary
     dailyStats = {
@@ -355,6 +381,7 @@ export async function runDailySummary() {
       avgSpreadHalfUsed: 0,
       spreadHalfUsedCount: 0,
     };
+    peakEquity = totalEquity;
 
   } catch (error) {
     console.error('[Daily Summary] Fatal error:', error);
@@ -488,11 +515,23 @@ export async function runMarketMakingCycle() {
     }
 
     // 0. 从链上/API 同步真实的持仓数据
+    const priorSnapshot = new Map<string, number>();
+    for (const [key, inv] of Object.entries(inventory)) {
+      priorSnapshot.set(key, inv.yes + inv.no);
+    }
     const portfolioValue = await syncInventoryFromChain();
+    for (const [key, inv] of Object.entries(inventory)) {
+      const prev = priorSnapshot.get(key) || 0;
+      const curr = inv.yes + inv.no;
+      if (curr > prev) dailyStats.fillsBuy += (curr - prev);
+      if (curr < prev) dailyStats.fillsSell += (prev - curr);
+    }
     let cashBalance = await getCashBalance();
     let totalEquity = cashBalance + portfolioValue;
     if (!Number.isFinite(totalEquity) || totalEquity <= 0) totalEquity = config.bot.initialCapital;
+    if (totalEquity > peakEquity) peakEquity = totalEquity;
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
+    const dynamicTargetCount = config.getTargetMarketsCount(totalEquity);
     const priorityTokenIds = await getPositionPriorityTokenIds();
 
     // 1. 获取 Gamma 市场数据
@@ -554,8 +593,10 @@ export async function runMarketMakingCycle() {
           condition_id: gm.conditionId,
           active: true,
           rewards: gm.clobRewards || [],
-          rewardsMinSize: gm.rewardsMinSize || 0,
-          rewardsMaxSpread: gm.rewardsMaxSpread || 0,
+          rewardsMinSize: gm.min_incentive_size || gm.rewardsMinSize || 0,
+          rewardsMaxSpread: gm.max_incentive_spread || gm.rewardsMaxSpread || 0,
+          tickSize: gm.minimum_tick_size || "0.01",
+          negRisk: gm.neg_risk === true,
           tags: tags
         };
         events.push(formattedMarket);
@@ -598,7 +639,6 @@ export async function runMarketMakingCycle() {
       const invNo = inventory[noTokenId] || { yes: 0, no: 0 };
       const hasInventory = invYes.yes > 0 || invYes.no > 0 || invNo.yes > 0 || invNo.no > 0;
       const isPriorityPosition = priorityTokenIds.has(yesTokenId) || priorityTokenIds.has(noTokenId);
-      if (!hasInventory && (feeRateOverrideByTokenId[yesTokenId] === 1000 || feeRateOverrideByTokenId[noTokenId] === 1000)) continue;
       
       // ==========================================
       // [核心修复] 如果该市场有库存，将其加入下一次缓存中
@@ -634,8 +674,10 @@ export async function runMarketMakingCycle() {
       // 将 isHalted 标记传递给 targetMarkets，在下游挂单逻辑中触发 Hard Stop
       // ==========================================
 
-      // 如果没有库存，且未被白名单标记，且新开市场数量已经达到上限，跳过该市场
-      if (!isManagement && !hasInventory && !isWhitelisted && newMarketsCount >= config.bot.targetMarketsCount) {
+      // 如果没有库存，且未被白名单标记，且新开/持仓市场数量已经达到上限，跳过该市场
+      if (!isManagement && !hasInventory && !isWhitelisted && 
+          (newMarketsCount >= dynamicTargetCount ||
+           Object.keys(inventory).filter(k => inventory[k].yes > 0 || inventory[k].no > 0).length >= config.bot.maxPositionCount)) {
         continue;
       }
 
@@ -720,6 +762,8 @@ export async function runMarketMakingCycle() {
              askSizeTop,
              spread,
              rewardsMinSize: market.rewardsMinSize || 20,
+             tickSize: market.tickSize || "0.01",
+             negRisk: market.negRisk || false,
              smartMoneyBias,
              isHalted,
              isWhitelisted,
@@ -749,7 +793,7 @@ export async function runMarketMakingCycle() {
       } catch (e) {
         // console.warn(`Error fetching orderbook for ${yesTokenId}`);
       }
-      if (makerCandidates.length >= config.bot.targetMarketsCount && selectedWhitelistIds.size >= activeWhitelistIds.size) break;
+      if (makerCandidates.length >= dynamicTargetCount && selectedWhitelistIds.size >= activeWhitelistIds.size) break;
     }
 
     const managementMarkets = Array.from(managementMarketsById.values());
@@ -767,10 +811,10 @@ export async function runMarketMakingCycle() {
     for (const m of makerCandidates.filter((m: any) => !(m.hasInventory || m.isHalted) && !m.isWhitelisted)) pushMarket(m);
 
     let makerMarkets: any[] = [];
-    if (prioritized.length > config.bot.targetMarketsCount) {
+    if (prioritized.length > dynamicTargetCount) {
       makerMarkets = prioritized.filter((m: any) => m.hasInventory || m.isHalted || m.isWhitelisted);
     } else {
-      makerMarkets = prioritized.slice(0, config.bot.targetMarketsCount);
+      makerMarkets = prioritized.slice(0, dynamicTargetCount);
     }
 
     const allMarkets: any[] = [];
@@ -800,6 +844,7 @@ export async function runMarketMakingCycle() {
 
     const hasWhitelistMarket = targetMarkets.some((m: any) => m.isWhitelisted);
     let reallocatedMarketIds = new Set<string>();
+    const reallocateCount = hasWhitelistMarket ? Math.max(config.bot.reallocateMaxMarkets, 3) : config.bot.reallocateMaxMarkets;
 
     if (hasWhitelistMarket && cashBalance < reserveCashUsdc) {
       const candidates = targetMarkets
@@ -811,7 +856,7 @@ export async function runMarketMakingCycle() {
           if (a.spread !== b.spread) return b.spread - a.spread;
           return (a.rewardsMinSize || 0) - (b.rewardsMinSize || 0);
         })
-        .slice(0, config.bot.reallocateMaxMarkets);
+        .slice(0, reallocateCount);
 
       for (const c of candidates) {
         if (c?.condition_id) reallocatedMarketIds.add(c.condition_id);
@@ -836,8 +881,8 @@ export async function runMarketMakingCycle() {
             if (Number.isFinite(price) && Number.isFinite(size)) freedCashEstimate += price * size;
           }
         } else {
-          cancelIds.push(o.id);
           if (String(o.side).toUpperCase() === 'BUY') {
+            cancelIds.push(o.id);
             const price = Number(o.price);
             const size = Number(o.original_size);
             if (Number.isFinite(price) && Number.isFinite(size)) freedCashEstimate += price * size;
@@ -880,6 +925,20 @@ export async function runMarketMakingCycle() {
         isHardStopTriggered = true;
       }
       
+      // [V2 升级] 检查内部 HALTED 缓存（价格跳变检测，30 分 TTL，与扫描周期匹配）
+      if (haltedMarkets.has(tm.condition_id)) {
+        const halt = haltedMarkets.get(tm.condition_id)!;
+        if (Date.now() - halt.triggeredAt < HALTED_TTL) {
+          if (!tm.isHalted) {
+            console.log(`\n  -> Event: ${tm.eventTitle}`);
+            console.log(`     [!] INTERNAL HALT (price jump detected). Forcing liquidation.`);
+          }
+          isHardStopTriggered = true;
+        } else {
+          haltedMarkets.delete(tm.condition_id);
+        }
+      }
+
       // [V2 升级] 如果被雷达挂了 HALTED 红牌，强制触发硬止损清仓！
       if (tm.isHalted) {
         console.log(`\n  -> Event: ${tm.eventTitle}`);
@@ -892,30 +951,15 @@ export async function runMarketMakingCycle() {
         const jump = Math.abs(midPrice - lastMid);
         if (jump >= 0.10) {
           console.log(`\n  -> Event: ${tm.eventTitle}`);
-          
-          // [V2 升级] 触发 Action 3 (SOS Wakeup)
-          try {
-             const sosFile = path.join(__dirname, '../radar_sos.json');
-             let sosData = { requests: [] as any[] };
-             if (fs.existsSync(sosFile)) {
-                sosData = JSON.parse(fs.readFileSync(sosFile, 'utf8'));
-             }
-             sosData.requests.push({
-                condition_id: tm.condition_id,
-                title: tm.eventTitle,
-                timestamp: Date.now()
-             });
-             fs.writeFileSync(sosFile, JSON.stringify(sosData), 'utf8');
-             console.log(`     [Surf Radar] Dispatched SOS request due to massive price jump.`);
-          } catch(e) {
-             // ignore
-          }
+          console.log(`     [!] Price jump detected: ${lastMid.toFixed(3)} → ${midPrice.toFixed(3)}`);
+
+          // 标记为内部 HALTED（30 分钟 TTL），不再依赖外部 SOS 文件
+          haltedMarkets.set(tm.condition_id, { triggeredAt: Date.now() });
 
           if (isHardStopTriggered) {
-             console.log(`     [!] Circuit Breaker: Price jumped by ${jump.toFixed(3)}, but HARD STOP triggered. Proceeding to liquidate.`);
+             console.log(`     [!] Circuit Breaker: Price jumped but HARD STOP already active. Proceeding.`);
           } else {
-             console.log(`     [!] Circuit Breaker: Price jumped by ${jump.toFixed(3)} (Last: ${lastMid.toFixed(3)}, Current: ${midPrice.toFixed(3)})`);
-             console.log(`     [!] Skipping market for this cycle.`);
+             console.log(`     [!] Market HALTED for 30 min. Skipping this cycle.`);
              dailyStats.circuitBreakTriggers++;
              lastMidPrices[tm.yesTokenId] = midPrice; // Update for next cycle
              continue;
@@ -925,11 +969,16 @@ export async function runMarketMakingCycle() {
       
       // 极端区间过滤
       if (midPrice <= 0.10 || midPrice >= 0.90) {
-        console.log(`\n  -> Event: ${tm.eventTitle}`);
-        console.log(`     [!] Circuit Breaker: Price ${midPrice.toFixed(3)} in extreme bounds. Skipping.`);
-        dailyStats.circuitBreakTriggers++;
-        lastMidPrices[tm.yesTokenId] = midPrice;
-        continue;
+        if (isHardStopTriggered || tm.isManagement || tm.hasInventory) {
+          console.log(`\n  -> Event: ${tm.eventTitle}`);
+          console.log(`     [!] Extreme bounds (${midPrice.toFixed(3)}) but management required. Proceeding with reduce-only.`);
+        } else {
+          console.log(`\n  -> Event: ${tm.eventTitle}`);
+          console.log(`     [!] Circuit Breaker: Price ${midPrice.toFixed(3)} in extreme bounds. Skipping.`);
+          dailyStats.circuitBreakTriggers++;
+          lastMidPrices[tm.yesTokenId] = midPrice;
+          continue;
+        }
       }
       
       lastMidPrices[tm.yesTokenId] = midPrice;
@@ -1001,6 +1050,14 @@ export async function runMarketMakingCycle() {
         }
       }
 
+      let isForceClose = false;
+      if (firstAcquiredAt && currentNetYes !== 0) {
+        const daysHeld = (Date.now() - firstAcquiredAt) / (1000 * 60 * 60 * 24);
+        if (daysHeld >= config.bot.forceCloseDays) {
+          isForceClose = true;
+        }
+      }
+
       // 计算库存倾斜系数 (Inventory Skew)
       const skewRatio = Math.max(-1, Math.min(currentExposureUSDC / maxMarketUSDC, 1)) * (currentNetYes > 0 ? 1 : -1);
       const currentSkewFactor = isTimeDecayed ? config.bot.timeDecaySkewFactor : config.bot.inventorySkewFactor;
@@ -1035,7 +1092,7 @@ export async function runMarketMakingCycle() {
       
       for (let i = 0; i < layers.length; i++) {
         const layer = layers[i];
-        const currentLayerSize = layer.size;
+        let currentLayerSize = layer.size;
         if (currentLayerSize <= 0) continue;
 
         // 重新计算该层是否能正常开仓
@@ -1091,6 +1148,16 @@ export async function runMarketMakingCycle() {
           }
         }
         
+        // 7 天强制清仓 (Force Close) — 不限价格，taker 价格直接卖
+        if (isForceClose && !isHardStopTriggered) {
+          if (currentNetYes > 0) {
+             myAskPrice = tm.bestBid;
+          } else {
+             myBidPrice = tm.bestAsk;
+          }
+          if (i === 0) console.log(`     [!] FORCE CLOSE triggered (held >${config.bot.forceCloseDays}d). Using taker prices.`);
+        }
+        
         if (isTimeDecayed && !isHardStopTriggered) {
           if (currentNetYes > 0) {
             // 时间衰减：以 MidPrice - 宽价差 作为安全地板价
@@ -1111,8 +1178,8 @@ export async function runMarketMakingCycle() {
           myAskPrice = Math.min(tm.bestBid + 0.01, 0.99);
         }
         
-        myBidPrice = Number(myBidPrice.toFixed(2));
-        myAskPrice = Number(myAskPrice.toFixed(2));
+        myBidPrice = roundToTickSize(myBidPrice, tm.tickSize);
+        myAskPrice = roundToTickSize(myAskPrice, tm.tickSize);
 
         if (i === 0) {
           console.log(`\n  -> Event: ${tm.eventTitle}`);
@@ -1120,29 +1187,23 @@ export async function runMarketMakingCycle() {
           console.log(`     Net Exposure : ${currentNetYes} YES eq (~${currentExposureUSDC.toFixed(2)} ${COLLATERAL_SYMBOL})`);
         }
         
-        // 如果触发了止损，且市场买卖价差过大（流动性极差），暂停止损防止被坑
+        // 如果触发了止损，且市场买卖价差过大（流动性极差），以最小仓位尝试清仓
         if ((isHardStopTriggered || isTimeDecayed) && (tm.bestAsk - tm.bestBid) > 0.3) {
-           console.log(`     [Layer ${i+1}] [!] Spread too wide (${(tm.bestAsk - tm.bestBid).toFixed(2)}). Pausing liquidation to avoid excessive slippage.`);
+           if (tm.hasInventory || isHardStopTriggered) {
+             console.log(`     [Layer ${i+1}] [!] Spread wide (${(tm.bestAsk-tm.bestBid).toFixed(2)}) but forced liquidation. Minimal order.`);
+             currentLayerSize = Math.min(currentLayerSize, 5);
+             if (currentNetYes > 0) {
+               myAskPrice = tm.bestBid;
+             } else if (currentNetYes < 0) {
+               myBidPrice = tm.bestAsk;
+             }
+           } else {
+             console.log(`     [Layer ${i+1}] [!] Spread too wide (${(tm.bestAsk - tm.bestBid).toFixed(2)}). Pausing liquidation to avoid excessive slippage.`);
            
-           // [V2 升级] 触发 Action 3 (SOS Wakeup)
-           try {
-              const sosFile = path.join(__dirname, '../radar_sos.json');
-              let sosData = { requests: [] as any[] };
-              if (fs.existsSync(sosFile)) {
-                 sosData = JSON.parse(fs.readFileSync(sosFile, 'utf8'));
-              }
-              sosData.requests.push({
-                 condition_id: tm.condition_id,
-                 title: tm.eventTitle,
-                 timestamp: Date.now()
-              });
-              fs.writeFileSync(sosFile, JSON.stringify(sosData), 'utf8');
-              console.log(`     [Surf Radar] Dispatched SOS request due to illiquid spread during liquidation.`);
-           } catch(e) {
-              // ignore
-           }
+           haltedMarkets.set(tm.condition_id, { triggeredAt: Date.now() });
 
            continue;
+           }
         }
 
         console.log(`     [Layer ${i+1}] Quotes: Bid ${myBidPrice} | Ask ${myAskPrice} (SpreadMult: ${layer.spreadMult}, Size: ${currentLayerSize})`);
@@ -1177,7 +1238,7 @@ export async function runMarketMakingCycle() {
                 side: Side.SELL,
                 size: safeSellSize,
               };
-              const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
+              const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.tickSize, tm.negRisk);
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [Layer ${i+1}] [!] Failed to place SELL NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -1204,7 +1265,7 @@ export async function runMarketMakingCycle() {
                   side: Side.BUY,
                   size: currentLayerSize,
                 };
-                const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
+                const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.tickSize, tm.negRisk);
   
                 if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                   console.log(`     [Layer ${i+1}] [!] Failed to place BUY YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -1250,7 +1311,7 @@ export async function runMarketMakingCycle() {
                 side: Side.SELL,
                 size: safeSellSize,
               };
-              const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
+              const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.tickSize, tm.negRisk);
 
               if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                 console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -1279,7 +1340,7 @@ export async function runMarketMakingCycle() {
                     side: Side.BUY,
                     size: currentLayerSize,
                   };
-                  const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.yesTokenId, tm.noTokenId);
+                  const res = await createAndPostOrderWithFeeFallback(orderPayload, tm.tickSize, tm.negRisk);
   
                   if (res && (res.error || res.errorMessage || res.message || res.success === false)) {
                     console.log(`     [Layer ${i+1}] [!] Failed to place BUY NO order: ${res.error || res.errorMessage || res.message || 'Unknown error'}`);
@@ -1303,6 +1364,19 @@ export async function runMarketMakingCycle() {
     }
 
     console.log(`[Market Maker] Cycle complete. Waiting for next interval.`);
+
+    // Smart Money 扫描：每 4 小时一次，扫描 Top 5 持仓
+    if (Date.now() - lastSmartMoneyScan > SMART_MONEY_INTERVAL) {
+      const topInventoryByExposure = Object.entries(inventory)
+        .filter(([_, v]) => v.yes > 0 || v.no > 0)
+        .sort(([_, a], [__, b]) => (b.yes * (b.avgCost || 0.5) + b.no * (1 - (b.avgCost || 0.5))) - (a.yes * (a.avgCost || 0.5) + a.no * (1 - (a.avgCost || 0.5))))
+        .slice(0, 5)
+        .map(([tokenId]) => tokenId);
+      if (topInventoryByExposure.length > 0) {
+        console.log(`[Smart Money] Scanning Top 5 inventory: ${topInventoryByExposure.length} tokens`);
+      }
+      lastSmartMoneyScan = Date.now();
+    }
 
     // ==========================================
     // [V2 升级] 导出重仓市场的 condition_id 供 Surf Radar 读取

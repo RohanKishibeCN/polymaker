@@ -50,12 +50,20 @@ export const config = {
     timeDecayDays: 2, // 缩短为 2 天清理死仓
     timeDecaySkewFactor: 0.06, // 加大出清力度
     hardStopLossPct: -0.15,
+    forceCloseDays: 7, // 7 天后强制清仓，不限价格
     enableDualLayerGrid: true,
+    maxPositionCount: 30, // 持仓市场硬上限
     initialCapital: (initialCapitalEnv && initialCapitalEnv > 0 ? initialCapitalEnv : 500),
     reserveCashUsdc: (reserveCashUsdcEnv && reserveCashUsdcEnv > 0 ? reserveCashUsdcEnv : 50),
     freezeAddSpreadSoft: (freezeAddSpreadSoftEnv && freezeAddSpreadSoftEnv > 0 ? freezeAddSpreadSoftEnv : 0.5),
     freezeAddSpreadHard: (freezeAddSpreadHardEnv && freezeAddSpreadHardEnv > 0 ? freezeAddSpreadHardEnv : 0.8),
     reallocateMaxMarkets: (reallocateMaxMarketsEnv && reallocateMaxMarketsEnv > 0 ? reallocateMaxMarketsEnv : 2)
+  },
+  getTargetMarketsCount(capital: number): number {
+    if (capital <= 500) return 7;
+    if (capital <= 1000) return 10;
+    if (capital <= 2000) return 12;
+    return 15;
   }
 };
 

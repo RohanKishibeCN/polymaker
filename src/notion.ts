@@ -4,6 +4,14 @@ import { config } from './config';
 const notion = new Client({ auth: config.notion.token });
 const databaseId = config.notion.databaseId;
 
+function toRichTextBlocks(content: string, chunkSize: number): Array<{ text: { content: string } }> {
+  const blocks: Array<{ text: { content: string } }> = [];
+  for (let i = 0; i < content.length; i += chunkSize) {
+    blocks.push({ text: { content: content.substring(i, i + chunkSize) } });
+  }
+  return blocks;
+}
+
 export async function logTrade(name: string, content: string) {
   try {
     await notion.pages.create({
@@ -29,13 +37,7 @@ export async function logTrade(name: string, content: string) {
           },
         },
         Content: {
-          rich_text: [
-            {
-              text: {
-                content: content.substring(0, 2000), // Notion rich_text content limit
-              },
-            },
-          ],
+          rich_text: toRichTextBlocks(content, 2000),
         },
       },
     });
@@ -70,13 +72,7 @@ export async function logDailySummary(name: string, content: string) {
           },
         },
         Content: {
-          rich_text: [
-            {
-              text: {
-                content: content.substring(0, 2000), // Notion rich_text content limit
-              },
-            },
-          ],
+          rich_text: toRichTextBlocks(content, 2000),
         },
       },
     });
