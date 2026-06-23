@@ -100,6 +100,8 @@ async function main() {
       chain: Chain.POLYGON,
       // @ts-ignore (viem WalletClient is supported but types might clash)
       signer: walletClient,
+      signatureType: SignatureTypeV2.POLY_1271,
+      funderAddress: process.env.POLYMARKET_FUNDER_ADDRESS?.trim(),
     });
 
     // 3. 通过私钥对签名消息 (EIP-712) 派生出一组绝对匹配的 API Credentials
