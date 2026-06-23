@@ -84,7 +84,9 @@ export function startHeartbeat() {
       const resp = await clobClient.postHeartbeat(heartbeatId);
       heartbeatId = resp.heartbeat_id || '';
     } catch (e: any) {
-      if (e?.response?.data?.heartbeat_id) {
+      if (e?.response?.data?.error_msg?.includes('Invalid Heartbeat ID')) {
+        heartbeatId = '';
+      } else if (e?.response?.data?.heartbeat_id) {
         heartbeatId = e.response.data.heartbeat_id;
       } else {
         heartbeatId = '';
