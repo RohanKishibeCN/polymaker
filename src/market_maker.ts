@@ -67,10 +67,10 @@ const clobClient: any = new ClobClient({
   },
   signatureType: (() => {
     const envType = (process.env.POLYMARKET_SIGNATURE_TYPE || '').trim();
+    if (envType === 'EOA') return SignatureTypeV2.EOA;
     if (envType === 'POLY_PROXY') return SignatureTypeV2.POLY_PROXY;
     if (envType === 'POLY_GNOSIS_SAFE') return SignatureTypeV2.POLY_GNOSIS_SAFE;
-    if (envType === 'POLY_1271') return SignatureTypeV2.POLY_1271;
-    return SignatureTypeV2.EOA;
+    return SignatureTypeV2.POLY_1271;
   })(),
   funderAddress: config.polymarket.funderAddress,
 });
