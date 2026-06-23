@@ -567,6 +567,12 @@ export async function runMarketMakingCycle() {
         } else {
           lastMarketOffset += 100;
         }
+        // 安全上限：offset 超过 1500（15 页）时强制归零
+        if (lastMarketOffset >= 1500) {
+          lastMarketOffset = 0;
+          console.log("[Market Maker] Offset safety cap reached (1500). Resetting to 0 for next cycle.");
+          break;
+        }
       } catch (e: any) {
          console.warn(`[Market Maker] Failed to fetch markets page ${i+1}: ${e.message}`);
          break;
