@@ -77,6 +77,7 @@ if (clobClient.axiosInstance) {
 }
 
 // CLOB V2 要求每 10 秒发送 heartbeat，否则服务器自动取消所有订单
+// 注意：部分 API 密钥因服务端原因会持续报 Invalid Heartbeat ID，不影响订单
 let heartbeatId = '';
 export function startHeartbeat() {
   setInterval(async () => {
