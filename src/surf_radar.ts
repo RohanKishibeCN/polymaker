@@ -95,6 +95,16 @@ function readRadarSignals(): RadarSignals {
       const existing = JSON.parse(fs.readFileSync(RADAR_FILE, 'utf8'));
       if (existing && existing.markets) {
         signals.markets = existing.markets;
+        const now = Date.now();
+        const HALTED_TTL = 24 * 60 * 60 * 1000; // 24 hours
+        for (const [key, mkt] of Object.entries(signals.markets)) {
+          if ((mkt as any).status === 'HALTED' && now - (mkt as any).updated_at > HALTED_TTL) {
+            (mkt as any).status = 'ACTIVE';
+            (mkt as any).updated_at = now;
+            (mkt as any).reason = 'TTL_EXPIRED';
+            console.log(`[Surf Radar] HALTED state expired for ${key}, reset to ACTIVE.`);
+          }
+        }
       }
       if (existing && existing.target_whitelist) {
         // Migrate old array format to object format
@@ -114,9 +124,13 @@ function readRadarSignals(): RadarSignals {
 }
 
 function writeAtomic(data: RadarSignals) {
-  data.last_updated = Date.now();
-  fs.writeFileSync(TMP_FILE, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(TMP_FILE, RADAR_FILE);
+  try {
+    data.last_updated = Date.now();
+    fs.writeFileSync(TMP_FILE, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(TMP_FILE, RADAR_FILE);
+  } catch (e: any) {
+    console.warn(`[Surf Radar] Failed to write radar_signals.json: ${e.message}`);
+  }
 }
 
 function runSurf(commandArgs: string): string {

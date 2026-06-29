@@ -23,6 +23,7 @@ const reserveCashUsdcEnv = parseNumberEnv('POLYMARKET_RESERVE_CASH_USDC');
 const freezeAddSpreadSoftEnv = parseNumberEnv('POLYMARKET_FREEZE_ADD_SPREAD_SOFT');
 const freezeAddSpreadHardEnv = parseNumberEnv('POLYMARKET_FREEZE_ADD_SPREAD_HARD');
 const reallocateMaxMarketsEnv = parseIntEnv('POLYMARKET_REALLOCATE_MAX_MARKETS');
+const maxPositionCountEnv = parseIntEnv('POLYMARKET_MAX_POSITION_COUNT');
 
 export const config = {
   polymarket: {
@@ -52,7 +53,7 @@ export const config = {
     hardStopLossPct: -0.15,
     forceCloseDays: 7, // 7 天后强制清仓，不限价格
     enableDualLayerGrid: true,
-    maxPositionCount: 30, // 持仓市场硬上限
+    maxPositionCount: (maxPositionCountEnv && maxPositionCountEnv > 0 ? maxPositionCountEnv : 30), // 可通过 env 调整
     initialCapital: (initialCapitalEnv && initialCapitalEnv > 0 ? initialCapitalEnv : 500),
     reserveCashUsdc: (reserveCashUsdcEnv && reserveCashUsdcEnv > 0 ? reserveCashUsdcEnv : 50),
     freezeAddSpreadSoft: (freezeAddSpreadSoftEnv && freezeAddSpreadSoftEnv > 0 ? freezeAddSpreadSoftEnv : 0.5),

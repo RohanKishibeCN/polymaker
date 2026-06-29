@@ -89,9 +89,8 @@ export function startHeartbeat() {
         heartbeatId = '';
       } else if (e?.response?.data?.heartbeat_id) {
         heartbeatId = e.response.data.heartbeat_id;
-      } else {
-        heartbeatId = '';
       }
+      // network error: keep current heartbeatId, retry next interval
     }
   }, 5000);
   console.log(`[Market Maker] Heartbeat started (5s interval).`);
@@ -1256,7 +1255,8 @@ export async function runMarketMakingCycle() {
               } else {
                 console.log(`     [Layer ${i+1}] [+] Placed SELL NO (Eq Bid) for ${safeSellSize} shares at $${sellNoPrice}`);
                 dailyStats.ordersPosted++;
-                invNo.no -= safeSellSize; // 更新本地库存，防止下一层网格重复卖出
+                invNo.no -= safeSellSize;
+                cashBalance += safeSellSize * sellNoPrice;
               }
             } catch (e: any) {
               console.log(`     [Layer ${i+1}] [!] Failed to place SELL NO order: ${e.message}`);
@@ -1329,7 +1329,8 @@ export async function runMarketMakingCycle() {
               } else {
                 console.log(`     [Layer ${i+1}] [-] Placed SELL YES (Ask) for ${safeSellSize} shares at $${sellYesPrice}`);
                 dailyStats.ordersPosted++;
-                invYes.yes -= safeSellSize; // 更新本地库存，防止下一层网格重复卖出
+                invYes.yes -= safeSellSize;
+                cashBalance += safeSellSize * sellYesPrice;
               }
             } catch (e: any) {
               console.log(`     [Layer ${i+1}] [!] Failed to place SELL YES order: ${e.message}`);
