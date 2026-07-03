@@ -24,6 +24,8 @@ const freezeAddSpreadSoftEnv = parseNumberEnv('POLYMARKET_FREEZE_ADD_SPREAD_SOFT
 const freezeAddSpreadHardEnv = parseNumberEnv('POLYMARKET_FREEZE_ADD_SPREAD_HARD');
 const reallocateMaxMarketsEnv = parseIntEnv('POLYMARKET_REALLOCATE_MAX_MARKETS');
 const maxPositionCountEnv = parseIntEnv('POLYMARKET_MAX_POSITION_COUNT');
+const sizePctEnv = parseNumberEnv('POLYMARKET_SIZE_PCT');
+const maxMarketPctEnv = parseNumberEnv('POLYMARKET_MAX_MARKET_PCT');
 
 export const config = {
   polymarket: {
@@ -43,8 +45,8 @@ export const config = {
     scanIntervalMs: (scanIntervalMinutesEnv && scanIntervalMinutesEnv > 0 ? scanIntervalMinutesEnv * 60 * 1000 : 3600 * 1000),
     targetMarketsCount: (targetMarketsCountEnv && targetMarketsCountEnv > 0 ? targetMarketsCountEnv : 7),
     tagQuota: (tagQuotaEnv && tagQuotaEnv > 0 ? tagQuotaEnv : 2),
-    sizePct: 0.12,
-    maxMarketPct: 0.30,
+    sizePct: (sizePctEnv && sizePctEnv > 0 ? sizePctEnv : 0.08),
+    maxMarketPct: (maxMarketPctEnv && maxMarketPctEnv > 0 ? maxMarketPctEnv : 0.25),
     spreadHalfBase: 0.02,
     spreadHalfMax: 0.04,
     inventorySkewFactor: 0.02,
