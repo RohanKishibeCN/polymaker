@@ -65,7 +65,7 @@ const clobClient: any = new ClobClient({
     secret: config.polymarket.secret,
     passphrase: config.polymarket.passphrase,
   },
-  signatureType: SignatureTypeV2.POLY_GNOSIS_SAFE,
+  signatureType: SignatureTypeV2.POLY_1271,
   funderAddress: config.polymarket.funderAddress,
 });
 
