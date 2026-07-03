@@ -92,8 +92,8 @@ export function startHeartbeat() {
       }
       // network error: keep current heartbeatId, retry next interval
     }
-  }, 5000);
-  console.log(`[Market Maker] Heartbeat started (5s interval).`);
+  }, 30000);
+  console.log(`[Market Maker] Heartbeat started (30s interval).`);
 }
 
 // 简单内存状态，记录我们在每个市场的持仓情况
@@ -401,15 +401,14 @@ async function syncInventoryFromChain(): Promise<number> {
       agent: proxyAgent
     });
     const positions = await res.json();
-    
-    // 重置内存库存，避免残留脏数据
-    for (const key in inventory) {
-      inventory[key].yes = 0;
-      inventory[key].no = 0;
-      inventory[key].avgCost = 0;
-    }
 
     if (Array.isArray(positions)) {
+      // 重置内存库存，避免残留脏数据（只在 API 成功返回有效数据后才清空）
+      for (const key in inventory) {
+        inventory[key].yes = 0;
+        inventory[key].no = 0;
+        inventory[key].avgCost = 0;
+      }
       for (const pos of positions) {
         if (!inventory[pos.asset]) {
           inventory[pos.asset] = { yes: 0, no: 0, avgCost: 0 };
@@ -577,6 +576,7 @@ export async function runMarketMakingCycle() {
         }
       } catch (e: any) {
          console.warn(`[Market Maker] Failed to fetch markets page ${i+1}: ${e.message}`);
+         lastMarketOffset = 0;
          break;
       }
     }
