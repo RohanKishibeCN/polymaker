@@ -693,9 +693,6 @@ export async function runMarketMakingCycle() {
         continue;
       }
 
-      // [LP Rewards Bot] 核心逻辑：只在官方有流动性补贴的市场做市！(有库存的市场强制放行，方便平仓)
-      if (!isManagement && !hasInventory && market.rewards && market.rewards.length === 0) continue;
-
       // 【第二轮迭代】Tag 多样性过滤（解决同质化事件扎堆）
       let skipForTagQuota = false;
       if (!isManagement && !hasInventory && market.tags && market.tags.length > 0) {
