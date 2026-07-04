@@ -768,7 +768,6 @@ export async function runMarketMakingCycle() {
            if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) continue;
 
            const spread = bestAsk - bestBid;
-           if (!isManagement && !hasInventory && !isWhitelisted && spread > config.bot.freezeAddSpreadHard) continue;
 
            let smartMoneyBias = 'NEUTRAL';
            if (radarData && market.condition_id) {
