@@ -233,40 +233,51 @@ async function getCollateralDecimals(collateralAddress: string): Promise<number>
 }
 
 // 获取稳定币余额辅助函数
+let lastGoodCashBalance = 0;
+const CASH_RPC_LIST = [
+  process.env.RPC_URL,
+  'https://polygon-bor.publicnode.com',
+  'https://polygon.llamarpc.com',
+  'https://polygon-rpc.com',
+].filter(Boolean) as string[];
+
 async function getCashBalance(): Promise<number> {
-  try {
-    const envCollateral = (process.env.POLYMARKET_COLLATERAL_ADDRESS || '').trim();
-    const collateralAddress = envCollateral
-      ? envCollateral
-      : '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';  // pUSD
-    const userAddress = config.polymarket.funderAddress;
-    const cleanAddress = userAddress.replace(/^0x/i, '').padStart(64, '0');
-    const data = `0x70a08231${cleanAddress}`;
-    
-    const rpcUrl = process.env.RPC_URL || 'https://polygon-rpc.com';
-    const response = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "eth_call",
-        params: [{ to: collateralAddress, data: data }, "latest"]
-      })
-    });
-    const rpcData = await response.json();
-    if (rpcData && rpcData.result) {
-      const decimals = await getCollateralDecimals(collateralAddress);
-      const raw = BigInt(rpcData.result);
-      const divisor = 10n ** BigInt(decimals);
-      const whole = raw / divisor;
-      const frac = raw % divisor;
-      return Number(whole) + Number(frac) / Number(divisor);
+  for (const rpcUrl of CASH_RPC_LIST) {
+    try {
+      const envCollateral = (process.env.POLYMARKET_COLLATERAL_ADDRESS || '').trim();
+      const collateralAddress = envCollateral
+        ? envCollateral
+        : '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';  // pUSD
+      const userAddress = config.polymarket.funderAddress;
+      const cleanAddress = userAddress.replace(/^0x/i, '').padStart(64, '0');
+      const data = `0x70a08231${cleanAddress}`;
+
+      const response = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_call",
+          params: [{ to: collateralAddress, data: data }, "latest"]
+        })
+      });
+      const rpcData = await response.json();
+      if (rpcData && rpcData.result) {
+        const decimals = await getCollateralDecimals(collateralAddress);
+        const raw = BigInt(rpcData.result);
+        const divisor = 10n ** BigInt(decimals);
+        const whole = raw / divisor;
+        const frac = raw % divisor;
+        lastGoodCashBalance = Number(whole) + Number(frac) / Number(divisor);
+        return lastGoodCashBalance;
+      }
+    } catch (e) {
+      continue;
     }
-  } catch (e) {
-    console.warn("Failed to get cash balance");
   }
-  return 0;
+  console.warn(`[getCashBalance] All RPC endpoints failed. Using cached balance: ${lastGoodCashBalance}`);
+  return lastGoodCashBalance;
 }
 
 export async function runDailySummary() {
@@ -339,8 +350,13 @@ export async function runDailySummary() {
 
     const totalEquity = cashBalance + portfolioValue;
     const initialCapital = config.bot.initialCapital;
-    const totalPnL = totalEquity - initialCapital;
-    const pnlPercent = (totalPnL / initialCapital) * 100;
+    let totalPnL = totalEquity - initialCapital;
+    let pnlPercent = (totalPnL / initialCapital) * 100;
+    // RPC 失败时用初始资本避免虚假报告
+    if (!Number.isFinite(totalEquity) || totalEquity <= 0) {
+      totalPnL = 0;
+      pnlPercent = 0;
+    }
 
     // 3. 构建 Content (Notion Scheme A)
     let content = `📊 [ACCOUNT]\n`;
@@ -533,7 +549,10 @@ export async function runMarketMakingCycle() {
     }
     let cashBalance = await getCashBalance();
     let totalEquity = cashBalance + portfolioValue;
-    if (!Number.isFinite(totalEquity) || totalEquity <= 0) totalEquity = config.bot.initialCapital;
+    if (!Number.isFinite(totalEquity) || totalEquity <= 0) {
+      totalEquity = config.bot.initialCapital;
+      if (cashBalance <= 0) cashBalance = totalEquity;
+    }
     if (totalEquity > peakEquity) peakEquity = totalEquity;
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
     const dynamicTargetCount = config.getTargetMarketsCount(totalEquity);
