@@ -1133,7 +1133,7 @@ export async function runMarketMakingCycle() {
         const cashAvailableForBuys = Math.max(0, cashBalance - reserveCashUsdc);
         const isHardFrozen = tm.spread > freezeAddSpreadHard;
         const isSoftFrozen = tm.spread > freezeAddSpreadSoft && !isHardFrozen;
-        const freezeBlocksBuys = tm.isManagement || isHardFrozen || (isSoftFrozen && !tm.isWhitelisted) || (isSoftFrozen && tm.isWhitelisted && i > 0);
+        const freezeBlocksBuys = tm.isManagement || (isHardFrozen && tm.hasInventory) || (isSoftFrozen && !tm.isWhitelisted) || (isSoftFrozen && tm.isWhitelisted && i > 0);
         
         // 只要不是已经爆仓 (isExposureMaxedOut) 或者硬止损，且余额和敞口都够这“一层”的单子，就可以挂单。
         const canIncreaseExposure = !isHardStopTriggered && !isExposureMaxedOut &&
