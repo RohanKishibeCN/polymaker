@@ -1,4 +1,4 @@
-import { Chain, ClobClient, Side, SignatureTypeV2 } from '@polymarket/clob-client';
+import { Chain, ClobClient, Side, SignatureTypeV2, AssetType } from '@polymarket/clob-client';
 import { createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
@@ -110,6 +110,14 @@ async function _initClobClient(): Promise<any> {
   if (client.axiosInstance) {
     // @ts-ignore
     client.axiosInstance.defaults.httpsAgent = axiosHttpsAgent;
+  }
+
+  // Step 5 from docs: Sync CLOB balances to link API key with deposit wallet
+  try {
+    await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    console.log('[Market Maker] Balance allowance synced for deposit wallet.');
+  } catch (e: any) {
+    console.warn('[Market Maker] updateBalanceAllowance error:', e.message);
   }
 
   return client;
