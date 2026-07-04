@@ -1,5 +1,7 @@
 import { Chain, ClobClient, Side, SignatureTypeV2 } from '@polymarket/clob-client';
-import { Wallet } from 'ethers';
+import { createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { polygon } from 'viem/chains';
 
 import { config } from './config';
 import { logTrade, logDailySummary } from './notion';
@@ -44,12 +46,17 @@ if (proxyUrl) {
   };
 }
 
-// Initialize Wallet & Client using ethers
+// Initialize Wallet & Client using viem (matching @polymarket/clob-client-v2 official Quickstart)
 const privateKey = config.polymarket.privateKey.startsWith('0x')
-  ? config.polymarket.privateKey
-  : `0x${config.polymarket.privateKey}`;
+  ? config.polymarket.privateKey as `0x${string}`
+  : `0x${config.polymarket.privateKey}` as `0x${string}`;
 
-const wallet = new Wallet(privateKey);
+const account = privateKeyToAccount(privateKey);
+const walletClient = createWalletClient({
+  account,
+  chain: polygon,
+  transport: http('https://polygon-rpc.com'),
+});
 
 // 定制化的 axios httpsAgent，供 clob-client 内部使用
 const axiosHttpsAgent = proxyAgent ? proxyAgent : new https.Agent();
@@ -57,7 +64,7 @@ const axiosHttpsAgent = proxyAgent ? proxyAgent : new https.Agent();
 const clobClient: any = new ClobClient({
   host: 'https://clob.polymarket.com',
   chain: Chain.POLYGON,
-  signer: wallet,
+  signer: walletClient,
   throwOnError: true,
   retryOnError: true,
   creds: {
