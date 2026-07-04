@@ -61,26 +61,65 @@ const walletClient = createWalletClient({
 // 定制化的 axios httpsAgent，供 clob-client 内部使用
 const axiosHttpsAgent = proxyAgent ? proxyAgent : new https.Agent();
 
-const clobClient: any = new ClobClient({
-  host: 'https://clob.polymarket.com',
-  chain: Chain.POLYGON,
-  signer: walletClient,
-  throwOnError: true,
-  retryOnError: true,
-  creds: {
+async function _initClobClient(): Promise<any> {
+  let creds = {
     key: config.polymarket.apiKey,
     secret: config.polymarket.secret,
     passphrase: config.polymarket.passphrase,
-  },
-  signatureType: SignatureTypeV2.POLY_GNOSIS_SAFE,
-  funderAddress: config.polymarket.funderAddress,
-});
+  };
 
-// 覆盖 clobClient 内部的 axios 实例配置，让其走代理
-// @ts-ignore
-if (clobClient.axiosInstance) {
+  if (!creds.key) {
+    console.log('[Market Maker] No existing API credentials. Deriving new ones...');
+    const tempClient = new ClobClient({
+      host: 'https://clob.polymarket.com',
+      chain: Chain.POLYGON,
+      signer: walletClient,
+    });
+    const newCreds = await tempClient.createOrDeriveApiKey();
+    creds = { key: newCreds.key, secret: newCreds.secret, passphrase: newCreds.passphrase };
+    // Save to .env for subsequent restarts
+    try {
+      const fs = await import('fs');
+      const path = await import('path');
+      const envPath = path.join(process.cwd(), '.env');
+      if (fs.existsSync(envPath)) {
+        let envContent = fs.readFileSync(envPath, 'utf8');
+        envContent = envContent.replace(/^POLYMARKET_API_KEY=.*$/m, `POLYMARKET_API_KEY="${newCreds.key}"`);
+        envContent = envContent.replace(/^POLYMARKET_API_SECRET=.*$/m, `POLYMARKET_API_SECRET="${newCreds.secret}"`);
+        envContent = envContent.replace(/^POLYMARKET_API_PASSPHRASE=.*$/m, `POLYMARKET_API_PASSPHRASE="${newCreds.passphrase}"`);
+        fs.writeFileSync(envPath, envContent);
+        console.log('[Market Maker] Saved new credentials to .env');
+      }
+    } catch (e: any) {
+      console.warn('[Market Maker] Could not save credentials:', e.message);
+    }
+  }
+
+  const client = new ClobClient({
+    host: 'https://clob.polymarket.com',
+    chain: Chain.POLYGON,
+    signer: walletClient,
+    throwOnError: true,
+    retryOnError: true,
+    creds,
+    signatureType: SignatureTypeV2.POLY_1271,
+    funderAddress: config.polymarket.funderAddress,
+  });
+
   // @ts-ignore
-  clobClient.axiosInstance.defaults.httpsAgent = axiosHttpsAgent;
+  if (client.axiosInstance) {
+    // @ts-ignore
+    client.axiosInstance.defaults.httpsAgent = axiosHttpsAgent;
+  }
+
+  return client;
+}
+
+let clobClient: any;
+
+export async function initClobClient() {
+  clobClient = await _initClobClient();
+  return clobClient;
 }
 
 // CLOB V2 要求每 10 秒发送 heartbeat，否则服务器自动取消所有订单

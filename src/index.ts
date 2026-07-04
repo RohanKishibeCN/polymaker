@@ -1,5 +1,5 @@
 import { config } from './config';
-import { runMarketMakingCycle, runDailySummary, startHeartbeat } from './market_maker';
+import { initClobClient, runMarketMakingCycle, runDailySummary, startHeartbeat } from './market_maker';
 
 async function main() {
   console.log('==========================================');
@@ -8,6 +8,8 @@ async function main() {
   console.log(` Target Markets: ${config.bot.targetMarketsCount}`);
   console.log(` Size Pct: ${config.bot.sizePct * 100}%, Max Market Pct: ${config.bot.maxMarketPct * 100}%`);
   console.log('==========================================');
+
+  await initClobClient();
 
   startHeartbeat();
 
