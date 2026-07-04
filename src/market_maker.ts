@@ -65,7 +65,7 @@ const clobClient: any = new ClobClient({
     secret: config.polymarket.secret,
     passphrase: config.polymarket.passphrase,
   },
-  signatureType: SignatureTypeV2.POLY_GNOSIS_SAFE,
+  signatureType: SignatureTypeV2.POLY_1271,
   funderAddress: config.polymarket.funderAddress,
 });
 
@@ -761,9 +761,6 @@ export async function runMarketMakingCycle() {
 
         // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单) (有库存的放行)
         // 并且价差必须足够大，至少容得下我们的 spreadHalf
-        if (makerCandidates.length < 5) {
-          console.log(`     [DBG] ${(market.question || '').substring(0,30)}: ask=${bestAsk.toFixed(3)} bid=${bestBid.toFixed(3)} spread=${(bestAsk-bestBid).toFixed(4)} sz=${bidSizeTop.toFixed(0)}/${askSizeTop.toFixed(0)}`);
-        }
         if (hasInventory || (bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
            if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) continue;
 
