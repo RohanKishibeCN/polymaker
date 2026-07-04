@@ -1,7 +1,5 @@
-import { Chain, ClobClient, SignatureTypeV2 } from '@polymarket/clob-client';
-import { createWalletClient, http } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
-import { polygon } from 'viem/chains';
+import { Chain, ClobClient } from '@polymarket/clob-client';
+import { Wallet } from 'ethers';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import fetch, { Headers, Request, Response } from 'node-fetch';
 import https from 'https';
@@ -28,7 +26,7 @@ async function main() {
   if (proxyUrl) {
     console.log(`[+] Using proxy to bypass Geoblock...`);
     const proxyAgent = new HttpsProxyAgent(proxyUrl);
-    
+
     delete process.env.HTTPS_PROXY;
     delete process.env.HTTP_PROXY;
     delete process.env.https_proxy;
@@ -81,25 +79,17 @@ async function main() {
   }
 
   try {
-    // 2. 初始化只有私钥的无头 ClobClient
+    // 2. 使用 ethers Wallet（与 market_maker.ts 完全一致，确保 EIP-712 签名格式匹配）
     const privateKey = privateKeyStr.startsWith('0x')
-      ? privateKeyStr as `0x${string}`
-      : `0x${privateKeyStr}` as `0x${string}`;
-
-    const account = privateKeyToAccount(privateKey);
-    console.log(`[+] Authenticating with EOA Address: ${account.address}`);
-
-    const walletClient = createWalletClient({
-      account,
-      chain: polygon,
-      transport: http('https://polygon-rpc.com'),
-    });
+      ? privateKeyStr
+      : `0x${privateKeyStr}`;
+    const wallet = new Wallet(privateKey);
+    console.log(`[+] Authenticating with EOA Address: ${wallet.address}`);
 
     const clobClient = new ClobClient({
       host: 'https://clob.polymarket.com',
       chain: Chain.POLYGON,
-      // @ts-ignore (viem WalletClient is supported but types might clash)
-      signer: walletClient,
+      signer: wallet,
     });
 
     // 3. 通过私钥对签名消息 (EIP-712) 派生出一组绝对匹配的 API Credentials
