@@ -103,7 +103,7 @@ async function _initClobClient(): Promise<any> {
     retryOnError: true,
     creds,
     signatureType: SignatureTypeV2.POLY_1271,
-    funderAddress: config.polymarket.funderAddress,
+    funderAddress: (process.env.POLYMARKET_FUNDER_ADDRESS_PROXY || config.polymarket.funderAddress),
   });
 
   // @ts-ignore
