@@ -185,7 +185,7 @@ async function createAndPostOrderWithFeeFallback(orderPayload: any, tickSize: st
   }
 }
 // Notion 总结需要的数据
-let dailyStats = {
+let dailyStats: any = {
   fillsBuy: 0,
   fillsSell: 0,
   ordersPosted: 0,
@@ -194,6 +194,8 @@ let dailyStats = {
   maxPositionPctEquity: 0,
   avgSpreadHalfUsed: 0,
   spreadHalfUsedCount: 0,
+  cycleBuyCount: 0,
+  cycleSellCount: 0,
 };
 
 let peakEquity = config.bot.initialCapital;
@@ -207,9 +209,25 @@ try {
   }
 } catch (e) {}
 
+// L2-1: 每轮 cycle 记录 balance 快照用于验证真实 PnL 和 rebate
+const BALANCE_SNAPSHOT_FILE = path.join(__dirname, '../balance_snapshot.json');
+let prevCycleCash = 0;
+try {
+  if (fs.existsSync(BALANCE_SNAPSHOT_FILE)) {
+    const snap = JSON.parse(fs.readFileSync(BALANCE_SNAPSHOT_FILE, 'utf8'));
+    prevCycleCash = snap.cash || 0;
+  }
+} catch (e) {}
+
 function saveBalanceLog(balance: number) {
   try {
     fs.writeFileSync(BALANCE_LOG_FILE, JSON.stringify({ balance, date: new Date().toISOString().split('T')[0] }), 'utf8');
+  } catch (e) {}
+}
+
+function saveBalanceSnapshot(cash: number) {
+  try {
+    fs.writeFileSync(BALANCE_SNAPSHOT_FILE, JSON.stringify({ cash, date: new Date().toISOString() }), 'utf8');
   } catch (e) {}
 }
 
@@ -334,6 +352,44 @@ async function getCashBalance(): Promise<number> {
   return lastGoodCashBalance;
 }
 
+// 基于订单簿前 3 档 + Gamma last price 的多源加权中间价
+function calculateFairMidPrice(orderbook: any, gammaMarket: any): number {
+  // 优先用 Gamma 返回的 last trade price
+  const gammaPrice = gammaMarket.lastTradePrice
+    ? parseFloat(gammaMarket.lastTradePrice)
+    : gammaMarket.outcomePrices
+      ? parseFloat(gammaMarket.outcomePrices)
+      : null;
+  if (gammaPrice && gammaPrice > 0.01 && gammaPrice < 0.99) return gammaPrice;
+
+  // 其次用订单簿前 3 层加权均价估算
+  const bids = orderbook.bids || [];
+  const asks = orderbook.asks || [];
+  if (bids.length >= 3 && asks.length >= 3) {
+    let bidWeightedSum = 0, bidWeightTotal = 0;
+    let askWeightedSum = 0, askWeightTotal = 0;
+    for (let i = 0; i < Math.min(bids.length, 3); i++) {
+      const price = parseFloat(bids[i].price);
+      const size = parseFloat(bids[i].size);
+      if (price >= 0.05) { bidWeightedSum += price * size; bidWeightTotal += size; }
+    }
+    for (let i = 0; i < Math.min(asks.length, 3); i++) {
+      const price = parseFloat(asks[i].price);
+      const size = parseFloat(asks[i].size);
+      if (price <= 0.95) { askWeightedSum += price * size; askWeightTotal += size; }
+    }
+    if (bidWeightTotal > 0 && askWeightTotal > 0) {
+      const vwapBid = bidWeightedSum / bidWeightTotal;
+      const vwapAsk = askWeightedSum / askWeightTotal;
+      return (vwapBid + vwapAsk) / 2;
+    }
+  }
+  // fallback: 算术平均，钳制到 0.15-0.85
+  const rawMid = (parseFloat(orderbook.asks?.[0]?.price || '0.99') +
+                  parseFloat(orderbook.bids?.[0]?.price || '0.01')) / 2;
+  return Math.max(0.15, Math.min(0.85, rawMid));
+}
+
 export async function runDailySummary() {
   try {
     console.log(`[Daily Summary] Generating daily summary...`);
@@ -456,8 +512,12 @@ export async function runDailySummary() {
       maxPositionPctEquity: 0,
       avgSpreadHalfUsed: 0,
       spreadHalfUsedCount: 0,
+      cycleBuyCount: 0,
+      cycleSellCount: 0,
     };
+
     peakEquity = totalEquity;
+    saveBalanceLog(cashBalance);
 
   } catch (error) {
     console.error('[Daily Summary] Fatal error:', error);
@@ -598,8 +658,8 @@ export async function runMarketMakingCycle() {
     for (const [key, inv] of Object.entries(inventory)) {
       const prev = priorSnapshot.get(key) || 0;
       const curr = inv.yes + inv.no;
-      if (curr > prev) dailyStats.fillsBuy += (curr - prev);
-      if (curr < prev) dailyStats.fillsSell += (prev - curr);
+      if (curr > prev) { dailyStats.fillsBuy += (curr - prev); dailyStats.cycleBuyCount += (curr - prev); }
+      if (curr < prev) { dailyStats.fillsSell += (prev - curr); dailyStats.cycleSellCount += (prev - curr); }
     }
     let cashBalance = await getCashBalance();
     let totalEquity = cashBalance + portfolioValue;
@@ -677,6 +737,7 @@ export async function runMarketMakingCycle() {
           token_id: gm.clobTokenIds,
           condition_id: gm.conditionId,
           active: true,
+          endTime: gm.end_date_iso || gm.endDate || gm.close_time || gm.end_time || null,
           rewards: gm.clobRewards || [],
           rewardsMinSize: gm.min_incentive_size || gm.rewardsMinSize || 0,
           rewardsMaxSpread: gm.max_incentive_spread || gm.rewardsMaxSpread || 0,
@@ -777,6 +838,34 @@ export async function runMarketMakingCycle() {
         }
       }
       if (skipForTagQuota) continue;
+
+      // L1-3: 到期时间过滤（到期前 48h 不新开仓，到期前 24h 所有持仓强制平仓）
+      if (!isManagement && !hasInventory && market.endTime) {
+        const hoursUntilClose = (new Date(market.endTime).getTime() - Date.now()) / (1000 * 3600);
+        if (hoursUntilClose < 48) {
+          if (hoursUntilClose < 24) {
+            // 不足 24h：有仓位的也在挂单阶段强制 hard stop
+            isHalted = true;
+          }
+          continue;
+        }
+      }
+
+      // L0-4: 跨类别分散——同一大类最多占 25% 仓位
+      // 限定同一个 root tag 的持仓数量
+      if (!isManagement && !hasInventory && market.tags && market.tags.length > 0) {
+        const categoryLimit = Math.floor(config.bot.maxPositionCount * config.bot.categoryMaxShare);
+        if (categoryLimit > 0) {
+          const rootTag = market.tags[0];
+          const curCategoryCount = Object.entries(tagCounter)
+            .filter(([tag]) => tag === rootTag)
+            .reduce((sum, [, count]) => sum + count, 0);
+          if (curCategoryCount >= categoryLimit) {
+            continue;
+          }
+        }
+      }
+
       // 验证订单簿
       try {
         // 加点延迟避免请求并发太高
@@ -816,9 +905,12 @@ export async function runMarketMakingCycle() {
         // 必须有一个合理的价差才能做市 (避免价差太小我们变成 Taker 吃单) (有库存的放行)
         // 并且价差必须足够大，至少容得下我们的 spreadHalf
         if (hasInventory || (bestAsk - bestBid) >= (config.bot.spreadHalfBase * 2)) {
-           if (!hasInventory && (bidSizeTop < 15 || askSizeTop < 15)) continue;
+           if (!hasInventory && (bidSizeTop < config.bot.minBidAskDepth || askSizeTop < config.bot.minBidAskDepth)) continue;
 
            const spread = bestAsk - bestBid;
+
+           // L0-1: 过滤 spread 过宽的市场（真做市商市场 spread 在 0.02-0.08）
+           if (!hasInventory && spread > config.bot.maxSpreadFilter) continue;
 
            let smartMoneyBias = 'NEUTRAL';
            if (radarData && market.condition_id) {
@@ -842,6 +934,7 @@ export async function runMarketMakingCycle() {
              bidSizeTop,
              askSizeTop,
              spread,
+             fairMidPrice: calculateFairMidPrice(orderbook, market),
              rewardsMinSize: market.rewardsMinSize || 20,
              tickSize: market.tickSize || "0.01",
              negRisk: market.negRisk || false,
@@ -987,7 +1080,7 @@ export async function runMarketMakingCycle() {
 
     // 为每个选定的市场挂单
     for (const tm of targetMarkets) {
-      const midPrice = (tm.bestBid + tm.bestAsk) / 2;
+      const midPrice = tm.fairMidPrice || (tm.bestBid + tm.bestAsk) / 2;
 
       // === 0. 获取当前库存与提前判定止损 ===
       const invYes = inventory[tm.yesTokenId] || { yes: 0, no: 0, pnlPct: 0 };
@@ -1144,11 +1237,14 @@ export async function runMarketMakingCycle() {
       const currentSkewFactor = isTimeDecayed ? config.bot.timeDecaySkewFactor : config.bot.inventorySkewFactor;
       const skewAdjustment = skewRatio * currentSkewFactor;
 
-      // B. 极低频宽价差防守
+      // L1-1: 动态 spreadHalf（市场波动性 + 深度自适应）
       let dynamicSpreadHalf = config.bot.spreadHalfBase;
-      if (tm.spread > 0.06) dynamicSpreadHalf += 0.01;
-      if (tm.bidSizeTop < 50 || tm.askSizeTop < 50) dynamicSpreadHalf += 0.01;
-      dynamicSpreadHalf = Math.max(config.bot.spreadHalfBase, Math.min(dynamicSpreadHalf, config.bot.spreadHalfMax));
+      const marketSpread = tm.spread;
+      dynamicSpreadHalf += Math.max(0, marketSpread - 0.04) * 0.3;
+      if (marketSpread > 0.08) dynamicSpreadHalf += (marketSpread - 0.08) * 0.2;
+      if (tm.bidSizeTop < 200 || tm.askSizeTop < 200) dynamicSpreadHalf += 0.005;
+      if (tm.bidSizeTop < 100 || tm.askSizeTop < 100) dynamicSpreadHalf += 0.01;
+      dynamicSpreadHalf = Math.max(0.015, Math.min(dynamicSpreadHalf, config.bot.spreadHalfMax));
 
       dailyStats.avgSpreadHalfUsed = (dailyStats.avgSpreadHalfUsed * dailyStats.spreadHalfUsedCount + dynamicSpreadHalf) / (dailyStats.spreadHalfUsedCount + 1);
       dailyStats.spreadHalfUsedCount++;
@@ -1443,6 +1539,22 @@ export async function runMarketMakingCycle() {
         }
       }
     }
+
+    // L1-2: 双向成交量平衡检测 + L2-1: 余额快照 & 真实 PnL
+    const buyRatio = dailyStats.cycleSellCount > 0
+      ? dailyStats.cycleBuyCount / dailyStats.cycleSellCount
+      : dailyStats.cycleBuyCount > 0 ? Infinity : 0;
+    if (dailyStats.cycleBuyCount >= 100 && buyRatio > 5) {
+      console.log(`     [!] BUY/SELL imbalance (${dailyStats.cycleBuyCount} buys vs ${dailyStats.cycleSellCount} sells). Consider widening spread.`);
+    }
+    if (prevCycleCash > 0) {
+      const cyclePnl = cashBalance - prevCycleCash;
+      if (cyclePnl !== 0) {
+        console.log(`[Market Maker] Cycle PnL: ${cyclePnl >= 0 ? '+' : ''}${cyclePnl.toFixed(2)} ${COLLATERAL_SYMBOL}`);
+      }
+    }
+    saveBalanceSnapshot(cashBalance);
+    prevCycleCash = cashBalance;
 
     console.log(`[Market Maker] Cycle complete. Waiting for next interval.`);
 
