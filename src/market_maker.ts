@@ -420,7 +420,7 @@ export async function runDailySummary() {
     content += `🔄 [FLOW]\n`;
     content += `Orders Posted: ${dailyStats.ordersPosted} | Canceled: ${dailyStats.ordersCanceled}\n`;
     content += `Fills Buy/Sell: ${dailyStats.fillsBuy}/${dailyStats.fillsSell}\n`;
-    if (yesterdayBalance !== null) {
+    if (yesterdayBalance !== null && yesterdayBalance > 0) {
       const estRewards = cashBalance - yesterdayBalance;
       if (estRewards > 0) content += `Est Rewards: +${estRewards.toFixed(2)} ${COLLATERAL_SYMBOL}\n`;
     }
