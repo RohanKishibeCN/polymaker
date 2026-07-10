@@ -26,7 +26,6 @@ const reallocateMaxMarketsEnv = parseIntEnv('POLYMARKET_REALLOCATE_MAX_MARKETS')
 const maxPositionCountEnv = parseIntEnv('POLYMARKET_MAX_POSITION_COUNT');
 const sizePctEnv = parseNumberEnv('POLYMARKET_SIZE_PCT');
 const maxMarketPctEnv = parseNumberEnv('POLYMARKET_MAX_MARKET_PCT');
-const maxSpreadFilterEnv = parseNumberEnv('POLYMARKET_MAX_SPREAD_FILTER');
 const minBidAskDepthEnv = parseIntEnv('POLYMARKET_MIN_BID_ASK_DEPTH');
 const categoryMaxShareEnv = parseNumberEnv('POLYMARKET_CATEGORY_MAX_SHARE');
 
@@ -64,7 +63,6 @@ export const config = {
     freezeAddSpreadSoft: (freezeAddSpreadSoftEnv && freezeAddSpreadSoftEnv > 0 ? freezeAddSpreadSoftEnv : 0.5),
     freezeAddSpreadHard: (freezeAddSpreadHardEnv && freezeAddSpreadHardEnv > 0 ? freezeAddSpreadHardEnv : 0.8),
     reallocateMaxMarkets: (reallocateMaxMarketsEnv && reallocateMaxMarketsEnv > 0 ? reallocateMaxMarketsEnv : 2),
-    maxSpreadFilter: (maxSpreadFilterEnv && maxSpreadFilterEnv > 0 ? maxSpreadFilterEnv : 0.15),
     minBidAskDepth: (minBidAskDepthEnv && minBidAskDepthEnv > 0 ? minBidAskDepthEnv : 100),
     categoryMaxShare: (categoryMaxShareEnv && categoryMaxShareEnv > 0 ? categoryMaxShareEnv : 0.25),
   },

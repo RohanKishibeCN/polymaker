@@ -909,8 +909,8 @@ export async function runMarketMakingCycle() {
 
            const spread = bestAsk - bestBid;
 
-           // L0-1: 过滤 spread 过宽的市场（真做市商市场 spread 在 0.02-0.08）
-           if (!hasInventory && spread > config.bot.maxSpreadFilter) continue;
+           // L0-1: 过滤 spread 过宽的市场（二元预测市场天然 ~0.98 价差，只过滤极端无人区）
+           if (!hasInventory && spread > 0.98) continue;
 
            let smartMoneyBias = 'NEUTRAL';
            if (radarData && market.condition_id) {
