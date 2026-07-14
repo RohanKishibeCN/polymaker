@@ -851,7 +851,8 @@ export async function runMarketMakingCycle() {
       }
 
       // 跳过 neg-risk 市场（POLY_1271 签名始终失败）
-      if (market.negRisk) continue;
+      // Gamma 原始数据用 neg_risk，formatted 数据用 negRisk
+      if (market.negRisk || market.neg_risk === true) continue;
 
       // 验证订单簿
       try {
@@ -924,7 +925,7 @@ export async function runMarketMakingCycle() {
              fairMidPrice: calculateFairMidPrice(orderbook),
              rewardsMinSize: market.rewardsMinSize || 20,
              tickSize: market.tickSize || "0.01",
-             negRisk: market.negRisk || false,
+             negRisk: market.negRisk === true || market.neg_risk === true,
              smartMoneyBias,
              isHalted,
              isWhitelisted,
@@ -1067,6 +1068,11 @@ export async function runMarketMakingCycle() {
 
     // 为每个选定的市场挂单
     for (const tm of targetMarkets) {
+      // neg-risk 市场的 POLY_1271 签名永远失败，直接跳过
+      if (tm.negRisk) {
+        console.log(`[Market Maker] Skipping negRisk market: ${tm.eventTitle || tm.condition_id}`);
+        continue;
+      }
       const midPrice = tm.fairMidPrice || (tm.bestBid + tm.bestAsk) / 2;
 
       // === 0. 获取当前库存与提前判定止损 ===
@@ -1610,7 +1616,8 @@ export async function runForceLiquidation() {
       // 只清理 $1 以下的死仓
       if (currentExposure >= 1) continue;
       // 跳过 neg-risk 市场（POLY_1271 签名始终失败）
-      if (gm.negRisk) continue;
+      // Gamma 原始数据用 neg_risk，formatted 数据用 negRisk
+      if (gm.negRisk || gm.neg_risk === true) continue;
 
       try {
         const obUrl = `https://clob.polymarket.com/book?token_id=${yesTokenId}`;
