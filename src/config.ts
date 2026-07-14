@@ -63,7 +63,7 @@ export const config = {
     freezeAddSpreadSoft: (freezeAddSpreadSoftEnv && freezeAddSpreadSoftEnv > 0 ? freezeAddSpreadSoftEnv : 0.5),
     freezeAddSpreadHard: (freezeAddSpreadHardEnv && freezeAddSpreadHardEnv > 0 ? freezeAddSpreadHardEnv : 0.8),
     reallocateMaxMarkets: (reallocateMaxMarketsEnv && reallocateMaxMarketsEnv > 0 ? reallocateMaxMarketsEnv : 2),
-    minBidAskDepth: (minBidAskDepthEnv && minBidAskDepthEnv > 0 ? minBidAskDepthEnv : 100),
+    minBidAskDepth: (minBidAskDepthEnv && minBidAskDepthEnv > 0 ? minBidAskDepthEnv : 20),
     categoryMaxShare: (categoryMaxShareEnv && categoryMaxShareEnv > 0 ? categoryMaxShareEnv : 0.25),
   },
   getTargetMarketsCount(capital: number): number {

@@ -352,42 +352,23 @@ async function getCashBalance(): Promise<number> {
   return lastGoodCashBalance;
 }
 
-// 基于订单簿前 3 档 + Gamma last price 的多源加权中间价
-function calculateFairMidPrice(orderbook: any, gammaMarket: any): number {
-  // 优先用 Gamma 返回的 last trade price
-  const gammaPrice = gammaMarket.lastTradePrice
-    ? parseFloat(gammaMarket.lastTradePrice)
-    : gammaMarket.outcomePrices
-      ? parseFloat(gammaMarket.outcomePrices)
-      : null;
-  if (gammaPrice && gammaPrice > 0.01 && gammaPrice < 0.99) return gammaPrice;
-
-  // 其次用订单簿前 3 层加权均价估算
-  const bids = orderbook.bids || [];
-  const asks = orderbook.asks || [];
-  if (bids.length >= 3 && asks.length >= 3) {
-    let bidWeightedSum = 0, bidWeightTotal = 0;
-    let askWeightedSum = 0, askWeightTotal = 0;
-    for (let i = 0; i < Math.min(bids.length, 3); i++) {
-      const price = parseFloat(bids[i].price);
-      const size = parseFloat(bids[i].size);
-      if (price >= 0.05) { bidWeightedSum += price * size; bidWeightTotal += size; }
-    }
-    for (let i = 0; i < Math.min(asks.length, 3); i++) {
-      const price = parseFloat(asks[i].price);
-      const size = parseFloat(asks[i].size);
-      if (price <= 0.95) { askWeightedSum += price * size; askWeightTotal += size; }
-    }
-    if (bidWeightTotal > 0 && askWeightTotal > 0) {
-      const vwapBid = bidWeightedSum / bidWeightTotal;
-      const vwapAsk = askWeightedSum / askWeightTotal;
-      return (vwapBid + vwapAsk) / 2;
-    }
-  }
-  // fallback: 算术平均，钳制到 0.15-0.85
-  const rawMid = (parseFloat(orderbook.asks?.[0]?.price || '0.99') +
-                  parseFloat(orderbook.bids?.[0]?.price || '0.01')) / 2;
-  return Math.max(0.15, Math.min(0.85, rawMid));
+// 深度不均衡方向性定价
+// 二元预测市场 bid/ask = 0.01/0.99，中间价毫无意义
+// 真正的信息在深度中：
+//   bidSize >> askSize → 市场一致在买 YES → 我们跟多（mid 靠近 bid）
+//   askSize >> bidSize → 市场一致在卖 YES → 我们跟空（mid 靠近 ask）
+function calculateFairMidPrice(orderbook: any): number {
+  const bestBid = parseFloat(orderbook.bids?.[0]?.price || '0.01');
+  const bestAsk = parseFloat(orderbook.asks?.[0]?.price || '0.99');
+  const bidSize = parseFloat(orderbook.bids?.[0]?.size || '0');
+  const askSize = parseFloat(orderbook.asks?.[0]?.size || '0');
+  const total = bidSize + askSize;
+  if (total === 0) return 0.50;
+  // bidSize 占比越高 → 市场看好 YES → mid 靠近 bestBid → 我们跟买
+  // askSize 占比越高 → 市场看衰 YES → mid 靠近 bestAsk → 我们跟卖
+  const bidWeight = bidSize / total;
+  const fairMid = bestBid * bidWeight + bestAsk * (1 - bidWeight);
+  return Math.max(0.01, Math.min(0.99, fairMid));
 }
 
 export async function runDailySummary() {
@@ -934,7 +915,7 @@ export async function runMarketMakingCycle() {
              bidSizeTop,
              askSizeTop,
              spread,
-             fairMidPrice: calculateFairMidPrice(orderbook, market),
+             fairMidPrice: calculateFairMidPrice(orderbook),
              rewardsMinSize: market.rewardsMinSize || 20,
              tickSize: market.tickSize || "0.01",
              negRisk: market.negRisk || false,
