@@ -850,6 +850,9 @@ export async function runMarketMakingCycle() {
         }
       }
 
+      // 跳过 neg-risk 市场（POLY_1271 签名始终失败）
+      if (market.negRisk) continue;
+
       // 验证订单簿
       try {
         // 加点延迟避免请求并发太高
@@ -1606,6 +1609,8 @@ export async function runForceLiquidation() {
       const currentExposure = Math.abs(inv.yes + inv.no);
       // 只清理 $1 以下的死仓
       if (currentExposure >= 1) continue;
+      // 跳过 neg-risk 市场（POLY_1271 签名始终失败）
+      if (gm.negRisk) continue;
 
       try {
         const obUrl = `https://clob.polymarket.com/book?token_id=${yesTokenId}`;
