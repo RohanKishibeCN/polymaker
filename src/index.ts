@@ -1,5 +1,5 @@
 import { config } from './config';
-import { initClobClient, runMarketMakingCycle, runDailySummary, startHeartbeat } from './market_maker';
+import { initClobClient, runMarketMakingCycle, runForceLiquidation, runDailySummary, startHeartbeat } from './market_maker';
 
 async function main() {
   console.log('==========================================');
@@ -16,6 +16,9 @@ async function main() {
   // Run the first market making cycle immediately and recursively schedule subsequent cycles
   await runCycleLoop();
 
+  // 快速清仓子循环（每 2 分钟运行一次，独立于主循环）
+  runLiquidationLoop();
+
   // Daily summary at midnight UTC (8:00 AM Beijing Time)
   scheduleDailySummary();
 }
@@ -26,8 +29,18 @@ async function runCycleLoop() {
   } catch (e: any) {
     console.error(`[Market Maker] Cycle error: ${e.message}`);
   }
-  // Schedule next cycle only after the current one completes
   setTimeout(runCycleLoop, config.bot.scanIntervalMs);
+}
+
+function runLiquidationLoop() {
+  setTimeout(async () => {
+    try {
+      await runForceLiquidation();
+    } catch (e: any) {
+      console.warn(`[FastLiq] Loop error: ${e.message}`);
+    }
+    runLiquidationLoop();
+  }, 2 * 60 * 1000);  // 每 2 分钟
 }
 
 function scheduleDailySummary() {

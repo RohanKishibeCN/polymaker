@@ -306,6 +306,8 @@ async function getCollateralDecimals(collateralAddress: string): Promise<number>
 
 // 获取稳定币余额辅助函数
 let lastGoodCashBalance = 0;
+// gamma markets 缓存供快速清仓使用
+let gammaMarketsCache: any[] = [];
 const CASH_RPC_LIST = [
   process.env.RPC_URL,
   'https://polygon-bor.publicnode.com',
@@ -695,6 +697,7 @@ export async function runMarketMakingCycle() {
       }
     }
     console.log(`[Market Maker] Fetched ${gammaMarkets.length} markets in this cycle. Next offset: ${lastMarketOffset}`);
+    gammaMarketsCache = gammaMarkets;
     
     // 我们需要把 Gamma markets 展平为可做市的 events 数组 (为了兼容旧代码命名)
     let events: any[] = [];
@@ -1581,5 +1584,105 @@ export async function runMarketMakingCycle() {
 
   } catch (error) {
     console.error('[Market Maker] Fatal error in cycle:', error);
+  }
+}
+
+// 快速清仓子循环（每 2 分钟运行一次，与主循环独立）
+// 专门清理 dust/dead position（<$1），不干扰主循环的市场选择
+export async function runForceLiquidation() {
+  try {
+    const cashBefore = await getCashBalance();
+    let clearedCount = 0;
+
+    for (const [tokenId, inv] of Object.entries(inventory)) {
+      if ((inv.yes <= 0 && inv.no <= 0)) continue;
+      // 获取这个 token 对应的 condition_id
+      // 从 gammaMarketsCache 缓存反向查找
+      const gm = gammaMarketsCache?.find(m => m.clobTokenIds && m.clobTokenIds.includes(tokenId));
+      if (!gm) continue;
+      const clobIds: string[] = gm.clobTokenIds || [];
+      const yesTokenId = clobIds[0];
+      const noTokenId = clobIds[1] || null;
+      const currentExposure = Math.abs(inv.yes + inv.no);
+      // 只清理 $1 以下的死仓
+      if (currentExposure >= 1) continue;
+
+      try {
+        const obUrl = `https://clob.polymarket.com/book?token_id=${yesTokenId}`;
+        const obResponse = await fetch(obUrl, {
+          agent: proxyAgent,
+          headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+        });
+        const ob = await obResponse.json();
+        if (!ob.bids || !ob.asks || ob.bids.length === 0 || ob.asks.length === 0) continue;
+
+        const bestBid = parseFloat(ob.bids[0].price);
+        const bestAsk = parseFloat(ob.asks[0].price);
+        if (bestAsk <= 0 || bestBid <= 0 || bestAsk <= bestBid) continue;
+
+        // YES 仓位 → 在 bestBid 卖出 YES
+        if (inv.yes > 0) {
+          const sellPrice = bestBid;
+          const sellSize = Math.max(Math.floor(inv.yes), 1);
+          const orderPayload: any = {
+            tokenID: yesTokenId,
+            price: sellPrice,
+            side: Side.SELL,
+            size: sellSize,
+          };
+          const res = await createAndPostOrderWithFeeFallback(orderPayload, gm.tickSize || "0.01", gm.negRisk || false);
+          if (res && !(res.error || res.errorMessage)) {
+            console.log(`[FastLiq] Sold ${sellSize} YES @${sellPrice} (exposure: ~${currentExposure}PUSD)`);
+            inv.yes = 0;
+            clearedCount++;
+          } else {
+            console.log(`[FastLiq] Failed to sell YES: ${res.error || res.errorMessage || 'unknown'}`);
+          }
+        }
+
+        // NO 仓位 → 在 NO 的 orderbook 上卖 NO
+        if (inv.no > 0 && noTokenId) {
+          const obUrlNo = `https://clob.polymarket.com/book?token_id=${noTokenId}`;
+          const obNoRes = await fetch(obUrlNo, {
+            agent: proxyAgent,
+            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+          });
+          const obNo = await obNoRes.json();
+          const noBestBid = obNo.bids?.[0]?.price ? parseFloat(obNo.bids[0].price) : 0;
+          if (noBestBid > 0) {
+            const sellSize = Math.max(Math.floor(inv.no), 1);
+            const orderPayload: any = {
+              tokenID: noTokenId,
+              price: noBestBid,
+              side: Side.SELL,
+              size: sellSize,
+            };
+            const res = await createAndPostOrderWithFeeFallback(orderPayload, gm.tickSize || "0.01", gm.negRisk || false);
+            if (res && !(res.error || res.errorMessage)) {
+              console.log(`[FastLiq] Sold ${sellSize} NO @${noBestBid} (exposure: ~${currentExposure}PUSD)`);
+              inv.no = 0;
+              clearedCount++;
+            } else {
+              console.log(`[FastLiq] Failed to sell NO: ${res.error || res.errorMessage || 'unknown'}`);
+            }
+          }
+        }
+        // 延迟避免 api 限流
+        await new Promise(r => setTimeout(r, 200));
+      } catch (e: any) {
+        console.warn(`[FastLiq] Error liquidating ${tokenId}: ${e.message}`);
+      }
+    }
+
+    if (clearedCount > 0) {
+      const cashAfter = await getCashBalance();
+      console.log(`[FastLiq] Cleared ${clearedCount} dead positions. Cash: ${cashBefore.toFixed(2)} → ${cashAfter.toFixed(2)}`);
+    }
+    // 保存缓存
+    const gammaCachePath = path.join(__dirname, '../gamma_markets_cache.json');
+    try { fs.writeFileSync(gammaCachePath, JSON.stringify(gammaMarketsCache, null, 2)); } catch {}
+
+  } catch (e: any) {
+    console.warn(`[FastLiq] Cycle error: ${e.message}`);
   }
 }
