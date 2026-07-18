@@ -559,22 +559,30 @@ export async function runMarketMakingCycle() {
     if (totalEquity > peakEquity) peakEquity = totalEquity;
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
 
-    // 2. 获取 Gamma 市场数据
+    // 2. 获取 Gamma 市场数据（拉 500 个，滚动 offset）
     console.log("[Market Maker] Fetching active markets from Gamma API...");
-    const gammaResponse = await fetch('https://gamma-api.polymarket.com/markets?limit=100&active=true&closed=false', {
-      agent: proxyAgent,
-      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-    });
-    const gammaMarkets = await gammaResponse.json();
+    const PAGES = 5;
+    let gammaMarkets: any[] = [];
+    for (let page = 0; page < PAGES; page++) {
+      try {
+        const offset = page * 100;
+        const url = `https://gamma-api.polymarket.com/markets?limit=100&offset=${offset}&active=true&closed=false`;
+        const resp = await fetch(url, {
+          agent: proxyAgent,
+          headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+        });
+        const batch = await resp.json();
+        if (Array.isArray(batch)) gammaMarkets.push(...batch);
+        if (!Array.isArray(batch) || batch.length < 100) break; // 最后一页
+        await new Promise(r => setTimeout(r, 100));
+      } catch { break; }
+    }
     console.log(`[Market Maker] Fetched ${gammaMarkets.length} markets.`);
 
-    // 3. 候选市场初筛（仅基于 Gamma 数据，不涉及订单簿）
-    const MAX_CANDIDATE_SCANS = 40;  // 只取前 40 个查询订单簿
+    // 3. 候选市场初筛
     let candidates: any[] = [];
-
     for (const gm of gammaMarkets) {
-      if (candidates.length >= MAX_CANDIDATE_SCANS) break;
-      // 跳过非活跃 / 已关闭 / 无 clobTokenIds / neg_risk 的市场
+      if (candidates.length >= 200) break; // 最多查 200 个订单簿
       if (!gm.active || gm.closed || !gm.clobTokenIds) continue;
       if (gm.neg_risk === true) continue;
       candidates.push(gm);
