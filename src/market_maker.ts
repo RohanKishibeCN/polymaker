@@ -603,10 +603,11 @@ export async function runMarketMakingCycle() {
     let debugCount = { total: 0, noBook: 0, negRisk: 0, noBids: 0, badPrice: 0, wideSpread: 0, lowDepth: 0, pass: 0 };
 
     for (const gm of candidates) {
-      const clobIds: string[] = gm.clobTokenIds;
-      if (!clobIds || clobIds.length < 2) continue;
-      const yesTokenId = clobIds[0];
-      const noTokenId = clobIds[1];
+      // clobTokenIds 可能是字符串格式的数组，用 getValidTokenIds 解析
+      const tokenIds = getValidTokenIds(gm.clobTokenIds);
+      if (!tokenIds) continue;
+      const yesTokenId = tokenIds[0];
+      const noTokenId = tokenIds[1];
 
       try {
         await new Promise(resolve => setTimeout(resolve, 50)); // 限流
