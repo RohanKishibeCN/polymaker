@@ -804,10 +804,17 @@ export async function runMarketMakingCycle() {
       // 将 isHalted 标记传递给 targetMarkets，在下游挂单逻辑中触发 Hard Stop
       // ==========================================
 
+      // 只计算有意义的仓位（总 token 数 > 20 的才算有效占位，<20 的死仓不占用最大仓位限制）
+      const meaningfulPosCount = Object.keys(inventory).filter(k => {
+        const inv = inventory[k];
+        const totalTokens = (inv.yes || 0) + (inv.no || 0);
+        return totalTokens > 20;
+      }).length;
+
       // 如果没有库存，且未被白名单标记，且新开/持仓市场数量已经达到上限，跳过该市场
       if (!isManagement && !hasInventory && !isWhitelisted && 
           (newMarketsCount >= dynamicTargetCount ||
-           Object.keys(inventory).filter(k => inventory[k].yes > 0 || inventory[k].no > 0).length >= config.bot.maxPositionCount)) {
+           meaningfulPosCount >= config.bot.maxPositionCount)) {
         continue;
       }
 
@@ -1605,19 +1612,32 @@ export async function runForceLiquidation() {
 
     for (const [tokenId, inv] of Object.entries(inventory)) {
       if ((inv.yes <= 0 && inv.no <= 0)) continue;
-      // 获取这个 token 对应的 condition_id
-      // 从 gammaMarketsCache 缓存反向查找
+      // 主路径：从 gamma cache 查找
       const gm = gammaMarketsCache?.find(m => m.clobTokenIds && m.clobTokenIds.includes(tokenId));
-      if (!gm) continue;
-      const clobIds: string[] = gm.clobTokenIds || [];
-      const yesTokenId = clobIds[0];
-      const noTokenId = clobIds[1] || null;
+
+      let yesTokenId: string | null = null;
+      let noTokenId: string | null = null;
+      let isNegRisk = false;
+      let tickSize = "0.01";
+
+      if (gm) {
+        const clobIds: string[] = gm.clobTokenIds || [];
+        yesTokenId = clobIds[0];
+        noTokenId = clobIds[1] || null;
+        isNegRisk = !!(gm.negRisk || gm.neg_risk === true);
+        tickSize = gm.minimum_tick_size || gm.tickSize || "0.01";
+      } else {
+        // fallback: tokenId 本身就是要卖的 token，直接用它
+        yesTokenId = tokenId;
+        tickSize = "0.01";
+      }
+
+      // 跳过 neg-risk
+      if (isNegRisk) continue;
+
       const currentExposure = Math.abs(inv.yes + inv.no);
       // 只清理 $1 以下的死仓
       if (currentExposure >= 1) continue;
-      // 跳过 neg-risk 市场（POLY_1271 签名始终失败）
-      // Gamma 原始数据用 neg_risk，formatted 数据用 negRisk
-      if (gm.negRisk || gm.neg_risk === true) continue;
 
       try {
         const obUrl = `https://clob.polymarket.com/book?token_id=${yesTokenId}`;
@@ -1642,7 +1662,7 @@ export async function runForceLiquidation() {
             side: Side.SELL,
             size: sellSize,
           };
-          const res = await createAndPostOrderWithFeeFallback(orderPayload, gm.tickSize || "0.01", gm.negRisk || false);
+          const res = await createAndPostOrderWithFeeFallback(orderPayload, tickSize || "0.01", isNegRisk);
           if (res && !(res.error || res.errorMessage)) {
             console.log(`[FastLiq] Sold ${sellSize} YES @${sellPrice} (exposure: ~${currentExposure}PUSD)`);
             inv.yes = 0;
@@ -1669,7 +1689,7 @@ export async function runForceLiquidation() {
               side: Side.SELL,
               size: sellSize,
             };
-            const res = await createAndPostOrderWithFeeFallback(orderPayload, gm.tickSize || "0.01", gm.negRisk || false);
+            const res = await createAndPostOrderWithFeeFallback(orderPayload, tickSize || "0.01", isNegRisk);
             if (res && !(res.error || res.errorMessage)) {
               console.log(`[FastLiq] Sold ${sellSize} NO @${noBestBid} (exposure: ~${currentExposure}PUSD)`);
               inv.no = 0;
