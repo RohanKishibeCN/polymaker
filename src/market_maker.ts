@@ -623,13 +623,15 @@ export async function runMarketMakingCycle() {
         // 边界检查
         if (bestBid <= 0 || bestAsk <= 0 || bestAsk <= bestBid) continue;
 
-        // 筛选：bid ≥ minBidPrice, ask ≤ maxAskPrice（代理中点区间）
-        if (bestBid < config.bot.minBidPrice || bestAsk > config.bot.maxAskPrice) continue;
+        const spread = bestAsk - bestBid;
+
+        // 筛选：spread 太宽的市场没有有效中点，也达不到 rewards scoring 要求
+        if (spread > 0.15) continue;
 
         // 筛选：深度足够
         if (bidSize < config.bot.minBidAskDepth || askSize < config.bot.minBidAskDepth) continue;
 
-        // 提取 rewards 参数
+        // 提取 rewards 参数（可能为空，但没关系）
         const rewardsMinSize = gm.min_incentive_size || 0;
         const rewardsMaxSpread = gm.max_incentive_spread || 0;
 
