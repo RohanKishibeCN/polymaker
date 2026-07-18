@@ -604,24 +604,30 @@ export async function runMarketMakingCycle() {
 
       try {
         await new Promise(resolve => setTimeout(resolve, 50)); // 限流
-        // 裸 GET 到 CLOB /price 端点（简单、无认证、可能不被 geo-block）
-        const priceUrl = `https://clob.polymarket.com/price?token_id=${yesTokenId}`;
-        const priceResp = await fetch(priceUrl, {
-          headers: { 'Accept': 'application/json' }
-        });
-        if (!priceResp.ok) { debugCount.noBook++; if (debugCount.noBook <= 3) console.warn(`[Filter] CLOB ${priceResp.status} for ${yesTokenId.substring(0,10)}`); continue; }
-        const priceData = await priceResp.json();
+        // 使用 Gamma API 的 outcomePrices（无 geo-block，不需要走 CLOB）
+        // 每个 market 的 outcomes 和 outcomePrices 一一对应：["Yes","No"] → ["0.20","0.80"]
+        let price = 0.50;
+        try {
+          const prices = JSON.parse(gm.outcomePrices || '[]');
+          if (prices.length >= 2) {
+            // prices[0] = Yes price, prices[1] = No price
+            const yesPrice = parseFloat(prices[0]);
+            const noPrice = parseFloat(prices[1]);
+            if (yesPrice > 0 && yesPrice < 1 && noPrice > 0 && noPrice < 1) {
+              price = (yesPrice + noPrice) / 2;
+            }
+          }
+        } catch {}
         debugCount.total++;
 
-        const price = parseFloat(priceData?.price || '0');
         if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
-        // 用 Gamma 的 volume 代替 spread/深度
+        // 用 Gamma 的 volume 代替深度
         const gmVolume = parseFloat(gm.volume || gm.volume24hr || '0');
         const gmLiq = parseFloat(gm.liquidityClob || gm.liquidity || '0');
         const depthProxy = Math.max(gmVolume, gmLiq);
         if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
 
-        // 用 price ±2% 作为虚拟 bid/ask（足够近以赚 rewards，价格偏离不成交）
+        // 用 price ±2% 作为 bid/ask
         const midpoint = price;
         const spread = 0.02;
         const halfSpread = spread / 2;
@@ -658,8 +664,8 @@ export async function runMarketMakingCycle() {
         });
 
       } catch (e: any) {
-        debugCount.noBook++;
-        if (debugCount.noBook <= 3) console.warn(`[Filter] getOrderBook error: ${e?.message || e}`);
+          debugCount.noBook++;
+          if (debugCount.noBook <= 3) console.warn(`[Filter] Gamma price parse error for ${gm.question?.substring(0, 30) || yesTokenId.substring(0,10)}`);
         continue;
       }
     }
@@ -700,17 +706,10 @@ export async function runMarketMakingCycle() {
 
     for (const m of selectedMarkets) {
       try {
-        // 最新 price（走 /price 端点，不走 /book）
-        const pp = await fetch(`https://clob.polymarket.com/price?token_id=${m.yesTokenId}`, {
-          headers: { 'Accept': 'application/json' }
-        });
-        if (!pp.ok) continue;
-        const ppData = await pp.json();
-        const price = parseFloat(ppData?.price || '0');
-        if (price <= 0 || price >= 1) continue;
-        const midpoint = price;
-        const bestBid = Math.max(0.001, midpoint - 0.01);
-        const bestAsk = Math.min(0.999, midpoint + 0.01);
+        // 使用选市场时已缓存的 midpoint（不需要重新请求 CLOB）
+        const midpoint = m.midpoint;
+        const bestBid = m.bestBid;
+        const bestAsk = m.bestAsk;
         const tickSize = m.tickSize || '0.01';
 
         // 计算报价：离 midpoint 很紧
