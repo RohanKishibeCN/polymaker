@@ -611,15 +611,15 @@ export async function runMarketMakingCycle() {
 
       try {
         await new Promise(resolve => setTimeout(resolve, 50)); // 限流
-        // 使用 Gamma API 的 outcomePrices（无 geo-block，不需要走 CLOB）
-        // 每个 market 的 outcomes 和 outcomePrices 一一对应：["Yes","No"] → ["0.20","0.80"]
+        // 解析 outcomePrices — 需要真实的价格，不是默认的 0.50
         let price = 0.50;
+        let yesPrice = 0.50;
+        let noPrice = 0.50;
         try {
           const prices = JSON.parse(gm.outcomePrices || '[]');
           if (prices.length >= 2) {
-            // prices[0] = Yes price, prices[1] = No price
-            const yesPrice = parseFloat(prices[0]);
-            const noPrice = parseFloat(prices[1]);
+            yesPrice = parseFloat(prices[0]);
+            noPrice = parseFloat(prices[1]);
             if (yesPrice > 0 && yesPrice < 1 && noPrice > 0 && noPrice < 1) {
               price = (yesPrice + noPrice) / 2;
             }
@@ -627,6 +627,8 @@ export async function runMarketMakingCycle() {
         } catch {}
         debugCount.total++;
 
+        // 跳过 outcomePrices 为 0.50/0.50 的市场（无成交的默认价格，不是真实价格）
+        if (Math.abs(yesPrice - 0.50) < 0.005 && Math.abs(noPrice - 0.50) < 0.005) { debugCount.badPrice++; continue; }
         if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
         // 用 Gamma 的 volume 代替深度
         const gmVolume = parseFloat(gm.volume || gm.volume24hr || '0');
@@ -740,7 +742,7 @@ export async function runMarketMakingCycle() {
         }
 
         console.log(`\n  -> ${m.eventTitle}`);
-        console.log(`     Midpoint: ${midpoint.toFixed(3)} | Bid: ${bidPrice} | Ask: ${askPrice} | Size: ${effectiveBuySize}`);
+        console.log(`     Midpoint: ${midpoint.toFixed(3)} | Bid: ${bidPrice} | Size: ${effectiveBuySize}`);
 
         // 挂 Bid（买入 YES）
         const buyPayload: any = {
@@ -756,21 +758,6 @@ export async function runMarketMakingCycle() {
           cashBalance -= buyCost; // 本地预算扣减
         } else {
           console.log(`     [!] BUY failed: ${buyRes?.error || buyRes?.errorMessage || 'unknown'}`);
-        }
-
-        // 挂 Ask（卖出 YES）
-        const sellPayload: any = {
-          tokenID: m.yesTokenId,
-          price: askPrice,
-          side: Side.SELL,
-          size: effectiveBuySize,
-        };
-        const sellRes = await createAndPostOrderWithFeeFallback(sellPayload, tickSize, false);
-        if (sellRes && !(sellRes.error || sellRes.errorMessage)) {
-          console.log(`     [+] Placed SELL YES @${askPrice} x${effectiveBuySize}`);
-          dailyStats.ordersPosted++;
-        } else {
-          console.log(`     [!] SELL failed: ${sellRes?.error || sellRes?.errorMessage || 'unknown'}`);
         }
 
         await new Promise(r => setTimeout(r, 100)); // 限流
