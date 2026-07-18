@@ -604,33 +604,37 @@ export async function runMarketMakingCycle() {
 
       try {
         await new Promise(resolve => setTimeout(resolve, 50)); // 限流
-        // 使用 SDK 的 getOrderBook 方法（已认证，不会被 geo-block）
-        const orderbook = await clobClient.getOrderBook(yesTokenId);
+        // 使用 SDK 的 midpoint+spread 获取价格数据（不走 /book 端点，避免 geo-block）
+        const [midResult, spreadResult] = await Promise.allSettled([
+          clobClient.getMidpoint(yesTokenId),
+          clobClient.getSpread(yesTokenId),
+        ]);
         debugCount.total++;
 
-        if (!orderbook || orderbook.error || orderbook.message) { debugCount.noBook++; if (debugCount.noBook <= 3) console.warn(`[Filter] Book error ${yesTokenId.substring(0,10)}: ${orderbook?.error || orderbook?.message || 'empty'}`); continue; }
-        // neg_risk 二次确认（orderbook 返回的字段）
-        if (orderbook.neg_risk === true) { debugCount.negRisk++; continue; }
+        if (midResult.status !== 'fulfilled' || !midResult.value) { 
+          debugCount.noBook++; 
+          if (debugCount.noBook <= 3) console.warn(`[Filter] No price for ${yesTokenId.substring(0,10)}`);
+          continue; 
+        }
+        const midpoint = parseFloat(midResult.value.price || midResult.value.midpoint || '0');
+        const spread = spreadResult.status === 'fulfilled' && spreadResult.value ? parseFloat(spreadResult.value.spread || '0.05') : 0.05;
+        if (midpoint <= 0 || midpoint >= 1) { debugCount.badPrice++; continue; }
 
-        const bids = orderbook.bids || [];
-        const asks = orderbook.asks || [];
-        if (bids.length === 0 || asks.length === 0) { debugCount.noBids++; continue; }
+        // 从 midpoint + spread 反推 bid/ask
+        const halfSpread = spread / 2;
+        const bestBid = Math.max(0.001, midpoint - halfSpread);
+        const bestAsk = Math.min(0.999, midpoint + halfSpread);
 
-        const bestBid = parseFloat(bids[0].price);
-        const bestAsk = parseFloat(asks[0].price);
-        const bidSize = parseFloat(bids[0].size);
-        const askSize = parseFloat(asks[0].size);
-
-        // 边界检查
-        if (bestBid <= 0 || bestAsk <= 0 || bestAsk <= bestBid) { debugCount.badPrice++; continue; }
-
-        const spread = bestAsk - bestBid;
-
-        // 筛选：spread 太宽的市场没有有效中点，也达不到 rewards scoring 要求
+        // 筛选：spread 太宽的市场没有有效中点
         if (spread > 0.15) { debugCount.wideSpread++; continue; }
 
-        // 筛选：深度足够
-        if (bidSize < config.bot.minBidAskDepth || askSize < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
+        // 用 liquidityClob 和 volume 做深度代理指标
+        const gmVolume = parseFloat(gm.volume || gm.volume24hr || '0');
+        const gmLiq = parseFloat(gm.liquidityClob || gm.liquidity || '0');
+        const depthProxy = Math.max(gmVolume, gmLiq);
+
+        // 筛选：深度足够（用成交量代替 orderbook 深度）
+        if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
 
         // 提取 rewards 参数（可能为空，但没关系）
         const rewardsMinSize = gm.min_incentive_size || 0;
@@ -650,15 +654,15 @@ export async function runMarketMakingCycle() {
           noTokenId,
           bestBid,
           bestAsk,
-          bidSize,
-          askSize,
+          bidSize: depthProxy,
+          askSize: depthProxy,
           spread: bestAsk - bestBid,
           midpoint: (bestBid + bestAsk) / 2,
-          tickSize: orderbook.tick_size || gm.minimum_tick_size || '0.01',
+          tickSize: gm.minimum_tick_size || '0.01',
           negRisk: false,
           rewardsMinSize,
           rewardsMaxSpread,
-          liquidityScore: bidSize + askSize, // 总深度作为流动性评分
+          liquidityScore: Math.max(gmVolume, gmLiq), // 总深度/成交量作为流动性评分
         });
 
       } catch (e: any) {
@@ -704,16 +708,19 @@ export async function runMarketMakingCycle() {
 
     for (const m of selectedMarkets) {
       try {
-        // 重新获取最新 orderbook（价格可能变化）
-        const ob = await clobClient.getOrderBook(m.yesTokenId);
-        if (!ob?.bids?.length || !ob?.asks?.length) continue;
-
-        const bestBid = parseFloat(ob.bids[0].price);
-        const bestAsk = parseFloat(ob.asks[0].price);
-        if (bestBid <= 0 || bestAsk <= 0 || bestAsk <= bestBid) continue;
-
-        const midpoint = (bestBid + bestAsk) / 2;
-        const tickSize = ob.tick_size || m.tickSize || '0.01';
+        // 重新获取最新 midpoint+spread（不走 /book）
+        const [midNow, spreadNow] = await Promise.allSettled([
+          clobClient.getMidpoint(m.yesTokenId),
+          clobClient.getSpread(m.yesTokenId),
+        ]);
+        if (midNow.status !== 'fulfilled' || !midNow.value) continue;
+        const midpoint = parseFloat(midNow.value.price || midNow.value.midpoint || '0');
+        const curSpread = spreadNow.status === 'fulfilled' && spreadNow.value ? parseFloat(spreadNow.value.spread || '0.05') : 0.05;
+        if (midpoint <= 0 || midpoint >= 1) continue;
+        const halfS = curSpread / 2;
+        const bestBid = Math.max(0.001, midpoint - halfS);
+        const bestAsk = Math.min(0.999, midpoint + halfS);
+        const tickSize = m.tickSize || '0.01';
 
         // 计算报价：离 midpoint 很紧
         let bidPrice = midpoint - spreadFromMid;
