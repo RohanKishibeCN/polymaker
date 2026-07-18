@@ -591,6 +591,7 @@ export async function runMarketMakingCycle() {
     // 4. 查询订单簿，筛选符合条件的市场
     console.log(`[Market Maker] Scanning ${candidates.length} candidate orderbooks...`);
     let eligibleMarkets: any[] = [];
+    let debugCount = { total: 0, noBook: 0, negRisk: 0, noBids: 0, badPrice: 0, wideSpread: 0, lowDepth: 0, pass: 0 };
 
     for (const gm of candidates) {
       const clobIds: string[] = gm.clobTokenIds;
@@ -606,14 +607,15 @@ export async function runMarketMakingCycle() {
           headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
         });
         const orderbook = await obResponse.json();
+        debugCount.total++;
 
-        if (orderbook.error || orderbook.message) continue;
+        if (orderbook.error || orderbook.message) { debugCount.noBook++; continue; }
         // neg_risk 二次确认（orderbook 返回的字段）
-        if (orderbook.neg_risk === true) continue;
+        if (orderbook.neg_risk === true) { debugCount.negRisk++; continue; }
 
         const bids = orderbook.bids || [];
         const asks = orderbook.asks || [];
-        if (bids.length === 0 || asks.length === 0) continue;
+        if (bids.length === 0 || asks.length === 0) { debugCount.noBids++; continue; }
 
         const bestBid = parseFloat(bids[0].price);
         const bestAsk = parseFloat(asks[0].price);
@@ -621,15 +623,15 @@ export async function runMarketMakingCycle() {
         const askSize = parseFloat(asks[0].size);
 
         // 边界检查
-        if (bestBid <= 0 || bestAsk <= 0 || bestAsk <= bestBid) continue;
+        if (bestBid <= 0 || bestAsk <= 0 || bestAsk <= bestBid) { debugCount.badPrice++; continue; }
 
         const spread = bestAsk - bestBid;
 
         // 筛选：spread 太宽的市场没有有效中点，也达不到 rewards scoring 要求
-        if (spread > 0.15) continue;
+        if (spread > 0.15) { debugCount.wideSpread++; continue; }
 
         // 筛选：深度足够
-        if (bidSize < config.bot.minBidAskDepth || askSize < config.bot.minBidAskDepth) continue;
+        if (bidSize < config.bot.minBidAskDepth || askSize < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
 
         // 提取 rewards 参数（可能为空，但没关系）
         const rewardsMinSize = gm.min_incentive_size || 0;
@@ -641,6 +643,7 @@ export async function runMarketMakingCycle() {
           // continue;  // 可选：严格模式跳过
         }
 
+        debugCount.pass++;
         eligibleMarkets.push({
           condition_id: gm.conditionId || gm.id,
           eventTitle: gm.question || gm.title || 'Unknown',
@@ -663,6 +666,8 @@ export async function runMarketMakingCycle() {
         continue;
       }
     }
+
+    console.log(`[Market Maker] Filter debug: total=${debugCount.total} noBook=${debugCount.noBook} negRisk=${debugCount.negRisk} noBids=${debugCount.noBids} badPrice=${debugCount.badPrice} wideSpread=${debugCount.wideSpread} lowDepth=${debugCount.lowDepth} pass=${debugCount.pass}`);
 
     // 5. 排序：奖励配置优先，然后按流动性排序
     eligibleMarkets.sort((a, b) => {
