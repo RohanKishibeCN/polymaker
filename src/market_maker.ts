@@ -655,6 +655,43 @@ export async function runMarketMakingCycle() {
     const dynamicTargetCount = config.getTargetMarketsCount(totalEquity);
     const priorityTokenIds = await getPositionPriorityTokenIds();
 
+    // 主循环内主动清算死仓（<$1 或总 token <20），不等 FastLiq
+    for (const [tokenId, inv] of Object.entries(inventory)) {
+      const totalTokens = (inv?.yes || 0) + (inv?.no || 0);
+      if (totalTokens === 0) continue;
+      if (totalTokens >= 20) continue; // 还有价值，不碰
+      // 死仓：直接尝试按 bestBid 卖出
+      try {
+        const obUrl = `https://clob.polymarket.com/book?token_id=${tokenId}`;
+        const obRes = await fetch(obUrl, {
+          agent: proxyAgent,
+          headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+        });
+        const ob = await obRes.json();
+        if (!ob.bids?.[0]) continue;
+        const bestBid = parseFloat(ob.bids[0].price);
+        if (bestBid <= 0) continue;
+        const sellSide = inv.yes > 0 ? 'yes' : 'no';
+        const sellSize = Math.max(Math.floor(inv[sellSide]), 1);
+        const orderPayload: any = {
+          tokenID: tokenId,
+          price: bestBid,
+          side: Side.SELL,
+          size: sellSize,
+        };
+        const res = await createAndPostOrderWithFeeFallback(orderPayload, "0.01", false);
+        if (res && !(res.error || res.errorMessage)) {
+          console.log(`[MainLiq] Cleared dead position ${tokenId} (${totalTokens} tokens @${bestBid})`);
+          inv.yes = 0; inv.no = 0;
+        } else {
+          console.log(`[MainLiq] Failed to clear ${tokenId}: ${res?.error || res?.errorMessage || 'unknown'}`);
+        }
+      } catch (e: any) {
+        console.warn(`[MainLiq] Error on ${tokenId}: ${e.message}`);
+      }
+      await new Promise(r => setTimeout(r, 100));
+    }
+
     // 1. 获取 Gamma 市场数据
     // Polymarket 最近在 /events 端点中移除了 clobRewards 数据，因此我们改用 /markets 端点
     console.log("[Market Maker] Fetching active markets from Gamma API (Offset Pagination)...");
@@ -804,17 +841,10 @@ export async function runMarketMakingCycle() {
       // 将 isHalted 标记传递给 targetMarkets，在下游挂单逻辑中触发 Hard Stop
       // ==========================================
 
-      // 只计算有意义的仓位（总 token 数 > 20 的才算有效占位，<20 的死仓不占用最大仓位限制）
-      const meaningfulPosCount = Object.keys(inventory).filter(k => {
-        const inv = inventory[k];
-        const totalTokens = (inv.yes || 0) + (inv.no || 0);
-        return totalTokens > 20;
-      }).length;
-
       // 如果没有库存，且未被白名单标记，且新开/持仓市场数量已经达到上限，跳过该市场
       if (!isManagement && !hasInventory && !isWhitelisted && 
           (newMarketsCount >= dynamicTargetCount ||
-           meaningfulPosCount >= config.bot.maxPositionCount)) {
+           Object.keys(inventory).filter(k => inventory[k].yes > 0 || inventory[k].no > 0).length >= config.bot.maxPositionCount)) {
         continue;
       }
 
