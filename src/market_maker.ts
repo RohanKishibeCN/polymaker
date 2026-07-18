@@ -575,7 +575,10 @@ export async function runMarketMakingCycle() {
         if (Array.isArray(batch)) gammaMarkets.push(...batch);
         if (!Array.isArray(batch) || batch.length < 100) break; // 最后一页
         await new Promise(r => setTimeout(r, 100));
-      } catch { break; }
+      } catch (e: any) {
+        console.warn(`[Market Maker] Gamma page ${page} failed: ${e?.message || e}`);
+        break;
+      }
     }
     console.log(`[Market Maker] Fetched ${gammaMarkets.length} markets.`);
 
@@ -609,7 +612,7 @@ export async function runMarketMakingCycle() {
         const orderbook = await obResponse.json();
         debugCount.total++;
 
-        if (orderbook.error || orderbook.message) { debugCount.noBook++; continue; }
+        if (orderbook.error || orderbook.message) { debugCount.noBook++; if (debugCount.noBook <= 3) console.warn(`[Filter] Book error ${yesTokenId.substring(0,10)}: ${orderbook.error || orderbook.message}`); continue; }
         // neg_risk 二次确认（orderbook 返回的字段）
         if (orderbook.neg_risk === true) { debugCount.negRisk++; continue; }
 
