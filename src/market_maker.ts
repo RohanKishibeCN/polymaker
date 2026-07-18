@@ -587,7 +587,13 @@ export async function runMarketMakingCycle() {
     for (const gm of gammaMarkets) {
       if (candidates.length >= 200) break; // 最多查 200 个订单簿
       if (!gm.active || gm.closed || !gm.clobTokenIds) continue;
-      if (gm.neg_risk === true) continue;
+      // 双重 negRisk 检查（Gamma 可能用 negRisk 或 neg_risk 字段名）
+      if (gm.neg_risk === true || gm.negRisk === true) continue;
+      // 只接受严格二元市场（outcomes = ["Yes", "No"]）
+      try {
+        const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
+        if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') continue;
+      } catch { continue; }
       candidates.push(gm);
     }
 
