@@ -611,23 +611,24 @@ export async function runMarketMakingCycle() {
 
       try {
         await new Promise(resolve => setTimeout(resolve, 50)); // 限流
-        // 解析 outcomePrices — 需要真实的价格，不是默认的 0.50
+        // 从 Data API 获取最后成交价（无 geo-block，公开 API）
         let price = 0.50;
-        let yesPrice = 0.50;
-        let noPrice = 0.50;
         try {
-          const prices = JSON.parse(gm.outcomePrices || '[]');
-          if (prices.length >= 2) {
-            yesPrice = parseFloat(prices[0]);
-            noPrice = parseFloat(prices[1]);
-            if (yesPrice > 0 && yesPrice < 1 && noPrice > 0 && noPrice < 1) {
-              price = (yesPrice + noPrice) / 2;
+          const tradeUrl = `https://data-api.polymarket.com/trades?token_id=${yesTokenId}&limit=1`;
+          const tradeResp = await fetch(tradeUrl, {
+            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+          });
+          const trades = await tradeResp.json();
+          if (Array.isArray(trades) && trades.length > 0) {
+            const lastTrade = parseFloat(trades[0].price || trades[0].taker_price || '0');
+            if (lastTrade > 0 && lastTrade < 1) {
+              price = lastTrade;
             }
           }
         } catch {}
         debugCount.total++;
 
-        // 跳过 midpoint 四舍五入后为 0.500 的市场（价格未形成，风险不可控）
+        // 跳过 midpoint 四舍五入后为 0.500 的市场（无最近成交或成交价失真）
         const roundedMid = Math.round(price * 1000) / 1000;
         if (roundedMid === 0.500) { debugCount.badPrice++; continue; }
         if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
