@@ -604,37 +604,29 @@ export async function runMarketMakingCycle() {
 
       try {
         await new Promise(resolve => setTimeout(resolve, 50)); // 限流
-        // 使用 SDK 的 midpoint+spread 获取价格数据（不走 /book 端点，避免 geo-block）
-        const [midResult, spreadResult] = await Promise.allSettled([
-          clobClient.getMidpoint(yesTokenId),
-          clobClient.getSpread(yesTokenId),
-        ]);
+        // 裸 GET 到 CLOB /price 端点（简单、无认证、可能不被 geo-block）
+        const priceUrl = `https://clob.polymarket.com/price?token_id=${yesTokenId}`;
+        const priceResp = await fetch(priceUrl, {
+          headers: { 'Accept': 'application/json' }
+        });
+        if (!priceResp.ok) { debugCount.noBook++; if (debugCount.noBook <= 3) console.warn(`[Filter] CLOB ${priceResp.status} for ${yesTokenId.substring(0,10)}`); continue; }
+        const priceData = await priceResp.json();
         debugCount.total++;
 
-        if (midResult.status !== 'fulfilled' || !midResult.value) { 
-          debugCount.noBook++; 
-          if (debugCount.noBook <= 3) console.warn(`[Filter] No price for ${yesTokenId.substring(0,10)}`);
-          continue; 
-        }
-        const midpoint = parseFloat(midResult.value.price || midResult.value.midpoint || '0');
-        const spread = spreadResult.status === 'fulfilled' && spreadResult.value ? parseFloat(spreadResult.value.spread || '0.05') : 0.05;
-        if (midpoint <= 0 || midpoint >= 1) { debugCount.badPrice++; continue; }
-
-        // 从 midpoint + spread 反推 bid/ask
-        const halfSpread = spread / 2;
-        const bestBid = Math.max(0.001, midpoint - halfSpread);
-        const bestAsk = Math.min(0.999, midpoint + halfSpread);
-
-        // 筛选：spread 太宽的市场没有有效中点
-        if (spread > 0.15) { debugCount.wideSpread++; continue; }
-
-        // 用 liquidityClob 和 volume 做深度代理指标
+        const price = parseFloat(priceData?.price || '0');
+        if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
+        // 用 Gamma 的 volume 代替 spread/深度
         const gmVolume = parseFloat(gm.volume || gm.volume24hr || '0');
         const gmLiq = parseFloat(gm.liquidityClob || gm.liquidity || '0');
         const depthProxy = Math.max(gmVolume, gmLiq);
-
-        // 筛选：深度足够（用成交量代替 orderbook 深度）
         if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
+
+        // 用 price ±2% 作为虚拟 bid/ask（足够近以赚 rewards，价格偏离不成交）
+        const midpoint = price;
+        const spread = 0.02;
+        const halfSpread = spread / 2;
+        const bestBid = Math.max(0.001, midpoint - halfSpread);
+        const bestAsk = Math.min(0.999, midpoint + halfSpread);
 
         // 提取 rewards 参数（可能为空，但没关系）
         const rewardsMinSize = gm.min_incentive_size || 0;
@@ -708,18 +700,17 @@ export async function runMarketMakingCycle() {
 
     for (const m of selectedMarkets) {
       try {
-        // 重新获取最新 midpoint+spread（不走 /book）
-        const [midNow, spreadNow] = await Promise.allSettled([
-          clobClient.getMidpoint(m.yesTokenId),
-          clobClient.getSpread(m.yesTokenId),
-        ]);
-        if (midNow.status !== 'fulfilled' || !midNow.value) continue;
-        const midpoint = parseFloat(midNow.value.price || midNow.value.midpoint || '0');
-        const curSpread = spreadNow.status === 'fulfilled' && spreadNow.value ? parseFloat(spreadNow.value.spread || '0.05') : 0.05;
-        if (midpoint <= 0 || midpoint >= 1) continue;
-        const halfS = curSpread / 2;
-        const bestBid = Math.max(0.001, midpoint - halfS);
-        const bestAsk = Math.min(0.999, midpoint + halfS);
+        // 最新 price（走 /price 端点，不走 /book）
+        const pp = await fetch(`https://clob.polymarket.com/price?token_id=${m.yesTokenId}`, {
+          headers: { 'Accept': 'application/json' }
+        });
+        if (!pp.ok) continue;
+        const ppData = await pp.json();
+        const price = parseFloat(ppData?.price || '0');
+        if (price <= 0 || price >= 1) continue;
+        const midpoint = price;
+        const bestBid = Math.max(0.001, midpoint - 0.01);
+        const bestAsk = Math.min(0.999, midpoint + 0.01);
         const tickSize = m.tickSize || '0.01';
 
         // 计算报价：离 midpoint 很紧
