@@ -40,7 +40,7 @@ export const config = {
   bot: {
     scanIntervalMs: (scanIntervalMinutesEnv && scanIntervalMinutesEnv > 0 ? scanIntervalMinutesEnv * 60 * 1000 : 3600 * 1000),
     maxMarkets: (maxMarketsEnv && maxMarketsEnv > 0 ? maxMarketsEnv : 5),
-    minBidAskDepth: (minBidAskDepthEnv && minBidAskDepthEnv > 0 ? minBidAskDepthEnv : 50),
+    minBidAskDepth: (minBidAskDepthEnv && minBidAskDepthEnv > 0 ? minBidAskDepthEnv : 1),
     minBidPrice: (minBidPriceEnv && minBidPriceEnv > 0 ? minBidPriceEnv : 0.10),
     maxAskPrice: (maxAskPriceEnv && maxAskPriceEnv > 0 ? maxAskPriceEnv : 0.90),
     spreadFromMidpoint: (spreadFromMidEnv && spreadFromMidEnv > 0 ? spreadFromMidEnv : 0.02),
