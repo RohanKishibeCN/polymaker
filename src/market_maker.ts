@@ -604,12 +604,14 @@ export async function runMarketMakingCycle() {
 
       try {
         await new Promise(resolve => setTimeout(resolve, 50)); // 限流
-        const obUrl = `https://clob.polymarket.com/book?token_id=${yesTokenId}`;
-        const obResponse = await fetch(obUrl, {
-          agent: proxyAgent,
-          headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-        });
-        const orderbook = await obResponse.json();
+        // 使用 clobClient 内部 axios（已认证+已配置代理）获取 orderbook
+        // raw fetch 到 /book 端点会被 geo-block（无认证请求被拦截）
+        const bookResp = await clobClient.axiosInstance?.get(`/book?token_id=${yesTokenId}`);
+        if (!bookResp) {
+          debugCount.noBook++;
+          continue;
+        }
+        const orderbook = bookResp.data;
         debugCount.total++;
 
         if (orderbook.error || orderbook.message) { debugCount.noBook++; if (debugCount.noBook <= 3) console.warn(`[Filter] Book error ${yesTokenId.substring(0,10)}: ${orderbook.error || orderbook.message}`); continue; }
@@ -707,13 +709,9 @@ export async function runMarketMakingCycle() {
     for (const m of selectedMarkets) {
       try {
         // 重新获取最新 orderbook（价格可能变化）
-        const obUrl = `https://clob.polymarket.com/book?token_id=${m.yesTokenId}`;
-        const obResponse = await fetch(obUrl, {
-          agent: proxyAgent,
-          headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-        });
-        const ob = await obResponse.json();
-        if (!ob.bids?.length || !ob.asks?.length) continue;
+        const refetchResp = await clobClient.axiosInstance?.get(`/book?token_id=${m.yesTokenId}`);
+        const ob = refetchResp?.data;
+        if (!ob?.bids?.length || !ob?.asks?.length) continue;
 
         const bestBid = parseFloat(ob.bids[0].price);
         const bestAsk = parseFloat(ob.asks[0].price);
