@@ -16,18 +16,13 @@ function parseIntEnv(name: string): number | undefined {
 }
 
 const scanIntervalMinutesEnv = parseNumberEnv('POLYMARKET_SCAN_INTERVAL_MINUTES');
-const targetMarketsCountEnv = parseIntEnv('POLYMARKET_TARGET_MARKETS_COUNT');
-const tagQuotaEnv = parseIntEnv('POLYMARKET_TAG_QUOTA');
 const initialCapitalEnv = parseNumberEnv('POLYMARKET_INITIAL_CAPITAL');
 const reserveCashUsdcEnv = parseNumberEnv('POLYMARKET_RESERVE_CASH_USDC');
-const freezeAddSpreadSoftEnv = parseNumberEnv('POLYMARKET_FREEZE_ADD_SPREAD_SOFT');
-const freezeAddSpreadHardEnv = parseNumberEnv('POLYMARKET_FREEZE_ADD_SPREAD_HARD');
-const reallocateMaxMarketsEnv = parseIntEnv('POLYMARKET_REALLOCATE_MAX_MARKETS');
-const maxPositionCountEnv = parseIntEnv('POLYMARKET_MAX_POSITION_COUNT');
-const sizePctEnv = parseNumberEnv('POLYMARKET_SIZE_PCT');
-const maxMarketPctEnv = parseNumberEnv('POLYMARKET_MAX_MARKET_PCT');
+const maxMarketsEnv = parseIntEnv('POLYMARKET_MAX_MARKETS');
 const minBidAskDepthEnv = parseIntEnv('POLYMARKET_MIN_BID_ASK_DEPTH');
-const categoryMaxShareEnv = parseNumberEnv('POLYMARKET_CATEGORY_MAX_SHARE');
+const minBidPriceEnv = parseNumberEnv('POLYMARKET_MIN_BID_PRICE');
+const maxAskPriceEnv = parseNumberEnv('POLYMARKET_MAX_ASK_PRICE');
+const spreadFromMidEnv = parseNumberEnv('POLYMARKET_SPREAD_FROM_MIDPOINT');
 
 export const config = {
   polymarket: {
@@ -36,7 +31,6 @@ export const config = {
     passphrase: (process.env.POLYMARKET_API_PASSPHRASE || '').trim(),
     funderAddress: (process.env.POLYMARKET_FUNDER_ADDRESS || '').trim(),
     privateKey: (process.env.PRIVATE_KEY || '').trim(),
-    // Polymarket 地理封锁风控需要的 geoBlockToken
     geoBlockToken: (process.env.POLYMARKET_GEOBLOCK_TOKEN || '').trim(),
   },
   notion: {
@@ -45,38 +39,20 @@ export const config = {
   },
   bot: {
     scanIntervalMs: (scanIntervalMinutesEnv && scanIntervalMinutesEnv > 0 ? scanIntervalMinutesEnv * 60 * 1000 : 3600 * 1000),
-    targetMarketsCount: (targetMarketsCountEnv && targetMarketsCountEnv > 0 ? targetMarketsCountEnv : 7),
-    tagQuota: (tagQuotaEnv && tagQuotaEnv > 0 ? tagQuotaEnv : 2),
-    sizePct: (sizePctEnv && sizePctEnv > 0 ? sizePctEnv : 0.08),
-    maxMarketPct: (maxMarketPctEnv && maxMarketPctEnv > 0 ? maxMarketPctEnv : 0.25),
-    spreadHalfBase: 0.02,
-    spreadHalfMax: 0.04,
-    inventorySkewFactor: 0.02,
-    timeDecayDays: 2, // 缩短为 2 天清理死仓
-    timeDecaySkewFactor: 0.06, // 加大出清力度
-    hardStopLossPct: -0.15,
-    forceCloseDays: 7, // 7 天后强制清仓，不限价格
-    enableDualLayerGrid: true,
-    maxPositionCount: (maxPositionCountEnv && maxPositionCountEnv > 0 ? maxPositionCountEnv : 30),
+    maxMarkets: (maxMarketsEnv && maxMarketsEnv > 0 ? maxMarketsEnv : 5),
+    minBidAskDepth: (minBidAskDepthEnv && minBidAskDepthEnv > 0 ? minBidAskDepthEnv : 50),
+    minBidPrice: (minBidPriceEnv && minBidPriceEnv > 0 ? minBidPriceEnv : 0.10),
+    maxAskPrice: (maxAskPriceEnv && maxAskPriceEnv > 0 ? maxAskPriceEnv : 0.90),
+    spreadFromMidpoint: (spreadFromMidEnv && spreadFromMidEnv > 0 ? spreadFromMidEnv : 0.02),
+    maxPositionCount: 5,
     initialCapital: (initialCapitalEnv && initialCapitalEnv > 0 ? initialCapitalEnv : 500),
     reserveCashUsdc: (reserveCashUsdcEnv && reserveCashUsdcEnv > 0 ? reserveCashUsdcEnv : 50),
-    freezeAddSpreadSoft: (freezeAddSpreadSoftEnv && freezeAddSpreadSoftEnv > 0 ? freezeAddSpreadSoftEnv : 0.5),
-    freezeAddSpreadHard: (freezeAddSpreadHardEnv && freezeAddSpreadHardEnv > 0 ? freezeAddSpreadHardEnv : 0.8),
-    reallocateMaxMarkets: (reallocateMaxMarketsEnv && reallocateMaxMarketsEnv > 0 ? reallocateMaxMarketsEnv : 2),
-    minBidAskDepth: (minBidAskDepthEnv && minBidAskDepthEnv > 0 ? minBidAskDepthEnv : 20),
-    categoryMaxShare: (categoryMaxShareEnv && categoryMaxShareEnv > 0 ? categoryMaxShareEnv : 0.25),
   },
-  getTargetMarketsCount(capital: number): number {
-    if (capital <= 500) return 7;
-    if (capital <= 1000) return 10;
-    if (capital <= 2000) return 12;
-    return 15;
-  }
 };
 
 // Validate config
 const missingKeys = Object.entries(config.polymarket)
-  .filter(([key, value]) => key !== 'geoBlockToken' && !value) // geoBlockToken is optional when using a proxy
+  .filter(([key, value]) => key !== 'geoBlockToken' && !value)
   .map(([key]) => `polymarket.${key}`);
 
 if (missingKeys.length > 0) {
