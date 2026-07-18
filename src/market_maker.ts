@@ -661,7 +661,9 @@ export async function runMarketMakingCycle() {
           liquidityScore: bidSize + askSize, // 总深度作为流动性评分
         });
 
-      } catch (e) {
+      } catch (e: any) {
+        debugCount.noBook++;
+        if (debugCount.noBook <= 3) console.warn(`[Filter] getOrderBook error: ${e?.message || e}`);
         continue;
       }
     }
