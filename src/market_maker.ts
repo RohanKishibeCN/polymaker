@@ -627,8 +627,9 @@ export async function runMarketMakingCycle() {
         } catch {}
         debugCount.total++;
 
-        // 跳过 outcomePrices 为 0.50/0.50 的市场（无成交的默认价格，不是真实价格）
-        if (Math.abs(yesPrice - 0.50) < 0.005 && Math.abs(noPrice - 0.50) < 0.005) { debugCount.badPrice++; continue; }
+        // 跳过 midpoint 四舍五入后为 0.500 的市场（价格未形成，风险不可控）
+        const roundedMid = Math.round(price * 1000) / 1000;
+        if (roundedMid === 0.500) { debugCount.badPrice++; continue; }
         if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
         // 用 Gamma 的 volume 代替深度
         const gmVolume = parseFloat(gm.volume || gm.volume24hr || '0');
