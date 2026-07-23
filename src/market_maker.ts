@@ -541,7 +541,7 @@ export async function runMarketMakingCycle() {
     let cashBalance = await getCashBalance();
     const reserveCashUsdc = config.bot.reserveCashUsdc;
 
-    // 同步链上仓位（只读，用于日报统计）
+    // 同步链上仓
     let portfolioValue = 0;
     try {
       await syncInventoryFromChain();
@@ -557,7 +557,37 @@ export async function runMarketMakingCycle() {
       totalEquity = config.bot.initialCapital;
     }
     if (totalEquity > peakEquity) peakEquity = totalEquity;
-    console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
+    console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL} | Cash: ${cashBalance.toFixed(2)}`);
+
+    // 1b. 清理小死仓（价值 < $15 的仓位直接市价卖出腾出资金）
+    if (cashBalance < config.bot.maxMarkets * 20) {
+      console.log("[Market Maker] Cash low, attempting to clear small dead positions...");
+      let clearedCount = 0;
+      for (const [tokenId, pos] of Object.entries(inventory)) {
+        const posValue = (pos.yes || 0) * (pos.avgCost || 0.5);
+        if (posValue > 0 && posValue < 15) {
+          try {
+            // 市价卖出 — 用 0.01 作为限价（比任何 bid 都低，确保立即成交）
+            const result = await clobClient.createAndPostOrder(
+              { tokenID: tokenId, price: 0.01, size: pos.yes, side: Side.SELL },
+              { tickSize: '0.01', negRisk: false, postOnly: false },
+              "GTC"
+            );
+            if (result && !result.error) {
+              console.log(`[Market Maker] Cleared position ${tokenId.substring(0,10)} value=$${posValue.toFixed(2)}`);
+              clearedCount++;
+              delete inventory[tokenId];
+            }
+          } catch {}
+        }
+      }
+      if (clearedCount > 0) {
+        cashBalance = await getCashBalance(); // 重新拉余额
+        console.log(`[Market Maker] Cleared ${clearedCount} positions. New cash: ${cashBalance.toFixed(2)}`);
+      } else {
+        console.log(`[Market Maker] No small positions to clear.`);
+      }
+    }
 
     // 2. 获取有 Liquidity Rewards 的市场列表（优先用 SDK 的认证端点）
     console.log("[Market Maker] Fetching reward markets from CLOB API...");
@@ -601,7 +631,8 @@ export async function runMarketMakingCycle() {
             noTokenId: tokenIds[1],
             midpoint: 0.50,
             rewardsMinSize: rm.rewards_min_size ?? 0,
-             rewardsMaxSpread: rm.rewards_max_spread ?? 0,
+            rewardsMaxSpread: rm.rewards_max_spread ?? 0,
+            total_daily_rate: rm.total_daily_rate || rm.native_daily_rate || 0,
             volume: parseFloat(gm.volume || gm.volume24hr || '0'),
             liquidity: parseFloat(gm.liquidityClob || gm.liquidity || '0'),
           });
@@ -720,23 +751,24 @@ export async function runMarketMakingCycle() {
          );
 
         debugCount.pass++;
-        eligibleMarkets.push({
-          condition_id: gm.conditionId || gm.id || gm.condition_id,
-          eventTitle: gm.eventTitle || gm.question || gm.title || 'Unknown',
-          yesTokenId,
-          noTokenId,
-          bestBid,
-          bestAsk,
-          bidSize: volProxy,
-          askSize: volProxy,
-          spread: bestAsk - bestBid,
-          midpoint: (bestBid + bestAsk) / 2,
-          tickSize: gm.minimum_tick_size || '0.01',
-          negRisk: false,
-          rewardsMinSize: gm.rewardsMinSize || 0,
-          rewardsMaxSpread: gm.rewardsMaxSpread || 0,
-          liquidityScore: volProxy,
-        });
+          eligibleMarkets.push({
+            condition_id: gm.conditionId || gm.id || gm.condition_id,
+            eventTitle: gm.eventTitle || gm.question || gm.title || 'Unknown',
+            yesTokenId,
+            noTokenId,
+            bestBid,
+            bestAsk,
+            bidSize: volProxy,
+            askSize: volProxy,
+            spread: bestAsk - bestBid,
+            midpoint: (bestBid + bestAsk) / 2,
+            tickSize: gm.minimum_tick_size || '0.01',
+            negRisk: false,
+            rewardsMinSize: gm.rewardsMinSize || 0,
+            rewardsMaxSpread: gm.rewardsMaxSpread || 0,
+            total_daily_rate: gm.total_daily_rate || 0,
+            liquidityScore: volProxy,
+          });
 
       } catch (e: any) {
           debugCount.noBook++;
@@ -747,12 +779,14 @@ export async function runMarketMakingCycle() {
 
     console.log(`[Market Maker] Filter debug: total=${debugCount.total} noBook=${debugCount.noBook} negRisk=${debugCount.negRisk} noBids=${debugCount.noBids} badPrice=${debugCount.badPrice} wideSpread=${debugCount.wideSpread} lowDepth=${debugCount.lowDepth} pass=${debugCount.pass}`);
 
-    // 5. 排序：奖励配置优先，然后按流动性排序
+    // 5. 排序：按 expected daily reward 排序（用 total_daily_rate 作为代理）
+    // 实际得分还取决于竞争激烈程度，但 total_daily_rate 是最好的可用代理
+    // 同时也给 rewards_min_size 小的市场加权（更容易满足）
     eligibleMarkets.sort((a, b) => {
       const aHasRewards = a.rewardsMinSize > 0 && a.rewardsMaxSpread > 0 ? 1 : 0;
       const bHasRewards = b.rewardsMinSize > 0 && b.rewardsMaxSpread > 0 ? 1 : 0;
       if (bHasRewards !== aHasRewards) return bHasRewards - aHasRewards;
-      return b.liquidityScore - a.liquidityScore;
+      return (b.total_daily_rate || 0) - (a.total_daily_rate || 0);
     });
 
     const selectedMarkets = eligibleMarkets.slice(0, config.bot.maxMarkets);
@@ -781,20 +815,19 @@ export async function runMarketMakingCycle() {
 
     for (const m of selectedMarkets) {
       try {
-        // 使用选市场时已缓存的 midpoint（不需要重新请求 CLOB）
+        // 使用选市场时已缓存的 midpoint
         const midpoint = m.midpoint;
-        const bestBid = m.bestBid;
-        const bestAsk = m.bestAsk;
         const tickSize = m.tickSize || '0.01';
+        const maxSpreadCents = m.rewardsMaxSpread || 5; // 默认 5¢
+        const maxSpread = maxSpreadCents / 100; // 转成价格
 
-        // 计算报价：离 midpoint 很紧
-        let bidPrice = midpoint - spreadFromMid;
-        let askPrice = midpoint + spreadFromMid;
-        // 钳制在订单簿范围内
-        bidPrice = Math.max(bestBid + parseFloat(tickSize), Math.min(bidPrice, bestAsk - parseFloat(tickSize)));
-        askPrice = Math.min(bestAsk - parseFloat(tickSize), Math.max(askPrice, bestBid + parseFloat(tickSize)));
+        // ✅ Reward 带内报价：bid = midpoint - maxSpread/2
+        // 确保 S(v,s) = ((v-s)/v)² > 0 (s < v = 在带内)
+        const halfBand = maxSpread / 2;
+        let bidPrice = midpoint - halfBand;
+        // 钳制在 0.01~0.99 之间
+        bidPrice = Math.max(0.01, Math.min(0.99, bidPrice));
         bidPrice = roundToTickSize(bidPrice, tickSize);
-        askPrice = roundToTickSize(askPrice, tickSize);
 
         // 奖励要求的 min size
         const quoteSize = Math.max(10, m.rewardsMinSize || 10);
@@ -803,14 +836,20 @@ export async function runMarketMakingCycle() {
         const buyCost = quoteSize * bidPrice;
         const effectiveBuySize = buyCost > cashAvailable ? Math.floor(cashAvailable / bidPrice) : quoteSize;
         if (effectiveBuySize < 1) {
-          console.log(`     [${m.eventTitle.substring(0, 30)}] Skipped: insufficient cash.`);
+          console.log(`     [${m.eventTitle.substring(0, 30)}] Skipped: insufficient cash (cash=${cashBalance.toFixed(2)}, reserve=${reserveCashUsdc}).`);
           continue;
         }
 
-        console.log(`\n  -> ${m.eventTitle}`);
-        console.log(`     Midpoint: ${midpoint.toFixed(3)} | Bid: ${bidPrice} | Size: ${effectiveBuySize}`);
+        // S(v,s) score for the reward
+        const sCents = maxSpreadCents / 2; // our spread from midpoint = half-band
+        const score = ((maxSpreadCents - sCents) / maxSpreadCents) ** 2;
+        const estDailyReward = (m.total_daily_rate || 0) * score * (effectiveBuySize / 1000); // rough estimate
 
-        // 挂 Bid（买入 YES）
+        console.log(`\n  -> ${m.eventTitle}`);
+        console.log(`     Midpoint: ${midpoint.toFixed(3)} | Rewards: $${m.total_daily_rate || 0}/day | Est: ~$${estDailyReward.toFixed(4)}/day`);
+        console.log(`     Bid: ${bidPrice} x${effectiveBuySize} | Spread: ${sCents.toFixed(1)}¢ (${(score*100).toFixed(0)}% score)`);
+
+        // 挂 Buy（买入 YES）
         const buyPayload: any = {
           tokenID: m.yesTokenId,
           price: bidPrice,
@@ -821,7 +860,7 @@ export async function runMarketMakingCycle() {
         if (buyRes && !(buyRes.error || buyRes.errorMessage)) {
           console.log(`     [+] Placed BUY YES @${bidPrice} x${effectiveBuySize}`);
           dailyStats.ordersPosted++;
-          cashBalance -= buyCost; // 本地预算扣减
+          cashBalance -= buyCost;
         } else {
           console.log(`     [!] BUY failed: ${buyRes?.error || buyRes?.errorMessage || 'unknown'}`);
         }
