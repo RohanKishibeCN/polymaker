@@ -573,35 +573,45 @@ export async function runMarketMakingCycle() {
     let candidates: any[] = [];
     if (rewardMarkets.length > 0) {
       console.log("[Market Maker] Building candidates from CLOB reward data...");
-      // 打印第一个 reward market 的完整结构以确认字段名
-      if (rewardMarkets[0]) {
-        const keys = Object.keys(rewardMarkets[0]);
-        const sample = JSON.stringify(rewardMarkets[0]).substring(0, 500);
-        console.log(`[Reward] Sample keys: ${keys.join(',')}`);
-        console.log(`[Reward] Sample data: ${sample}...`);
-      }
-      let skipNoTokens = 0, skipNotBinary = 0;
-      for (const rm of rewardMarkets) {
-        if (candidates.length >= 200) break;
-        if (!rm.tokens || !Array.isArray(rm.tokens) || rm.tokens.length < 2) { skipNoTokens++; continue; }
-        const yesToken = rm.tokens.find((t: any) => t.outcome?.toLowerCase() === 'yes');
-        const noToken = rm.tokens.find((t: any) => t.outcome?.toLowerCase() === 'no');
-        if (!yesToken || !noToken) { 
-          skipNotBinary++;
-          if (skipNotBinary <= 3) console.warn(`[Reward] Non-binary: ${rm.question?.substring(0,30)} outcomes=${rm.tokens.map((t:any)=>t.outcome).join(',')}`);
-          continue; 
+      // MarketReward 不返回 tokens，只有 condition_id，需从 Gamma 补市场数据
+      const topRewardMarkets = rewardMarkets.slice(0, 200);
+      let skipNoGamma = 0;
+      for (const rm of topRewardMarkets) {
+        try {
+          const url = `https://gamma-api.polymarket.com/markets?condition_id=${rm.condition_id}&limit=1`;
+          const resp = await fetch(url, {
+            agent: proxyAgent,
+            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+          });
+          const gms = await resp.json();
+          const gm = Array.isArray(gms) ? gms[0] : null;
+          if (!gm || !gm.active || gm.closed || !gm.clobTokenIds) { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
+          if (gm.neg_risk === true || gm.negRisk === true) { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
+          // 只接受二元 Yes/No 市场
+          try {
+            const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
+            if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
+          } catch { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
+          const tokenIds = getValidTokenIds(gm.clobTokenIds);
+          if (!tokenIds) { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
+          candidates.push({
+            condition_id: rm.condition_id,
+            eventTitle: gm.question || gm.title || 'Unknown',
+            yesTokenId: tokenIds[0],
+            noTokenId: tokenIds[1],
+            midpoint: 0.50,
+            rewardsMinSize: rm.rewards_min_size ?? 0,
+             rewardsMaxSpread: rm.rewards_max_spread ?? 0,
+            volume: parseFloat(gm.volume || gm.volume24hr || '0'),
+            liquidity: parseFloat(gm.liquidityClob || gm.liquidity || '0'),
+          });
+          await new Promise(r => setTimeout(r, 30));
+        } catch {
+          skipNoGamma++;
+          await new Promise(r => setTimeout(r, 30));
         }
-        candidates.push({
-          condition_id: rm.condition_id,
-          eventTitle: rm.question || 'Unknown',
-          yesTokenId: yesToken.token_id,
-          noTokenId: noToken.token_id,
-          midpoint: parseFloat(yesToken.price || '0.50'),
-          rewardsMinSize: rm.rewards_min_size || 0,
-          rewardsMaxSpread: rm.rewards_max_spread || 0,
-        });
       }
-      console.log(`[Market Maker] Built ${candidates.length} candidates from CLOB rewards (${skipNoTokens} no tokens, ${skipNotBinary} non-binary).`);
+      console.log(`[Market Maker] Built ${candidates.length} candidates from CLOB rewards (${skipNoGamma} skipped via Gamma).`);
     } else {
       // 降级：从 Gamma 所有市场扫描
       console.log("[Market Maker] Fetching active markets from Gamma API (fallback)...");
@@ -676,15 +686,11 @@ export async function runMarketMakingCycle() {
         const roundedMid = Math.round(price * 1000) / 1000;
         if (roundedMid === 0.500) { debugCount.badPrice++; continue; }
         if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
-        // 用 Gamma 的 volume 代替深度（仅 Gamma fallback 模式需要过滤）
-        if (!isClobReward) {
-          const gmVolume = parseFloat(gm.volume || gm.volume24hr || '0');
-          const gmLiq = parseFloat(gm.liquidityClob || gm.liquidity || '0');
-          const depthProxy = Math.max(gmVolume, gmLiq);
-          if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
-        } else {
-          // CLOB reward 模式：无需 volume 过滤，所有候选都有 rewards
-        }
+        // 用 Gamma 的 volume 代替深度
+         const gmVolume = parseFloat(gm.volume || (gm as any).volume24hr || '0');
+         const gmLiq = parseFloat(gm.liquidity || (gm as any).liquidityClob || '0');
+         const depthProxy = Math.max(gmVolume, gmLiq);
+         if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
 
         // 用 price ±2% 作为 bid/ask
         const midpoint = price;
@@ -708,7 +714,10 @@ export async function runMarketMakingCycle() {
           const ids = getValidTokenIds(gm.clobTokenIds);
           return ids ? ids[1] : null;
         })();
-        const volProxy = isClobReward ? 100000 : Math.max(parseFloat(gm.volume || gm.volume24hr || '0'), parseFloat(gm.liquidityClob || gm.liquidity || '0'));
+        const volProxy = Math.max(
+           parseFloat((gm as any).volume || '0'),
+           parseFloat((gm as any).liquidity || '0')
+         );
 
         debugCount.pass++;
         eligibleMarkets.push({
