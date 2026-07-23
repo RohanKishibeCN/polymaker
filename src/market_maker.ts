@@ -573,12 +573,17 @@ export async function runMarketMakingCycle() {
     let candidates: any[] = [];
     if (rewardMarkets.length > 0) {
       console.log("[Market Maker] Building candidates from CLOB reward data...");
+      let skipNoTokens = 0, skipNotBinary = 0;
       for (const rm of rewardMarkets) {
         if (candidates.length >= 200) break;
-        if (!rm.tokens || rm.tokens.length < 2) continue;
-        const yesToken = rm.tokens.find((t: any) => t.outcome === 'Yes');
-        const noToken = rm.tokens.find((t: any) => t.outcome === 'No');
-        if (!yesToken || !noToken) continue;
+        if (!rm.tokens || rm.tokens.length < 2) { skipNoTokens++; continue; }
+        const yesToken = rm.tokens.find((t: any) => t.outcome?.toLowerCase() === 'yes');
+        const noToken = rm.tokens.find((t: any) => t.outcome?.toLowerCase() === 'no');
+        if (!yesToken || !noToken) { 
+          skipNotBinary++;
+          if (skipNotBinary <= 3) console.warn(`[Reward] Non-binary: ${rm.question?.substring(0,30)} outcomes=${rm.tokens.map((t:any)=>t.outcome).join(',')}`);
+          continue; 
+        }
         candidates.push({
           condition_id: rm.condition_id,
           eventTitle: rm.question || 'Unknown',
@@ -589,7 +594,7 @@ export async function runMarketMakingCycle() {
           rewardsMaxSpread: rm.rewards_max_spread || 0,
         });
       }
-      console.log(`[Market Maker] Built ${candidates.length} candidates from CLOB rewards.`);
+      console.log(`[Market Maker] Built ${candidates.length} candidates from CLOB rewards (${skipNoTokens} no tokens, ${skipNotBinary} non-binary).`);
     } else {
       // 降级：从 Gamma 所有市场扫描
       console.log("[Market Maker] Fetching active markets from Gamma API (fallback)...");
