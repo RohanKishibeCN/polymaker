@@ -569,42 +569,27 @@ export async function runMarketMakingCycle() {
       console.warn(`[Market Maker] CLOB getCurrentRewards failed: ${e?.message}. Falling back to Gamma.`);
     }
 
-    // 如果 CLOB 成功，用 condition_id 从 Gamma 补充市场数据
-    let gammaRewardMap: Map<string, any> = new Map();
-    if (rewardMarkets.length > 0) {
-      console.log("[Market Maker] Enriching reward markets with Gamma data...");
-      for (const rm of rewardMarkets) {
-        try {
-          const url = `https://gamma-api.polymarket.com/markets?condition_id=${rm.condition_id}&limit=1`;
-          const resp = await fetch(url, {
-            agent: proxyAgent,
-            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-          });
-          const gms = await resp.json();
-          if (Array.isArray(gms) && gms.length > 0) {
-            gammaRewardMap.set(rm.condition_id, gms[0]);
-          }
-          await new Promise(r => setTimeout(r, 50));
-        } catch {}
-      }
-      console.log(`[Market Maker] Enriched ${gammaRewardMap.size} reward markets.`);
-    }
-
-    // 3. 构建候选市场列表
+    // 如果 CLOB 成功，从 MarketReward 直接取 token IDs（不需要 Gamma）
     let candidates: any[] = [];
     if (rewardMarkets.length > 0) {
+      console.log("[Market Maker] Building candidates from CLOB reward data...");
       for (const rm of rewardMarkets) {
         if (candidates.length >= 200) break;
-        const gm = gammaRewardMap.get(rm.condition_id);
-        if (!gm || !gm.active || gm.closed || !gm.clobTokenIds) continue;
-        if (gm.neg_risk === true || gm.negRisk === true) continue;
-        // 只接受严格二元市场
-        try {
-          const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
-          if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') continue;
-        } catch { continue; }
-        candidates.push({ ...gm, rewardsMinSize: rm.rewards_min_size, rewardsMaxSpread: rm.rewards_max_spread });
+        if (!rm.tokens || rm.tokens.length < 2) continue;
+        const yesToken = rm.tokens.find((t: any) => t.outcome === 'Yes');
+        const noToken = rm.tokens.find((t: any) => t.outcome === 'No');
+        if (!yesToken || !noToken) continue;
+        candidates.push({
+          condition_id: rm.condition_id,
+          eventTitle: rm.question || 'Unknown',
+          yesTokenId: yesToken.token_id,
+          noTokenId: noToken.token_id,
+          midpoint: parseFloat(yesToken.price || '0.50'),
+          rewardsMinSize: rm.rewards_min_size || 0,
+          rewardsMaxSpread: rm.rewards_max_spread || 0,
+        });
       }
+      console.log(`[Market Maker] Built ${candidates.length} candidates from CLOB rewards.`);
     } else {
       // 降级：从 Gamma 所有市场扫描
       console.log("[Market Maker] Fetching active markets from Gamma API (fallback)...");
@@ -642,17 +627,19 @@ export async function runMarketMakingCycle() {
       console.log(`[Market Maker] Fetched ${candidates.length} markets (fallback).`);
     }
 
-    // 4. 查询订单簿，筛选符合条件的市场
-    console.log(`[Market Maker] Scanning ${candidates.length} candidate orderbooks...`);
+    // 4. 查询数据，筛选符合条件
+    console.log(`[Market Maker] Scanning ${candidates.length} candidates...`);
     let eligibleMarkets: any[] = [];
     let debugCount = { total: 0, noBook: 0, negRisk: 0, noBids: 0, badPrice: 0, wideSpread: 0, lowDepth: 0, pass: 0 };
 
     for (const gm of candidates) {
-      // clobTokenIds 可能是字符串格式的数组，用 getValidTokenIds 解析
-      const tokenIds = getValidTokenIds(gm.clobTokenIds);
-      if (!tokenIds) continue;
-      const yesTokenId = tokenIds[0];
-      const noTokenId = tokenIds[1];
+      // 支持两种候选类型：CLOB reward（已有 yesTokenId）和 Gamma fallback（需从 clobTokenIds 解析）
+      const yesTokenId = gm.yesTokenId || (() => {
+        const ids = getValidTokenIds(gm.clobTokenIds);
+        return ids ? ids[0] : null;
+      })();
+      if (!yesTokenId) continue;
+      const isClobReward = rewardMarkets.length > 0;
 
       try {
         await new Promise(resolve => setTimeout(resolve, 50)); // 限流
@@ -677,11 +664,15 @@ export async function runMarketMakingCycle() {
         const roundedMid = Math.round(price * 1000) / 1000;
         if (roundedMid === 0.500) { debugCount.badPrice++; continue; }
         if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
-        // 用 Gamma 的 volume 代替深度
-        const gmVolume = parseFloat(gm.volume || gm.volume24hr || '0');
-        const gmLiq = parseFloat(gm.liquidityClob || gm.liquidity || '0');
-        const depthProxy = Math.max(gmVolume, gmLiq);
-        if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
+        // 用 Gamma 的 volume 代替深度（仅 Gamma fallback 模式需要过滤）
+        if (!isClobReward) {
+          const gmVolume = parseFloat(gm.volume || gm.volume24hr || '0');
+          const gmLiq = parseFloat(gm.liquidityClob || gm.liquidity || '0');
+          const depthProxy = Math.max(gmVolume, gmLiq);
+          if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
+        } else {
+          // CLOB reward 模式：无需 volume 过滤，所有候选都有 rewards
+        }
 
         // 用 price ±2% 作为 bid/ask
         const midpoint = price;
@@ -700,23 +691,30 @@ export async function runMarketMakingCycle() {
           if (!hasRewards) { debugCount.lowDepth++; continue; }
         }
 
+        // 获取 noTokenId（两种模式）
+        const noTokenId = gm.noTokenId || (() => {
+          const ids = getValidTokenIds(gm.clobTokenIds);
+          return ids ? ids[1] : null;
+        })();
+        const volProxy = isClobReward ? 100000 : Math.max(parseFloat(gm.volume || gm.volume24hr || '0'), parseFloat(gm.liquidityClob || gm.liquidity || '0'));
+
         debugCount.pass++;
         eligibleMarkets.push({
-          condition_id: gm.conditionId || gm.id,
-          eventTitle: gm.question || gm.title || 'Unknown',
+          condition_id: gm.conditionId || gm.id || gm.condition_id,
+          eventTitle: gm.eventTitle || gm.question || gm.title || 'Unknown',
           yesTokenId,
           noTokenId,
           bestBid,
           bestAsk,
-          bidSize: depthProxy,
-          askSize: depthProxy,
+          bidSize: volProxy,
+          askSize: volProxy,
           spread: bestAsk - bestBid,
           midpoint: (bestBid + bestAsk) / 2,
           tickSize: gm.minimum_tick_size || '0.01',
           negRisk: false,
-          rewardsMinSize,
-          rewardsMaxSpread,
-          liquidityScore: Math.max(gmVolume, gmLiq), // 总深度/成交量作为流动性评分
+          rewardsMinSize: gm.rewardsMinSize || 0,
+          rewardsMaxSpread: gm.rewardsMaxSpread || 0,
+          liquidityScore: volProxy,
         });
 
       } catch (e: any) {
