@@ -573,10 +573,17 @@ export async function runMarketMakingCycle() {
     let candidates: any[] = [];
     if (rewardMarkets.length > 0) {
       console.log("[Market Maker] Building candidates from CLOB reward data...");
+      // 打印第一个 reward market 的完整结构以确认字段名
+      if (rewardMarkets[0]) {
+        const keys = Object.keys(rewardMarkets[0]);
+        const sample = JSON.stringify(rewardMarkets[0]).substring(0, 500);
+        console.log(`[Reward] Sample keys: ${keys.join(',')}`);
+        console.log(`[Reward] Sample data: ${sample}...`);
+      }
       let skipNoTokens = 0, skipNotBinary = 0;
       for (const rm of rewardMarkets) {
         if (candidates.length >= 200) break;
-        if (!rm.tokens || rm.tokens.length < 2) { skipNoTokens++; continue; }
+        if (!rm.tokens || !Array.isArray(rm.tokens) || rm.tokens.length < 2) { skipNoTokens++; continue; }
         const yesToken = rm.tokens.find((t: any) => t.outcome?.toLowerCase() === 'yes');
         const noToken = rm.tokens.find((t: any) => t.outcome?.toLowerCase() === 'no');
         if (!yesToken || !noToken) { 
