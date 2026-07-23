@@ -649,11 +649,10 @@ export async function runMarketMakingCycle() {
         const rewardsMinSize = gm.min_incentive_size || 0;
         const rewardsMaxSpread = gm.max_incentive_spread || 0;
 
-        // 必须有奖励配置（或者至少其中一项有值）
-        if (rewardsMinSize <= 0 && rewardsMaxSpread <= 0) {
-          // 没有奖励配置也放行，但记录
-          // continue;  // 可选：严格模式跳过
-        }
+        // 统计 rewards 配置情况
+        const hasRewards = rewardsMinSize > 0 && rewardsMaxSpread > 0;
+
+        if (!hasRewards) { debugCount.lowDepth++; continue; }
 
         debugCount.pass++;
         eligibleMarkets.push({
