@@ -559,42 +559,87 @@ export async function runMarketMakingCycle() {
     if (totalEquity > peakEquity) peakEquity = totalEquity;
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
 
-    // 2. 获取 Gamma 市场数据（拉 1000 个，滚动 offset）
-    console.log("[Market Maker] Fetching active markets from Gamma API...");
-    const PAGES = 10;
-    let gammaMarkets: any[] = [];
-    for (let page = 0; page < PAGES; page++) {
-      try {
-        const offset = page * 100;
-        const url = `https://gamma-api.polymarket.com/markets?limit=100&offset=${offset}&active=true&closed=false&order=volume&ascending=false`;
-        const resp = await fetch(url, {
-          agent: proxyAgent,
-          headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-        });
-        const batch = await resp.json();
-        if (Array.isArray(batch)) gammaMarkets.push(...batch);
-        if (!Array.isArray(batch) || batch.length < 100) break; // 最后一页
-        await new Promise(r => setTimeout(r, 100));
-      } catch (e: any) {
-        console.warn(`[Market Maker] Gamma page ${page} failed: ${e?.message || e}`);
-        break;
-      }
+    // 2. 获取有 Liquidity Rewards 的市场列表（优先用 SDK 的认证端点）
+    console.log("[Market Maker] Fetching reward markets from CLOB API...");
+    let rewardMarkets: any[] = [];
+    try {
+      rewardMarkets = await clobClient.getCurrentRewards();
+      console.log(`[Market Maker] Found ${rewardMarkets.length} reward markets via CLOB API.`);
+    } catch (e: any) {
+      console.warn(`[Market Maker] CLOB getCurrentRewards failed: ${e?.message}. Falling back to Gamma.`);
     }
-    console.log(`[Market Maker] Fetched ${gammaMarkets.length} markets.`);
 
-    // 3. 候选市场初筛
+    // 如果 CLOB 成功，用 condition_id 从 Gamma 补充市场数据
+    let gammaRewardMap: Map<string, any> = new Map();
+    if (rewardMarkets.length > 0) {
+      console.log("[Market Maker] Enriching reward markets with Gamma data...");
+      for (const rm of rewardMarkets) {
+        try {
+          const url = `https://gamma-api.polymarket.com/markets?condition_id=${rm.condition_id}&limit=1`;
+          const resp = await fetch(url, {
+            agent: proxyAgent,
+            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+          });
+          const gms = await resp.json();
+          if (Array.isArray(gms) && gms.length > 0) {
+            gammaRewardMap.set(rm.condition_id, gms[0]);
+          }
+          await new Promise(r => setTimeout(r, 50));
+        } catch {}
+      }
+      console.log(`[Market Maker] Enriched ${gammaRewardMap.size} reward markets.`);
+    }
+
+    // 3. 构建候选市场列表
     let candidates: any[] = [];
-    for (const gm of gammaMarkets) {
-      if (candidates.length >= 200) break; // 最多查 200 个订单簿
-      if (!gm.active || gm.closed || !gm.clobTokenIds) continue;
-      // 双重 negRisk 检查（Gamma 可能用 negRisk 或 neg_risk 字段名）
-      if (gm.neg_risk === true || gm.negRisk === true) continue;
-      // 只接受严格二元市场（outcomes = ["Yes", "No"]）
-      try {
-        const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
-        if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') continue;
-      } catch { continue; }
-      candidates.push(gm);
+    if (rewardMarkets.length > 0) {
+      for (const rm of rewardMarkets) {
+        if (candidates.length >= 200) break;
+        const gm = gammaRewardMap.get(rm.condition_id);
+        if (!gm || !gm.active || gm.closed || !gm.clobTokenIds) continue;
+        if (gm.neg_risk === true || gm.negRisk === true) continue;
+        // 只接受严格二元市场
+        try {
+          const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
+          if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') continue;
+        } catch { continue; }
+        candidates.push({ ...gm, rewardsMinSize: rm.rewards_min_size, rewardsMaxSpread: rm.rewards_max_spread });
+      }
+    } else {
+      // 降级：从 Gamma 所有市场扫描
+      console.log("[Market Maker] Fetching active markets from Gamma API (fallback)...");
+      const PAGES = 10;
+      for (let page = 0; page < PAGES; page++) {
+        try {
+          const offset = page * 100;
+          const url = `https://gamma-api.polymarket.com/markets?limit=100&offset=${offset}&active=true&closed=false&order=volume&ascending=false`;
+          const resp = await fetch(url, {
+            agent: proxyAgent,
+            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+          });
+          const batch = await resp.json();
+          if (Array.isArray(batch)) {
+            for (const gm of batch) {
+              if (candidates.length >= 200) break;
+              if (!gm.active || gm.closed || !gm.clobTokenIds) continue;
+              if (gm.neg_risk === true || gm.negRisk === true) continue;
+              try {
+                const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
+                if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') continue;
+              } catch { continue; }
+              // 放弃 reward 过滤（Gamma 不返回 reward 数据）
+              // 这里直接把 market 加入候选，后面通过 price + volume 过滤
+              candidates.push(gm);
+            }
+          }
+          if (!Array.isArray(batch) || batch.length < 100) break;
+          await new Promise(r => setTimeout(r, 100));
+        } catch (e: any) {
+          console.warn(`[Market Maker] Gamma page ${page} failed: ${e?.message || e}`);
+          break;
+        }
+      }
+      console.log(`[Market Maker] Fetched ${candidates.length} markets (fallback).`);
     }
 
     // 4. 查询订单簿，筛选符合条件的市场
@@ -649,10 +694,11 @@ export async function runMarketMakingCycle() {
         const rewardsMinSize = gm.min_incentive_size || 0;
         const rewardsMaxSpread = gm.max_incentive_spread || 0;
 
-        // 统计 rewards 配置情况
-        const hasRewards = rewardsMinSize > 0 && rewardsMaxSpread > 0;
-
-        if (!hasRewards) { debugCount.lowDepth++; continue; }
+        // 只在 CLOB reward 模式下过滤 rewards（fallback 模式不用，因为 Gamma 不返回该数据）
+        if (rewardMarkets.length > 0) {
+          const hasRewards = (gm.rewardsMinSize || 0) > 0 && (gm.rewardsMaxSpread || 0) > 0;
+          if (!hasRewards) { debugCount.lowDepth++; continue; }
+        }
 
         debugCount.pass++;
         eligibleMarkets.push({
