@@ -566,7 +566,7 @@ export async function runMarketMakingCycle() {
     for (let page = 0; page < PAGES; page++) {
       try {
         const offset = page * 100;
-        const url = `https://gamma-api.polymarket.com/markets?limit=100&offset=${offset}&active=true&closed=false`;
+        const url = `https://gamma-api.polymarket.com/markets?limit=100&offset=${offset}&active=true&closed=false&order=volume_24hr&ascending=false`;
         const resp = await fetch(url, {
           agent: proxyAgent,
           headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
