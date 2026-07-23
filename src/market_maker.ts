@@ -559,14 +559,14 @@ export async function runMarketMakingCycle() {
     if (totalEquity > peakEquity) peakEquity = totalEquity;
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL}`);
 
-    // 2. 获取 Gamma 市场数据（拉 500 个，滚动 offset）
+    // 2. 获取 Gamma 市场数据（拉 1000 个，滚动 offset）
     console.log("[Market Maker] Fetching active markets from Gamma API...");
-    const PAGES = 5;
+    const PAGES = 10;
     let gammaMarkets: any[] = [];
     for (let page = 0; page < PAGES; page++) {
       try {
         const offset = page * 100;
-        const url = `https://gamma-api.polymarket.com/markets?limit=100&offset=${offset}&active=true&closed=false&order=volume_24hr&ascending=false`;
+        const url = `https://gamma-api.polymarket.com/markets?limit=100&offset=${offset}&active=true&closed=false&order=volume&ascending=false`;
         const resp = await fetch(url, {
           agent: proxyAgent,
           headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
