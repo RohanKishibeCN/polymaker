@@ -46,7 +46,7 @@ export const config = {
     spreadFromMidpoint: (spreadFromMidEnv && spreadFromMidEnv > 0 ? spreadFromMidEnv : 0.02),
     maxPositionCount: 5,
     initialCapital: (initialCapitalEnv && initialCapitalEnv > 0 ? initialCapitalEnv : 500),
-    reserveCashUsdc: (reserveCashUsdcEnv && reserveCashUsdcEnv > 0 ? reserveCashUsdcEnv : 20),
+    reserveCashUsdc: (reserveCashUsdcEnv && reserveCashUsdcEnv > 0 ? reserveCashUsdcEnv : 10),
   },
 };
 

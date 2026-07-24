@@ -604,7 +604,17 @@ export async function runMarketMakingCycle() {
     if (rewardMarkets.length > 0) {
       console.log("[Market Maker] Building candidates from CLOB reward data...");
       // MarketReward 不返回 tokens，只有 condition_id，需从 Gamma 补市场数据
-      const topRewardMarkets = rewardMarkets.slice(0, 200);
+      // 先排序：按 reward 性价比排序，让高收益低门槛的市场排前面
+      const sortedRewards = rewardMarkets
+        .filter((rm: any) => rm.rewards_min_size > 0 && rm.total_daily_rate > 0)
+        .sort((a: any, b: any) => {
+          // 按 daily_rate / min_shares 排序（每 share 日均收益）
+          const aRatio = (a.total_daily_rate || 0) / Math.max(1, a.rewards_min_size || 1);
+          const bRatio = (b.total_daily_rate || 0) / Math.max(1, b.rewards_min_size || 1);
+          return bRatio - aRatio;
+        });
+      console.log(`[Market Maker] Top reward: ${sortedRewards[0]?.question || '?'} (${((sortedRewards[0]?.total_daily_rate || 0) / Math.max(1, sortedRewards[0]?.rewards_min_size || 1)).toFixed(2)}/share/day)`);
+      const topRewardMarkets = sortedRewards.slice(0, 200);
       let skipNoGamma = 0;
       for (const rm of topRewardMarkets) {
         try {
