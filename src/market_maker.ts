@@ -714,14 +714,17 @@ export async function runMarketMakingCycle() {
         debugCount.total++;
 
         // 跳过 midpoint 四舍五入后为 0.500 的市场（无最近成交或成交价失真）
-        const roundedMid = Math.round(price * 1000) / 1000;
-        if (roundedMid === 0.500) { debugCount.badPrice++; continue; }
-        if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
-        // 用 Gamma 的 volume 代替深度
-         const gmVolume = parseFloat(gm.volume || (gm as any).volume24hr || '0');
-         const gmLiq = parseFloat(gm.liquidity || (gm as any).liquidityClob || '0');
-         const depthProxy = Math.max(gmVolume, gmLiq);
-         if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
+          const roundedMid = Math.round(price * 1000) / 1000;
+          if (roundedMid === 0.500) { debugCount.badPrice++; continue; }
+          if (price <= 0 || price >= 1) { debugCount.badPrice++; continue; }
+          // CLOB reward 模式：无需 volume 过滤，reward 数据本身就代表可参与
+          // Gamma fallback 模式：用 volume 过滤以保证最低流动性
+          if (!isClobReward) {
+            const gmVolume = parseFloat(gm.volume || (gm as any).volume24hr || '0');
+            const gmLiq = parseFloat(gm.liquidity || (gm as any).liquidityClob || '0');
+            const depthProxy = Math.max(gmVolume, gmLiq);
+            if (depthProxy < config.bot.minBidAskDepth) { debugCount.lowDepth++; continue; }
+          }
 
         // 用 price ±2% 作为 bid/ask
         const midpoint = price;
@@ -779,13 +782,12 @@ export async function runMarketMakingCycle() {
 
     console.log(`[Market Maker] Filter debug: total=${debugCount.total} noBook=${debugCount.noBook} negRisk=${debugCount.negRisk} noBids=${debugCount.noBids} badPrice=${debugCount.badPrice} wideSpread=${debugCount.wideSpread} lowDepth=${debugCount.lowDepth} pass=${debugCount.pass}`);
 
-    // 5. 排序：按 expected daily reward 排序（用 total_daily_rate 作为代理）
-    // 实际得分还取决于竞争激烈程度，但 total_daily_rate 是最好的可用代理
-    // 同时也给 rewards_min_size 小的市场加权（更容易满足）
+    // 5. 排序：按 reward 性价比（日奖励 ÷ min_shares ÷ midpoint，即每 $1 资金能赚多少）
+    // 资金小的市场排名更高，更容易满足 min shares
     eligibleMarkets.sort((a, b) => {
-      const aHasRewards = a.rewardsMinSize > 0 && a.rewardsMaxSpread > 0 ? 1 : 0;
-      const bHasRewards = b.rewardsMinSize > 0 && b.rewardsMaxSpread > 0 ? 1 : 0;
-      if (bHasRewards !== aHasRewards) return bHasRewards - aHasRewards;
+      const aROI = (a.total_daily_rate || 0) / Math.max(1, a.rewardsMinSize * a.midpoint);
+      const bROI = (b.total_daily_rate || 0) / Math.max(1, b.rewardsMinSize * b.midpoint);
+      if (bROI !== aROI) return bROI - aROI;
       return (b.total_daily_rate || 0) - (a.total_daily_rate || 0);
     });
 
