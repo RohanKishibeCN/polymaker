@@ -565,9 +565,9 @@ export async function runMarketMakingCycle() {
       let clearedCount = 0;
       for (const [tokenId, pos] of Object.entries(inventory)) {
         const posValue = (pos.yes || 0) * (pos.avgCost || 0.5);
+        // 小仓（<$15）立即按 0.01 市价清；中仓（$15~$50）按 0.02 限价挂着等
         if (posValue > 0 && posValue < 15) {
           try {
-            // 市价卖出 — 用 0.01 作为限价（比任何 bid 都低，确保立即成交）
             const result = await clobClient.createAndPostOrder(
               { tokenID: tokenId, price: 0.01, size: pos.yes, side: Side.SELL },
               { tickSize: '0.01', negRisk: false, postOnly: false },
@@ -578,6 +578,16 @@ export async function runMarketMakingCycle() {
               clearedCount++;
               delete inventory[tokenId];
             }
+          } catch {}
+        } else if (posValue >= 15 && posValue < 50) {
+          // 中仓用 0.02 挂限价单，不着急清，等对手来买
+          try {
+            await clobClient.createAndPostOrder(
+              { tokenID: tokenId, price: 0.02, size: pos.yes, side: Side.SELL },
+              { tickSize: '0.01', negRisk: false, postOnly: true },
+              "GTC"
+            );
+            console.log(`[Market Maker] Listed sell for ${tokenId.substring(0,10)} @0.02 (value=$${posValue.toFixed(2)})`);
           } catch {}
         }
       }
