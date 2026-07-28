@@ -154,11 +154,18 @@ export function startHeartbeat() {
 // 注意：VPS 重启后会清零。如果要严格风控，应该存在本地 SQLite 中
 const inventory: Record<string, { yes: number, no: number, avgCost?: number, pnlPct?: number }> = {};
 
-async function createAndPostOrderWithFeeFallback(orderPayload: any, tickSize: string, negRisk: boolean) {
+async function createAndPostOrderWithFeeFallback(orderPayload: any, tickSize: string, negRisk: boolean, postOnly = true) {
   try {
-    // postOnly 防止吃单：如果价格会 cross spread，拒绝而不是执行
-    return await clobClient.createAndPostOrder(orderPayload, { tickSize, negRisk, postOnly: true }, "GTC");
+    return await clobClient.createAndPostOrder(orderPayload, { tickSize, negRisk, postOnly }, "GTC");
   } catch (e: any) {
+    // "order manager not ready" 通常是 postOnly 校验问题，降级到 postOnly: false
+    if (postOnly && (e?.message?.includes('order manager not ready') || e?.response?.data?.error_msg?.includes('order manager not ready'))) {
+      try {
+        return await clobClient.createAndPostOrder(orderPayload, { tickSize, negRisk, postOnly: false }, "GTC");
+      } catch (e2: any) {
+        return { error: e2.message };
+      }
+    }
     return { error: e.message };
   }
 }
@@ -903,16 +910,16 @@ export async function runMarketMakingCycle() {
           console.log(`     [!] Midpoint ${midpoint.toFixed(3)} requires double-sided quoting, but only ${m.heldYesShares || 0} YES held (need ${m.rewardsMinSize || 10})`);
         }
 
-        // 挂 Buy（买入 YES）— 重试最多 3 次
+        // 挂 Buy（买入 YES）— 重试最多 5 次，间隔 2s
         if (currentCash > reserveCashUsdc + buyCost) {
           let buyRes = null;
-          for (let attempt = 0; attempt < 3; attempt++) {
+          for (let attempt = 0; attempt < 5; attempt++) {
             buyRes = await createAndPostOrderWithFeeFallback(
               { tokenID: m.yesTokenId, price: bidPrice, side: Side.BUY, size: effectiveBuySize },
               tickSize, false
             );
             if (buyRes && !(buyRes.error || buyRes.errorMessage)) break;
-            if (buyRes?.error?.includes('order manager not ready')) await new Promise(r => setTimeout(r, 500));
+            if (buyRes?.error?.includes('order manager not ready')) await new Promise(r => setTimeout(r, 2000));
             else break;
           }
           if (buyRes && !(buyRes.error || buyRes.errorMessage)) {
@@ -923,19 +930,19 @@ export async function runMarketMakingCycle() {
           }
         }
 
-        // 挂 Sell（卖出 YES）— 重试最多 3 次
-        if (canSell) {
-          const askPrice = Math.min(0.99, roundToTickSize(midpoint + halfBand, tickSize));
-          const sellSize = Math.min(effectiveBuySize, m.heldYesShares);
-          let sellRes = null;
-          for (let attempt = 0; attempt < 3; attempt++) {
-            sellRes = await createAndPostOrderWithFeeFallback(
-              { tokenID: m.yesTokenId, price: askPrice, side: Side.SELL, size: sellSize },
-              tickSize, false
-            );
-            if (sellRes && !(sellRes.error || sellRes.errorMessage)) break;
-            if (sellRes?.error?.includes('order manager not ready')) await new Promise(r => setTimeout(r, 500));
-            else break;
+        // 挂 Sell（卖出 YES）— 重试最多 5 次，间隔 2s
+         if (canSell) {
+           const askPrice = Math.min(0.99, roundToTickSize(midpoint + halfBand, tickSize));
+           const sellSize = Math.min(effectiveBuySize, m.heldYesShares);
+           let sellRes = null;
+           for (let attempt = 0; attempt < 5; attempt++) {
+             sellRes = await createAndPostOrderWithFeeFallback(
+               { tokenID: m.yesTokenId, price: askPrice, side: Side.SELL, size: sellSize },
+               tickSize, false
+             );
+             if (sellRes && !(sellRes.error || sellRes.errorMessage)) break;
+             if (sellRes?.error?.includes('order manager not ready')) await new Promise(r => setTimeout(r, 2000));
+             else break;
           }
           if (sellRes && !(sellRes.error || sellRes.errorMessage)) {
             console.log(`     [+] Placed SELL YES @${askPrice} x${sellSize}`);
