@@ -237,6 +237,20 @@ function getValidTokenIds(rawTokenId: any): [string, string] | null {
   return null;
 }
 
+// 去重（同一个 event 只保留一个最高 ROI 的市场）
+function dedupeMarkets(markets: any[]): any[] {
+  const seen = new Set<string>();
+  const result: any[] = [];
+  for (const m of markets) {
+    const key = m.condition_id;
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(m);
+    }
+  }
+  return result;
+}
+
 // 记录每天是否已经推送过总结
 let lastSummaryDateStr = '';
 
@@ -811,8 +825,11 @@ export async function runMarketMakingCycle() {
       return (b.total_daily_rate || 0) - (a.total_daily_rate || 0);
     });
 
-    const selectedMarkets = eligibleMarkets.slice(0, config.bot.maxMarkets);
-    console.log(`[Market Maker] Selected ${selectedMarkets.length} reward markets (from ${eligibleMarkets.length} eligible).`);
+    const selectedMarkets = dedupeMarkets(eligibleMarkets).slice(0, config.bot.maxMarkets);
+      console.log(`[Market Maker] Selected ${selectedMarkets.length} unique reward markets (from ${eligibleMarkets.length} eligible).`);
+      for (const sm of selectedMarkets) {
+        console.log(`     - ${sm.eventTitle.substring(0, 40)} ($${sm.total_daily_rate || 0}/day, min ${sm.rewardsMinSize} @${(sm.rewardsMaxSpread || 0)}¢)`);
+      }
 
     if (selectedMarkets.length === 0) {
       console.log(`[Market Maker] No eligible markets found. Waiting for next interval.`);
@@ -861,6 +878,9 @@ export async function runMarketMakingCycle() {
         if (effectiveBuySize < 1) {
           console.log(`     [${m.eventTitle.substring(0, 30)}] Skipped: insufficient cash (cash=${currentCash.toFixed(2)}, reserve=${reserveCashUsdc}).`);
           continue;
+        }
+        if (effectiveBuySize < quoteSize) {
+          console.log(`     [Budget] cash=${currentCash.toFixed(2)} reserve=${reserveCashUsdc} available=${cashAvailable.toFixed(2)} need=${buyCost.toFixed(2)} → size=${effectiveBuySize} (reduced from ${quoteSize})`);
         }
 
         // S(v,s) score for the reward
