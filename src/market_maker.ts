@@ -242,11 +242,13 @@ function dedupeMarkets(markets: any[]): any[] {
   const seen = new Set<string>();
   const result: any[] = [];
   for (const m of markets) {
-    const key = m.condition_id;
-    if (!seen.has(key)) {
-      seen.add(key);
-      result.push(m);
-    }
+    // 条件 ID 不同但标题相同的视为同一个市场
+    const key = m.condition_id || m.eventTitle || '';
+    const titleKey = m.eventTitle || '';
+    if (seen.has(key) || seen.has(titleKey)) continue;
+    seen.add(key);
+    seen.add(titleKey);
+    result.push(m);
   }
   return result;
 }
@@ -620,7 +622,7 @@ export async function runMarketMakingCycle() {
             if (gm.neg_risk === true || gm.negRisk === true) return null;
             try {
               const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
-              if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') return null;
+              if (outcomes.length !== 2) return null;
             } catch { return null; }
             const tokenIds = getValidTokenIds(gm.clobTokenIds);
             if (!tokenIds) return null;
