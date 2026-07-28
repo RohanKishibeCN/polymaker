@@ -588,43 +588,46 @@ export async function runMarketMakingCycle() {
         });
       console.log(`[Market Maker] Top reward: ${sortedRewards[0]?.question || '?'} (${((sortedRewards[0]?.total_daily_rate || 0) / Math.max(1, sortedRewards[0]?.rewards_min_size || 1)).toFixed(2)}/share/day)`);
       const topRewardMarkets = sortedRewards.slice(0, 200);
+      // 并行拉 Gamma 数据（每次 20 并发，大幅降低等待时间）
+      const BATCH = 20;
       let skipNoGamma = 0;
-      for (const rm of topRewardMarkets) {
-        try {
-          const url = `https://gamma-api.polymarket.com/markets?condition_id=${rm.condition_id}&limit=1`;
-          const resp = await fetch(url, {
-            agent: proxyAgent,
-            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-          });
-          const gms = await resp.json();
-          const gm = Array.isArray(gms) ? gms[0] : null;
-          if (!gm || !gm.active || gm.closed || !gm.clobTokenIds) { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
-          if (gm.neg_risk === true || gm.negRisk === true) { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
-          // 只接受二元 Yes/No 市场
+      for (let i = 0; i < topRewardMarkets.length; i += BATCH) {
+        const batch = topRewardMarkets.slice(i, i + BATCH);
+        const results = await Promise.all(batch.map(async (rm: any) => {
           try {
-            const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
-            if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
-          } catch { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
-          const tokenIds = getValidTokenIds(gm.clobTokenIds);
-          if (!tokenIds) { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
-          const heldShares = (inventory[tokenIds[0]] as any)?.yes || 0;
-          candidates.push({
-            condition_id: rm.condition_id,
-            eventTitle: gm.question || gm.title || 'Unknown',
-            yesTokenId: tokenIds[0],
-            noTokenId: tokenIds[1],
-            midpoint: 0.50,
-            rewardsMinSize: rm.rewards_min_size ?? 0,
-            rewardsMaxSpread: rm.rewards_max_spread ?? 0,
-            total_daily_rate: rm.total_daily_rate || rm.native_daily_rate || 0,
-            volume: parseFloat(gm.volume || gm.volume24hr || '0'),
-            liquidity: parseFloat(gm.liquidityClob || gm.liquidity || '0'),
-            heldYesShares: heldShares,
-          });
-          await new Promise(r => setTimeout(r, 30));
-        } catch {
-          skipNoGamma++;
-          await new Promise(r => setTimeout(r, 30));
+            const url = `https://gamma-api.polymarket.com/markets?condition_id=${rm.condition_id}&limit=1`;
+            const resp = await fetch(url, {
+              agent: proxyAgent,
+              headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+            });
+            const gms = await resp.json();
+            const gm = Array.isArray(gms) ? gms[0] : null;
+            if (!gm || !gm.active || gm.closed || !gm.clobTokenIds) return null;
+            if (gm.neg_risk === true || gm.negRisk === true) return null;
+            try {
+              const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
+              if (outcomes.length !== 2 || outcomes[0] !== 'Yes' || outcomes[1] !== 'No') return null;
+            } catch { return null; }
+            const tokenIds = getValidTokenIds(gm.clobTokenIds);
+            if (!tokenIds) return null;
+            const heldShares = (inventory[tokenIds[0]] as any)?.yes || 0;
+            return {
+              condition_id: rm.condition_id,
+              eventTitle: gm.question || gm.title || 'Unknown',
+              yesTokenId: tokenIds[0],
+              noTokenId: tokenIds[1],
+              midpoint: 0.50,
+              rewardsMinSize: rm.rewards_min_size ?? 0,
+              rewardsMaxSpread: rm.rewards_max_spread ?? 0,
+              total_daily_rate: rm.total_daily_rate || rm.native_daily_rate || 0,
+              volume: parseFloat(gm.volume || gm.volume24hr || '0'),
+              liquidity: parseFloat(gm.liquidityClob || gm.liquidity || '0'),
+              heldYesShares: heldShares,
+            };
+          } catch { return null; }
+        }));
+        for (const r of results) {
+          if (r) candidates.push(r); else skipNoGamma++;
         }
       }
       console.log(`[Market Maker] Built ${candidates.length} candidates from CLOB rewards (${skipNoGamma} skipped via Gamma).`);
@@ -850,18 +853,19 @@ export async function runMarketMakingCycle() {
 
         // 奖励要求的 min size
         const quoteSize = Math.max(10, m.rewardsMinSize || 10);
-        // 预算保护：确保有足够现金买入
-        const cashAvailable = Math.max(0, cashBalance - reserveCashUsdc);
+        // 每单前从链上实时读余额（避免本地变量误差）
+        const currentCash = await getCashBalance();
+        const cashAvailable = Math.max(0, currentCash - reserveCashUsdc);
         const buyCost = quoteSize * bidPrice;
         const effectiveBuySize = buyCost > cashAvailable ? Math.floor(cashAvailable / bidPrice) : quoteSize;
         if (effectiveBuySize < 1) {
-          console.log(`     [${m.eventTitle.substring(0, 30)}] Skipped: insufficient cash (cash=${cashBalance.toFixed(2)}, reserve=${reserveCashUsdc}).`);
+          console.log(`     [${m.eventTitle.substring(0, 30)}] Skipped: insufficient cash (cash=${currentCash.toFixed(2)}, reserve=${reserveCashUsdc}).`);
           continue;
         }
 
         // S(v,s) score for the reward
-        const sCents = maxSpreadCents / 2; // our spread from midpoint = half-band
-        const score = ((maxSpreadCents - sCents) / maxSpreadCents) ** 2;
+        const sCents = Math.abs(midpoint - bidPrice) * 100; // actual spread in cents
+        const score = sCents < maxSpreadCents ? ((maxSpreadCents - sCents) / maxSpreadCents) ** 2 : 0;
         const estDailyReward = (m.total_daily_rate || 0) * score * (effectiveBuySize / 1000); // rough estimate
 
         console.log(`\n  -> ${m.eventTitle}`);
@@ -878,7 +882,7 @@ export async function runMarketMakingCycle() {
         }
 
         // 挂 Buy（买入 YES）
-        if (cashBalance > reserveCashUsdc + buyCost) {
+        if (currentCash > reserveCashUsdc + buyCost) {
           const buyRes = await createAndPostOrderWithFeeFallback(
             { tokenID: m.yesTokenId, price: bidPrice, side: Side.BUY, size: effectiveBuySize },
             tickSize, false
@@ -886,7 +890,6 @@ export async function runMarketMakingCycle() {
           if (buyRes && !(buyRes.error || buyRes.errorMessage)) {
             console.log(`     [+] Placed BUY YES @${bidPrice} x${effectiveBuySize}`);
             dailyStats.ordersPosted++;
-            cashBalance -= buyCost;
           } else {
             console.log(`     [!] BUY failed: ${buyRes?.error || buyRes?.errorMessage || 'unknown'}`);
           }
@@ -914,7 +917,32 @@ export async function runMarketMakingCycle() {
       }
     }
 
-    // 8. 收尾
+    // 8. 验证收益：检查最近 24h 是否有 REWARD 活动到账
+    try {
+      const activityUrl = `https://data-api.polymarket.com/activity?user=${config.polymarket.funderAddress}&type=REWARD&limit=20`;
+      const activityResp = await fetch(activityUrl, {
+        headers: { 'Accept': 'application/json' }
+      });
+      const activity = await activityResp.json();
+      if (Array.isArray(activity) && activity.length > 0) {
+        let totalRewards = 0;
+        for (const a of activity) {
+          const rewardVal = parseFloat(a.size || a.amount || '0');
+          if (Number.isFinite(rewardVal)) totalRewards += rewardVal;
+        }
+        if (totalRewards > 0) {
+          console.log(`[Market Maker] ✅ Recent rewards detected: +${totalRewards.toFixed(2)} PUSD`);
+        } else {
+          console.log(`[Market Maker] ⚠️ No rewards detected yet. Orders are earning $0 todat.`);
+        }
+      } else {
+        console.log(`[Market Maker] ⚠️ No rewards detected yet. Orders may not be scoring.`);
+      }
+    } catch (e: any) {
+      console.warn(`[Market Maker] Reward check failed: ${e.message}`);
+    }
+
+    // 9. 收尾
     console.log(`[Market Maker] Cycle complete. Orders posted: ${dailyStats.ordersPosted}. Waiting for next interval.`);
 
   } catch (error) {
