@@ -603,8 +603,8 @@ export async function runMarketMakingCycle() {
           return bRatio - aRatio;
         });
       console.log(`[Market Maker] Top reward: ${sortedRewards[0]?.question || '?'} (${((sortedRewards[0]?.total_daily_rate || 0) / Math.max(1, sortedRewards[0]?.rewards_min_size || 1)).toFixed(2)}/share/day)`);
-      const topRewardMarkets = sortedRewards.slice(0, 200);
-      // 并行拉 Gamma 数据（每次 20 并发，大幅降低等待时间）
+      const topRewardMarkets = sortedRewards.slice(0, 500);
+      // 并行拉 Gamma 数据（每次 20 并发）
       const BATCH = 20;
       let skipNoGamma = 0;
       for (let i = 0; i < topRewardMarkets.length; i += BATCH) {
