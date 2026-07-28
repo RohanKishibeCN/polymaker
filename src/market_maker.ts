@@ -559,45 +559,8 @@ export async function runMarketMakingCycle() {
     if (totalEquity > peakEquity) peakEquity = totalEquity;
     console.log(`[Market Maker] Current Equity: ~${totalEquity.toFixed(2)} ${COLLATERAL_SYMBOL} | Cash: ${cashBalance.toFixed(2)}`);
 
-    // 1b. 清理小死仓（价值 < $15 的仓位直接市价卖出腾出资金）
-    if (cashBalance < config.bot.maxMarkets * 20) {
-      console.log("[Market Maker] Cash low, attempting to clear small dead positions...");
-      let clearedCount = 0;
-      for (const [tokenId, pos] of Object.entries(inventory)) {
-        const posValue = (pos.yes || 0) * (pos.avgCost || 0.5);
-        // 小仓（<$15）立即按 0.01 市价清；中仓（$15~$50）按 0.02 限价挂着等
-        if (posValue > 0 && posValue < 15) {
-          try {
-            const result = await clobClient.createAndPostOrder(
-              { tokenID: tokenId, price: 0.01, size: pos.yes, side: Side.SELL },
-              { tickSize: '0.01', negRisk: false, postOnly: false },
-              "GTC"
-            );
-            if (result && !result.error) {
-              console.log(`[Market Maker] Cleared position ${tokenId.substring(0,10)} value=$${posValue.toFixed(2)}`);
-              clearedCount++;
-              delete inventory[tokenId];
-            }
-          } catch {}
-        } else if (posValue >= 15 && posValue < 50) {
-          // 中仓用 0.02 挂限价单，不着急清，等对手来买
-          try {
-            await clobClient.createAndPostOrder(
-              { tokenID: tokenId, price: 0.02, size: pos.yes, side: Side.SELL },
-              { tickSize: '0.01', negRisk: false, postOnly: true },
-              "GTC"
-            );
-            console.log(`[Market Maker] Listed sell for ${tokenId.substring(0,10)} @0.02 (value=$${posValue.toFixed(2)})`);
-          } catch {}
-        }
-      }
-      if (clearedCount > 0) {
-        cashBalance = await getCashBalance(); // 重新拉余额
-        console.log(`[Market Maker] Cleared ${clearedCount} positions. New cash: ${cashBalance.toFixed(2)}`);
-      } else {
-        console.log(`[Market Maker] No small positions to clear.`);
-      }
-    }
+    // 1b. 记录持仓 token IDs 用于后续 reward 交叉匹配
+    const inventoryTokenIds = new Set(Object.keys(inventory));
 
     // 2. 获取有 Liquidity Rewards 的市场列表（优先用 SDK 的认证端点）
     console.log("[Market Maker] Fetching reward markets from CLOB API...");
@@ -644,6 +607,7 @@ export async function runMarketMakingCycle() {
           } catch { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
           const tokenIds = getValidTokenIds(gm.clobTokenIds);
           if (!tokenIds) { skipNoGamma++; await new Promise(r => setTimeout(r, 30)); continue; }
+          const heldShares = (inventory[tokenIds[0]] as any)?.yes || 0;
           candidates.push({
             condition_id: rm.condition_id,
             eventTitle: gm.question || gm.title || 'Unknown',
@@ -655,6 +619,7 @@ export async function runMarketMakingCycle() {
             total_daily_rate: rm.total_daily_rate || rm.native_daily_rate || 0,
             volume: parseFloat(gm.volume || gm.volume24hr || '0'),
             liquidity: parseFloat(gm.liquidityClob || gm.liquidity || '0'),
+            heldYesShares: heldShares,
           });
           await new Promise(r => setTimeout(r, 30));
         } catch {
@@ -663,6 +628,32 @@ export async function runMarketMakingCycle() {
         }
       }
       console.log(`[Market Maker] Built ${candidates.length} candidates from CLOB rewards (${skipNoGamma} skipped via Gamma).`);
+
+      // 3. 自动卖出非 reward 持仓（释放现金做 reward）
+      const rewardTokenIds = new Set(candidates.map((c: any) => c.yesTokenId));
+      let soldNonReward = 0;
+      for (const [tokenId, pos] of Object.entries(inventory)) {
+        const posYes = (pos as any).yes || 0;
+        if (posYes > 0 && !rewardTokenIds.has(tokenId)) {
+          try {
+            // 用 midpoint 的 10% 作为卖出价（比贱卖好）
+            const sellPrice = Math.max(0.02, roundToTickSize(0.50 * 0.1, '0.01'));
+            const result = await clobClient.createAndPostOrder(
+              { tokenID: tokenId, price: sellPrice, size: posYes, side: Side.SELL },
+              { tickSize: '0.01', negRisk: false, postOnly: true },
+              "GTC"
+            );
+            if (result && !result.error) {
+              console.log(`[Market Maker] Listed non-reward position ${tokenId.substring(0,10)} @${sellPrice} x${posYes}`);
+              soldNonReward++;
+            }
+          } catch {}
+        }
+      }
+      if (soldNonReward > 0) {
+        cashBalance = await getCashBalance();
+        console.log(`[Market Maker] Sold ${soldNonReward} non-reward positions. New cash: ${cashBalance.toFixed(2)}`);
+      }
     } else {
       // 降级：从 Gamma 所有市场扫描
       console.log("[Market Maker] Fetching active markets from Gamma API (fallback)...");
@@ -791,6 +782,7 @@ export async function runMarketMakingCycle() {
             rewardsMaxSpread: gm.rewardsMaxSpread || 0,
             total_daily_rate: gm.total_daily_rate || 0,
             liquidityScore: volProxy,
+            heldYesShares: gm.heldYesShares || 0,
           });
 
       } catch (e: any) {
@@ -805,6 +797,10 @@ export async function runMarketMakingCycle() {
     // 5. 排序：按 reward 性价比（日奖励 ÷ min_shares ÷ midpoint，即每 $1 资金能赚多少）
     // 资金小的市场排名更高，更容易满足 min shares
     eligibleMarkets.sort((a, b) => {
+      // 优先持仓市场（已有股票可以直接双面报价）
+      if ((b.heldYesShares || 0) > 0 && (a.heldYesShares || 0) === 0) return 1;
+      if ((a.heldYesShares || 0) > 0 && (b.heldYesShares || 0) === 0) return -1;
+      // 然后按 ROI
       const aROI = (a.total_daily_rate || 0) / Math.max(1, a.rewardsMinSize * a.midpoint);
       const bROI = (b.total_daily_rate || 0) / Math.max(1, b.rewardsMinSize * b.midpoint);
       if (bROI !== aROI) return bROI - aROI;
@@ -869,22 +865,46 @@ export async function runMarketMakingCycle() {
 
         console.log(`\n  -> ${m.eventTitle}`);
         console.log(`     Midpoint: ${midpoint.toFixed(3)} | Rewards: $${m.total_daily_rate || 0}/day | Est: ~$${estDailyReward.toFixed(4)}/day`);
-        console.log(`     Bid: ${bidPrice} x${effectiveBuySize} | Spread: ${sCents.toFixed(1)}¢ (${(score*100).toFixed(0)}% score)`);
+        console.log(`     Bid: ${bidPrice} x${effectiveBuySize} | Held: ${m.heldYesShares || 0} YES | Spread: ${sCents.toFixed(1)}¢ (${(score*100).toFixed(0)}% score)`);
+
+        // 检查是否需要双面报价
+        const needsBothSides = midpoint < 0.10 || midpoint > 0.90;
+        const canSell = (m.heldYesShares || 0) >= (m.rewardsMinSize || 10);
+
+        // 如果 needsBothSides 但不能卖，跳过一个警告
+        if (needsBothSides && !canSell) {
+          console.log(`     [!] Midpoint ${midpoint.toFixed(3)} requires double-sided quoting, but only ${m.heldYesShares || 0} YES held (need ${m.rewardsMinSize || 10})`);
+        }
 
         // 挂 Buy（买入 YES）
-        const buyPayload: any = {
-          tokenID: m.yesTokenId,
-          price: bidPrice,
-          side: Side.BUY,
-          size: effectiveBuySize,
-        };
-        const buyRes = await createAndPostOrderWithFeeFallback(buyPayload, tickSize, false);
-        if (buyRes && !(buyRes.error || buyRes.errorMessage)) {
-          console.log(`     [+] Placed BUY YES @${bidPrice} x${effectiveBuySize}`);
-          dailyStats.ordersPosted++;
-          cashBalance -= buyCost;
-        } else {
-          console.log(`     [!] BUY failed: ${buyRes?.error || buyRes?.errorMessage || 'unknown'}`);
+        if (cashBalance > reserveCashUsdc + buyCost) {
+          const buyRes = await createAndPostOrderWithFeeFallback(
+            { tokenID: m.yesTokenId, price: bidPrice, side: Side.BUY, size: effectiveBuySize },
+            tickSize, false
+          );
+          if (buyRes && !(buyRes.error || buyRes.errorMessage)) {
+            console.log(`     [+] Placed BUY YES @${bidPrice} x${effectiveBuySize}`);
+            dailyStats.ordersPosted++;
+            cashBalance -= buyCost;
+          } else {
+            console.log(`     [!] BUY failed: ${buyRes?.error || buyRes?.errorMessage || 'unknown'}`);
+          }
+        }
+
+        // 挂 Sell（卖出 YES）— 如果有足够持仓
+        if (canSell) {
+          const askPrice = Math.min(0.99, roundToTickSize(midpoint + halfBand, tickSize));
+          const sellSize = Math.min(effectiveBuySize, m.heldYesShares);
+          const sellRes = await createAndPostOrderWithFeeFallback(
+            { tokenID: m.yesTokenId, price: askPrice, side: Side.SELL, size: sellSize },
+            tickSize, false
+          );
+          if (sellRes && !(sellRes.error || sellRes.errorMessage)) {
+            console.log(`     [+] Placed SELL YES @${askPrice} x${sellSize}`);
+            dailyStats.ordersPosted++;
+          } else {
+            console.log(`     [!] SELL failed: ${sellRes?.error || sellRes?.errorMessage || 'unknown'}`);
+          }
         }
 
         await new Promise(r => setTimeout(r, 100)); // 限流
