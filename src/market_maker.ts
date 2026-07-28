@@ -903,12 +903,18 @@ export async function runMarketMakingCycle() {
           console.log(`     [!] Midpoint ${midpoint.toFixed(3)} requires double-sided quoting, but only ${m.heldYesShares || 0} YES held (need ${m.rewardsMinSize || 10})`);
         }
 
-        // 挂 Buy（买入 YES）
+        // 挂 Buy（买入 YES）— 重试最多 3 次
         if (currentCash > reserveCashUsdc + buyCost) {
-          const buyRes = await createAndPostOrderWithFeeFallback(
-            { tokenID: m.yesTokenId, price: bidPrice, side: Side.BUY, size: effectiveBuySize },
-            tickSize, false
-          );
+          let buyRes = null;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            buyRes = await createAndPostOrderWithFeeFallback(
+              { tokenID: m.yesTokenId, price: bidPrice, side: Side.BUY, size: effectiveBuySize },
+              tickSize, false
+            );
+            if (buyRes && !(buyRes.error || buyRes.errorMessage)) break;
+            if (buyRes?.error?.includes('order manager not ready')) await new Promise(r => setTimeout(r, 500));
+            else break;
+          }
           if (buyRes && !(buyRes.error || buyRes.errorMessage)) {
             console.log(`     [+] Placed BUY YES @${bidPrice} x${effectiveBuySize}`);
             dailyStats.ordersPosted++;
@@ -917,14 +923,20 @@ export async function runMarketMakingCycle() {
           }
         }
 
-        // 挂 Sell（卖出 YES）— 如果有足够持仓
+        // 挂 Sell（卖出 YES）— 重试最多 3 次
         if (canSell) {
           const askPrice = Math.min(0.99, roundToTickSize(midpoint + halfBand, tickSize));
           const sellSize = Math.min(effectiveBuySize, m.heldYesShares);
-          const sellRes = await createAndPostOrderWithFeeFallback(
-            { tokenID: m.yesTokenId, price: askPrice, side: Side.SELL, size: sellSize },
-            tickSize, false
-          );
+          let sellRes = null;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            sellRes = await createAndPostOrderWithFeeFallback(
+              { tokenID: m.yesTokenId, price: askPrice, side: Side.SELL, size: sellSize },
+              tickSize, false
+            );
+            if (sellRes && !(sellRes.error || sellRes.errorMessage)) break;
+            if (sellRes?.error?.includes('order manager not ready')) await new Promise(r => setTimeout(r, 500));
+            else break;
+          }
           if (sellRes && !(sellRes.error || sellRes.errorMessage)) {
             console.log(`     [+] Placed SELL YES @${askPrice} x${sellSize}`);
             dailyStats.ordersPosted++;
