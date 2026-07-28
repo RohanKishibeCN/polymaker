@@ -634,10 +634,11 @@ export async function runMarketMakingCycle() {
       let soldNonReward = 0;
       for (const [tokenId, pos] of Object.entries(inventory)) {
         const posYes = (pos as any).yes || 0;
-        if (posYes > 0 && !rewardTokenIds.has(tokenId)) {
-          try {
-            // 用 midpoint 的 10% 作为卖出价（比贱卖好）
-            const sellPrice = Math.max(0.02, roundToTickSize(0.50 * 0.1, '0.01'));
+          if (posYes > 0 && !rewardTokenIds.has(tokenId)) {
+            try {
+              // 用 avgCost 的 10% 作为卖出价（比贱卖好）
+              const refPrice = (pos as any).avgCost || 0.50;
+              const sellPrice = Math.max(0.02, roundToTickSize(refPrice * 0.1, '0.01'));
             const result = await clobClient.createAndPostOrder(
               { tokenID: tokenId, price: sellPrice, size: posYes, side: Side.SELL },
               { tickSize: '0.01', negRisk: false, postOnly: true },
