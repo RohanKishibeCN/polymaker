@@ -154,18 +154,11 @@ export function startHeartbeat() {
 // 注意：VPS 重启后会清零。如果要严格风控，应该存在本地 SQLite 中
 const inventory: Record<string, { yes: number, no: number, avgCost?: number, pnlPct?: number }> = {};
 
-async function createAndPostOrderWithFeeFallback(orderPayload: any, tickSize: string, negRisk: boolean, postOnly = true) {
+async function createAndPostOrderWithFeeFallback(orderPayload: any, tickSize: string, negRisk: boolean) {
+  // 不下 fallback，postOnly:true 失败就是真的失败
   try {
-    return await clobClient.createAndPostOrder(orderPayload, { tickSize, negRisk, postOnly }, "GTC");
+    return await clobClient.createAndPostOrder(orderPayload, { tickSize, negRisk, postOnly: true }, "GTC");
   } catch (e: any) {
-    // "order manager not ready" 通常是 postOnly 校验问题，降级到 postOnly: false
-    if (postOnly && (e?.message?.includes('order manager not ready') || e?.response?.data?.error_msg?.includes('order manager not ready'))) {
-      try {
-        return await clobClient.createAndPostOrder(orderPayload, { tickSize, negRisk, postOnly: false }, "GTC");
-      } catch (e2: any) {
-        return { error: e2.message };
-      }
-    }
     return { error: e.message };
   }
 }
@@ -858,7 +851,16 @@ export async function runMarketMakingCycle() {
       console.warn(`[Market Maker] Cancel orders error: ${e.message}`);
     }
 
-    // 7. 为每个市场挂单（Liquidity Rewards 优化）
+    // 7. 挂单前唤醒 order manager（解决 async pipeline 迁移后的 order manager not ready）
+    try {
+      // 发送一次心跳获取新 ID 并等待 order manager 就绪
+      const hb = await clobClient.postHeartbeat('');
+      if (hb?.heartbeat_id) heartbeatId = hb.heartbeat_id;
+      await new Promise(r => setTimeout(r, 3000));
+    } catch {}
+    console.log(`[Market Maker] Order manager primed. Placing orders...`);
+
+    // 8. 为每个市场挂单（Liquidity Rewards 优化）
     const spreadFromMid = config.bot.spreadFromMidpoint;
 
     for (const m of selectedMarkets) {
@@ -958,7 +960,7 @@ export async function runMarketMakingCycle() {
       }
     }
 
-    // 8. 验证收益：检查最近 24h 是否有 REWARD 活动到账
+    // 9. 验证收益：检查最近 24h 是否有 REWARD 活动到账
     try {
       const activityUrl = `https://data-api.polymarket.com/activity?user=${config.polymarket.funderAddress}&type=REWARD&limit=20`;
       const activityResp = await fetch(activityUrl, {
