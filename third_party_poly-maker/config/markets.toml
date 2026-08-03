@@ -1,0 +1,25 @@
+# Trade list (supervised MM session).
+[[markets]]
+slug    = "will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568"
+profile = "newsom-mm"
+enabled = true
+
+[[markets]]
+slug    = "will-alexandru-nazare-be-the-next-prime-minister-of-romania"
+profile = "romania-pm"
+enabled = true
+
+[[markets]]
+slug    = "zelenskyy-of-tweets-july-31-august-7-2026-60-79"
+profile = "romania-pm"
+enabled = true
+
+[[markets]]
+slug    = "cz-binance-of-tweets-august-4-august-11-2026-0-19"
+profile = "romania-pm"
+enabled = true
+
+[[markets]]
+slug    = "will-mark-warner-vote-yea-on-the-clarity-act-20260729190926661"
+profile = "romania-pm"
+enabled = true
