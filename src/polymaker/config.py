@@ -168,6 +168,8 @@ class Secrets(BaseSettings):
     browser_address: str = Field(default="", alias="BROWSER_ADDRESS")
     polygon_rpc: str | None = Field(default=None, alias="POLYGON_RPC")
     alert_webhook_url: str | None = Field(default=None, alias="ALERT_WEBHOOK_URL")
+    notion_token: str | None = Field(default=None, alias="NOTION_TOKEN")
+    notion_database_id: str | None = Field(default=None, alias="NOTION_DATABASE_ID")
     # Polymarket builder API creds (self-generated via L2 auth: clob.create_builder_api_key)
     # + relayer URL — needed to merge a V2 DepositWallet (sig_type 1/3), whose execute()
     # only accepts calls from its factory/relayer. See merge.py.

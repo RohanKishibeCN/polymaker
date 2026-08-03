@@ -251,6 +251,33 @@ def moneydoctor(
     raise typer.Exit(0 if ok else 1)
 
 
+@app.command(name="report")
+def report(
+    config_dir: str = typer.Option("config", help="config directory"),
+    paper: bool = typer.Option(False, "--paper", help="report paper-mode data"),
+) -> None:
+    """Generate today's summary and push it to Notion (daily report)."""
+    from datetime import datetime
+
+    from polymaker.config import Config
+    from polymaker.report import NotionReporter, build_daily_report
+
+    cfg = Config.load(config_dir)
+    content = build_daily_report(cfg, paper=paper)
+    console.print(content)
+    reporter = NotionReporter(
+        cfg.secrets.notion_token, cfg.secrets.notion_database_id, proxy=cfg.proxy
+    )
+    mode = "PAPER" if paper else "LIVE"
+    ok = reporter.post(f"polymaker {mode} 日报 {datetime.now():%Y-%m-%d}", content)
+    if ok:
+        console.print("[green]已推送 Notion.[/green]")
+    elif not reporter.enabled:
+        console.print("[yellow]未配置 NOTION_TOKEN/NOTION_DATABASE_ID，仅打印本地日报.[/yellow]")
+    else:
+        console.print("[red]Notion 推送失败，详见日志.[/red]")
+
+
 @app.command(name="cancel-all")
 def cancel_all(config_dir: str = typer.Option("config", help="config directory")) -> None:
     """Cancel all open orders for the wallet (panic button)."""
