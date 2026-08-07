@@ -117,7 +117,7 @@ def build_daily_report(cfg: Config, *, paper: bool = False) -> str:
             lines.append("今日成交:")
             for f in fills:
                 maker = "maker" if f["is_maker"] else "taker"
-                side = "BUY " if f["side"] == "buy" else "SELL"
+                side = "SELL" if f["side"] == "SELL" else "BUY"
                 lines.append(
                     f"  {side} {maker}: {f['n']} 笔, {f['sz']:.2f} 股, 名义 ${f['notional']:.2f}"
                 )

@@ -28,11 +28,48 @@ def _other(token: str) -> str | None:
     return None  # only used for mint legs; fallback keeps token as-is
 
 
+def _backfill(cdir: Path, jpath: Path, addr: str) -> None:
+    """One-shot: insert journal fills into the fills ledger WITHOUT touching
+    positions (positions are already correct from REST reconcile; applying the
+    fills again would double count). Idempotent: INSERT OR IGNORE on trade_id."""
+    import sqlite3
+
+    conn = sqlite3.connect(cdir / "state.db")
+    inserted = dup = 0
+    seen: set[str] = set()
+    for line in jpath.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("kind") != "user_trade":
+            continue
+        msg = rec["data"]
+        for ev in normalize_trade(msg, addr, _other):
+            if ev.trade_id in seen:
+                continue
+            seen.add(ev.trade_id)
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO fills(trade_id,token_id,side,price,size,is_maker,ts)"
+                " VALUES(?,?,?,?,?,1,?)",
+                (ev.trade_id, ev.token_id, ev.our_side.value, ev.price, ev.size, ev.ts),
+            )
+            if cur.rowcount:
+                inserted += 1
+            else:
+                dup += 1
+    conn.commit()
+    conn.close()
+    print(f"[6] backfill: inserted {inserted} fills, {dup} duplicates (journal={jpath.name})")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config-dir", default="livecfg")
     ap.add_argument("--journal", default=None,
                     help="journal path (default: <config-dir>/journal/live.jsonl)")
+    ap.add_argument("--backfill", action="store_true",
+                    help="insert journal fills into the fills ledger (positions untouched)")
     args = ap.parse_args()
     cdir = Path(args.config_dir)
 
@@ -94,6 +131,12 @@ def main() -> None:
                   f"addrs={addrs} -> EOA matched:{per['EOA']}  browser matched:{per['browser']}")
     print(f"[5] replay verdict: EOA produced {hits['EOA']} events, browser produced {hits['browser']} events "
           f"across {len(recs)} journal events")
+
+    if args.backfill:
+        if isinstance(browser, str) and browser.startswith("0x"):
+            _backfill(cdir, jpath, browser)
+        else:
+            print("[6] backfill skipped: no browser_address in .env")
 
 
 if __name__ == "__main__":

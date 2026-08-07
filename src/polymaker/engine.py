@@ -102,7 +102,7 @@ class Engine:
         # subscribe feeds
         self.md.set_markets([(cid, [m.yes.token_id, m.no.token_id]) for cid, m in self.metas.items()])
         self.user = UserStream(
-            self.gateway.creds, self.gateway.address, self.user_proc,
+            self.gateway.creds, self.gateway.funder, self.user_proc,
             other_token=self._other_token, condition_of_token=self._cid_of_token,
             journal=self.journal, proxy=self.cfg.proxy,
             on_reconnect=self._on_user_reconnect,
