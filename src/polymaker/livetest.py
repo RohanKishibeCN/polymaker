@@ -77,6 +77,12 @@ async def run_livetest(cfg: Config, console: Console, notional_usdc: float = 5.0
 
     await asyncio.sleep(2.0)
     live = await gw.open_orders()
+
+    if live is None:
+
+        console.print('  [red]x[/red] orders endpoint did not answer')
+
+        return False
     found = any(o.order_id == oid for o in live)
     console.print(f"  [{'green' if found else 'yellow'}]{'✓' if found else '?'}[/] "
                   f"read back open orders: {len(live)} live, ours {'present' if found else 'not seen yet'}")
@@ -85,6 +91,12 @@ async def run_livetest(cfg: Config, console: Console, notional_usdc: float = 5.0
     console.print("  [green]✓[/green] cancel sent")
     await asyncio.sleep(1.5)
     after = await gw.open_orders()
+
+    if after is None:
+
+        console.print('  [red]x[/red] orders endpoint did not answer')
+
+        return False
     still = any(o.order_id == oid for o in after)
     console.print(f"  [{'green' if not still else 'red'}]{'✓' if not still else '✗'}[/] "
                   f"order {'cancelled' if not still else 'STILL LIVE — cancel manually!'}")

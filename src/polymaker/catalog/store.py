@@ -107,8 +107,7 @@ class CatalogStore:
         out = []
         for row in rows:
             meta = _load_meta(row["meta_json"])
-            sc = MarketScore(**json.loads(row["score_json"])) if row["score_json"] else score_market(meta)
-            out.append((meta, sc))
+            out.append((meta, _load_score(row["score_json"], meta)))
         return out
 
     def export_csv(self, path: str | Path, limit: int = 500) -> int:
@@ -120,17 +119,21 @@ class CatalogStore:
         """
         rows = self.top(limit)
         fields = [
-            "score", "reward_pool_per_day", "rebate_pool_per_day", "spread",
-            "best_bid", "best_ask", "tick", "min_size", "neg_risk", "taker_fee_pct",
-            "rebate_pct", "rewards_max_spread", "liquidity", "volume_24h",
-            "end_date", "question", "slug", "condition_id",
+            "score", "reward_income_per_day", "reward_yield_pct", "capital_usdc",
+            "competition", "toxicity", "reward_pool_per_day", "rebate_pool_per_day",
+            "spread", "best_bid", "best_ask", "tick", "min_size", "neg_risk",
+            "taker_fee_pct", "rebate_pct", "rewards_max_spread", "liquidity",
+            "volume_24h", "end_date", "question", "slug", "condition_id",
         ]
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(fields)
             for m, sc in rows:
                 w.writerow([
-                    f"{sc.score:.3f}", f"{m.rewards_daily_rate:.2f}", f"{sc.rebate_potential:.2f}",
+                    f"{sc.score:.3f}", f"{sc.reward_daily_income:.4f}",
+                    f"{sc.reward_yield_pct:.4f}", f"{sc.capital_usdc:.0f}",
+                    f"{sc.competition:.0f}", f"{sc.toxicity:.2f}",
+                    f"{m.rewards_daily_rate:.2f}", f"{sc.rebate_potential:.2f}",
                     f"{sc.spread:.4f}", m.best_bid, m.best_ask, f"{m.tick_size:g}",
                     f"{m.min_order_size:g}", int(m.neg_risk), f"{m.taker_fee_bps / 100:.1f}",
                     f"{m.rebate_rate * 100:.0f}", m.rewards_max_spread, f"{m.liquidity_num:.0f}",
@@ -160,3 +163,19 @@ def _load_meta(blob: str) -> MarketMeta:
     d = json.loads(blob)
     d["tokens"] = tuple(TokenMeta(**t) for t in d["tokens"])
     return MarketMeta(**d)
+
+
+def _load_score(score_json: str | None, meta: MarketMeta) -> MarketScore:
+    """Rebuild a stored MarketScore, tolerating rows written by an older schema.
+
+    The catalog persists across releases, so a row scored by a previous formula can
+    lack today's fields (or carry removed ones). Rather than crash a `markets`
+    listing, re-score from the market metadata — the live model is the source of
+    truth, and stale rows are exactly what the freshness gate exists to filter out.
+    """
+    if score_json:
+        try:
+            return MarketScore(**json.loads(score_json))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return score_market(meta)

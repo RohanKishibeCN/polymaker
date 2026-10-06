@@ -15,10 +15,12 @@ from tests.conftest import view
 
 
 def _inputs(meta, profile, **over):
+    mid = over.pop("mid", 0.50)
     base = dict(
         meta=meta,
         regime=Regime.QUIET,
         fv=0.50,
+        mid_price=mid,
         vol_short=0.0,
         toxicity=0.0,
         yes_view=view(0.49, 0.51),

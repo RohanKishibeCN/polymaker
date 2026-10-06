@@ -116,16 +116,82 @@ class StateStore:
         self.positions[token_id] = pos
         self._persist_position(pos)
 
-    def reconcile_positions(self, api_positions: dict[str, tuple[float, float]]) -> None:
+    def reverse_fill(self, trade_id: str) -> Fill | None:
+        """Undo a persisted fill that never settled. Returns the original fill.
+
+        Used when a FAILED arrives after a restart, so the in-memory `_applied` map no
+        longer holds the match. Without this, the optimistic inventory AND its cash
+        side-effect survived forever: the position showed shares we never received and
+        `net_cash` stayed reduced by money never spent, which understates equity and
+        can latch the daily-loss kill switch.
+
+        Idempotent: if the reversal is already recorded we return None.
+        """
+        if self._conn.execute("SELECT 1 FROM fills WHERE trade_id=?",
+                              (f"{trade_id}:reverse",)).fetchone():
+            return None
+        row = self._conn.execute(
+            "SELECT token_id, side, price, size, ts FROM fills WHERE trade_id=?",
+            (trade_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        fill = Fill(
+            token_id=str(row["token_id"]),
+            side=Side(str(row["side"])),
+            price=float(row["price"]),
+            size=float(row["size"]),
+            trade_id=str(trade_id),
+            ts=float(row["ts"]),
+            is_maker=True,
+        )
+        # Re-apply the opposite side, but WITHOUT recomputing avg price from the
+        # polluted basis: a reversal must restore the pre-fill size, so we recompute
+        # size only and leave the basis to be repaired by the next authoritative read.
+        reversed_fill = Fill(
+            fill.token_id, fill.side.opposite, fill.price, fill.size,
+            f"{trade_id}:reverse", fill.ts, True,
+        )
+        if self.apply_fill(reversed_fill):
+            log.warning("fill_reversed_after_restart", trade_id=trade_id,
+                        token=fill.token_id[:12], side=fill.side.value, size=fill.size)
+            return fill
+        return None
+
+    def reconcile_positions(
+        self, api_positions: dict[str, tuple[float, float]], *, authoritative: bool = False
+    ) -> list[str]:
         """Overwrite sizes from REST, skipping tokens with in-flight trades or
-        a very recent fill (the optimistic value is more current there)."""
+        a very recent fill (the optimistic value is more current there).
+
+        With ``authoritative=True`` the caller asserts this read is complete, so a
+        tracked token ABSENT from the response is treated as closed and zeroed. That
+        matters after a merge/redeem/manual sell: the position simply disappears from
+        the API, and without this the internal books keep phantom shares — the quoter
+        then sells inventory it no longer holds and the merge path computes from
+        inventory that is gone. Returns the token ids that were zeroed.
+        """
         now = time.time()
+        skipped: set[str] = set()
         for token_id, (size, avg) in api_positions.items():
             if self._inflight.get(token_id, 0) > 0:
+                skipped.add(token_id)
                 continue
             if now - self._last_fill_ts.get(token_id, 0.0) < 5.0:
+                skipped.add(token_id)  # optimistic value is newer than this read
                 continue
             self.set_position(token_id, size, avg)
+
+        zeroed: list[str] = []
+        if authoritative:
+            for token_id, pos in list(self.positions.items()):
+                if pos.size <= 0 or token_id in api_positions or token_id in skipped:
+                    continue
+                log.warning("position_closed_elsewhere", token=token_id[:12],
+                            size=round(pos.size, 2), source="authoritative_read")
+                self.set_position(token_id, 0.0, 0.0)
+                zeroed.append(token_id)
+        return zeroed
 
     # ── in-flight guard ─────────────────────────────────────────────────
     def mark_inflight(self, token_id: str) -> None:

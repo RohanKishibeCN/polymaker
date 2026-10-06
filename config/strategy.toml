@@ -31,7 +31,7 @@ event_cooloff_s     = 30      # shorter: this is a deep, slow market
 event_jump_ticks    = 6       # 0.006 = ~3% jump -> pull quotes
 event_sweep_mult    = 6.0     # print must be >=6 order-sizes
 event_sweep_frac    = 1.0     # AND consume ~all near-touch depth to count as a sweep
-trend_flow_z        = 1.8
+trend_flow_z        = 0.75    # z is bounded [-1,1]; 0.75 = strongly one-sided
 # --- lifecycle (resolves 2028 — irrelevant here) ---
 end_date_taper_days = 7
 reduce_only_hours   = 24
@@ -75,7 +75,7 @@ event_cooloff_s     = 30
 event_jump_ticks    = 5       # 0.005 jump from a thin book -> pull (gap protection)
 event_sweep_mult    = 3.0     # thinner book: a smaller print is a real sweep here
 event_sweep_frac    = 0.8     # consuming ~80% of near-touch depth counts
-trend_flow_z        = 2.6     # noisy flow z on a $4k/day tape -> raise the bar
+trend_flow_z        = 0.85    # z is bounded [-1,1]; noisy tape -> demand more persistence
 trend_vol_ratio     = 5.0     # ~1 trade/hr: microprice jitter must NOT halve size
                               # (real gaps still caught by event_jump_ticks)
 # --- lifecycle (end date stale/None -> these are inert; acceptingOrders governs) ---

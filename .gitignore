@@ -479,3 +479,6 @@ positions/
 data/
 *.whl
 session/
+
+# local tooling
+.uvcache/

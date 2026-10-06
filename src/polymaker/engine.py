@@ -19,8 +19,8 @@ from typing import Any
 from polymaker.alerts import Alerter
 from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
 from polymaker.catalog.store import CatalogStore
-from polymaker.config import Config, StrategyProfile
-from polymaker.domain import Fill, MarketMeta, Regime, Side
+from polymaker.config import Config, MarketEntry, StrategyProfile
+from polymaker.domain import Fill, MarketMeta, ProtocolVersion, Regime, Side
 from polymaker.execution.gateway import ExecutionGateway
 from polymaker.execution.reconciler import reconcile
 from polymaker.journal import Journal
@@ -28,7 +28,7 @@ from polymaker.logging import get_logger
 from polymaker.marketdata.parse import TradePrint
 from polymaker.marketdata.service import MarketDataService
 from polymaker.merge import Merger
-from polymaker.risk.manager import RiskManager
+from polymaker.risk.manager import RiskManager, resting_buy_notional
 from polymaker.state.store import StateStore
 from polymaker.state.tracker import UserEventProcessor
 from polymaker.strategy.estimators import (
@@ -37,7 +37,12 @@ from polymaker.strategy.estimators import (
     MarkoutTracker,
     VolEstimator,
 )
-from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
+from polymaker.strategy.quoting import (
+    QuoteInputs,
+    compute_fair_value,
+    construct_quotes,
+    exit_urgency,
+)
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 from polymaker.userstream.client import UserStream
 
@@ -77,6 +82,7 @@ class Engine:
         self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
         self._last_quote_fv: dict[str, float] = {}  # requote suppression
+        self._position_since: dict[str, float] = {}  # token -> when we first held it
         # supervised tasks: name -> (factory, task) so a dead task restarts
         self._task_specs: dict[str, Any] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
@@ -162,8 +168,18 @@ class Engine:
         self.md.stop()
         if self.user:
             self.user.stop()
-        for t in [*self._tasks.values(), *self._aux_tasks]:
+        tasks = [*self._tasks.values(), *self._aux_tasks]
+        for t in tasks:
             t.cancel()
+        # AWAIT the cancellations: without this a place() POST may still be in flight
+        # when cancel_all() returns, so the order can land afterwards and survive as a
+        # live, untracked order at exit.
+        for t in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+        # Drain the blocking client pool for the same reason.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(self.gateway.drain)
         with contextlib.suppress(Exception):
             await self.gateway.cancel_all()
         self.gateway.close()
@@ -173,32 +189,76 @@ class Engine:
 
     # ── market resolution ───────────────────────────────────────────────
     async def _resolve_markets(self) -> None:
+        """Resolve every configured market, always re-reading Gamma for the live row.
+
+        The catalog is a scan cache, not a source of truth: it stores whatever the last
+        `scan` saw, which can be weeks old. Only Gamma is authoritative for `version`,
+        and `version` decides which identifier we trade and which ledger holds the
+        shares — so a stale cached row could make us quote a dead id. The cache is
+        therefore used only as a fallback when Gamma cannot be reached.
+        """
         reward_rates: dict[str, float] | None = None
         async with GammaClient(self.cfg.wallet.gamma_host) as gamma:
             for entry in self.cfg.enabled_markets:
-                meta = self.catalog.get_by_slug(entry.slug) if entry.slug else None
-                if meta is None and entry.condition_id:
-                    meta = self.catalog.get(entry.condition_id)
-                if meta is None:  # fall back to a live Gamma fetch
-                    if reward_rates is None:
-                        reward_rates = await fetch_reward_rates(self.cfg.wallet.clob_host)
-                    meta = await self._fetch_meta(gamma, entry.slug, entry.condition_id, reward_rates)
+                if reward_rates is None:
+                    reward_rates = await fetch_reward_rates(self.cfg.wallet.clob_host)
+                raw = await self._live_market(gamma, entry.slug, entry.condition_id)
+                meta = parse_market(raw, reward_rates) if raw else None
+                if meta is not None:
+                    self.catalog.upsert_market(meta)
+                else:
+                    cached = self._cached_meta(entry)
+                    if cached is not None:
+                        log.warning("market_using_stale_cache", ref=entry.ref,
+                                    scanned_age_s=round(time.time() - cached.scanned_ts, 1),
+                                    version=cached.version.value,
+                                    note="Gamma row unavailable/unsupported; version may be stale")
+                        meta = cached
                 if meta is None:
                     log.warning("market_unresolved", ref=entry.ref)
                     continue
-                self.metas[meta.condition_id] = meta
-                self.profiles[meta.condition_id] = self.cfg.profile_for(entry)
-                self.est[meta.condition_id] = self._make_estimators(self.profiles[meta.condition_id])
-                self.regime_m[meta.condition_id] = RegimeMachine()
-                self._dirty[meta.condition_id] = asyncio.Event()
-                self._locks[meta.condition_id] = asyncio.Lock()
-                for tok in (meta.yes.token_id, meta.no.token_id):
-                    self._token_cid[tok] = meta.condition_id
+                self._register_market(meta, entry)
+
+    def _cached_meta(self, entry: MarketEntry) -> MarketMeta | None:
+        if entry.slug:
+            cached = self.catalog.get_by_slug(entry.slug)
+            if cached is not None:
+                return cached
+        return self.catalog.get(entry.condition_id) if entry.condition_id else None
+
+    def _register_market(self, meta: MarketMeta, entry: MarketEntry) -> None:
+        self.metas[meta.condition_id] = meta
+        self.profiles[meta.condition_id] = self.cfg.profile_for(entry)
+        self.est[meta.condition_id] = self._make_estimators(self.profiles[meta.condition_id])
+        self.regime_m[meta.condition_id] = RegimeMachine()
+        self._dirty[meta.condition_id] = asyncio.Event()
+        self._locks[meta.condition_id] = asyncio.Lock()
+        for tok in (meta.yes.token_id, meta.no.token_id):
+            self._token_cid[tok] = meta.condition_id
+
+    async def _live_market(
+        self, gamma: GammaClient, slug: str | None, condition_id: str | None
+    ) -> dict[str, Any] | None:
+        """Direct Gamma row for a configured market, or None if not obtainable."""
+        if slug:
+            raw = await gamma.market_by_slug(slug)
+            if raw is not None:
+                return raw
+        if condition_id:
+            return await gamma.market_by_condition_id(condition_id)
+        return None
 
     async def _fetch_meta(
         self, gamma: GammaClient, slug: str | None, condition_id: str | None,
         reward_rates: dict[str, float],
     ) -> MarketMeta | None:
+        raw = await self._live_market(gamma, slug, condition_id)
+        if raw is not None:
+            meta = parse_market(raw, reward_rates)
+            if meta is not None:
+                self.catalog.upsert_market(meta)
+            return meta
+        # Fall back to a tag-scoped sweep (covers markets Gamma won't return by slug).
         tag_id = self.catalog.cached_tag("politics")
         if tag_id is None:  # cold start: resolve + cache so the sweep is scoped
             tag_id = await gamma.resolve_tag_id("politics")
@@ -227,11 +287,17 @@ class Engine:
         # cancel/adopt any stragglers so we never quote on top of an unknown order
         with contextlib.suppress(Exception):
             leftover = await self.gateway.open_orders()
-            if leftover:
+            if leftover is None:
+                log.warning("startup_orders_unreadable")
+            elif leftover:
                 log.warning("startup_orders_remain", n=len(leftover))
                 for tok in {o.token_id for o in leftover}:
                     await self.gateway.cancel_asset(tok)
                 still = await self.gateway.open_orders()
+                if still is None:
+                    # Cannot confirm the wipe -> do not clobber local order state.
+                    log.error("startup_orders_recheck_failed")
+                    raise RuntimeError("open-orders recheck failed")
                 for tok in self._token_cid:
                     self.state.replace_open_orders(
                         tok, [o for o in still if o.token_id == tok], grace_s=0.0
@@ -243,10 +309,27 @@ class Engine:
         # purge positions that leaked in for markets we don't trade (manual UI
         # bets etc.) so they can't distort exposure caps or PnL
         self.state.drop_untracked_positions(set(self._token_cid))
-        positions = self._only_traded(await self.gateway.positions())
+        read = await self.gateway.positions()
+        if read is None:
+            # A failed read must never be mistaken for "we are flat": leave the
+            # persisted state untouched and let the next reconcile retry.
+            log.warning("startup_positions_unreadable")
+            return
+        positions = self._only_traded(read)
         if positions:
             self.state.reconcile_positions(positions)
             log.info("startup_positions", n=len(positions))
+
+    def _token_versions(self, tokens: list[str]) -> dict[str, ProtocolVersion]:
+        """Map our traded token ids to their market's protocol version, so ledger
+        reads are routed to the correct ERC-1155 contract."""
+        out: dict[str, ProtocolVersion] = {}
+        for tok in tokens:
+            cid = self._token_cid.get(tok)
+            meta = self.metas.get(cid) if cid else None
+            if meta is not None:
+                out[tok] = meta.version
+        return out
 
     def _only_traded(self, positions: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
         """Scope account positions to tokens WE trade. Manual/UI positions in
@@ -306,13 +389,33 @@ class Engine:
 
     def _on_fill(self, fill: Fill) -> None:
         self.risk.note_fill(fill)
+        if fill.side is Side.BUY and fill.size > 0:
+            # start the hold clock for exit urgency (an exit that never becomes
+            # urgent is an exit that never happens)
+            self._position_since.setdefault(fill.token_id, fill.ts)
+        elif fill.side is Side.SELL:
+            self._position_since.pop(fill.token_id, None)
         cid = self._token_cid.get(fill.token_id)
         if cid is None:
             return
         est = self.est[cid]
         fv = est.last_fv if est.last_fv is not None else fill.price
         token_fv = fv if fill.token_id == self.metas[cid].yes.token_id else (1.0 - fv)
-        est.markout.record_fill(fill.side, token_fv, fill.ts)
+        # Record in the FILLED token's price space and remember which token it was,
+        # so the mark can later be resolved in that same space (see _token_fv).
+        est.markout.record_fill(fill.side, token_fv, fill.ts, fill.token_id)
+
+    def _token_fv(self, yes_fv: float, token_id: str, cid: str | None = None) -> float:
+        """Convert a YES-space fair value into `token_id`'s own price space.
+
+        YES and NO are complementary (NO = 1 - YES), and every per-token estimator
+        (markout, exit pricing) must stay in one consistent space.
+        """
+        resolved = cid or self._token_cid.get(token_id)
+        meta = self.metas.get(resolved) if resolved else None
+        if meta is None or token_id == meta.yes.token_id:
+            return yes_fv
+        return 1.0 - yes_fv
 
     # ── quoter ──────────────────────────────────────────────────────────
     async def _quoter(self, cid: str) -> None:
@@ -354,50 +457,12 @@ class Engine:
                 wake = min(wake, 10.0)
         return max(1.0, wake)
 
-    async def _recompute(self, cid: str) -> None:
-        lock = self._locks.get(cid)
-        if lock is None:
-            return
-        async with lock:  # serialize vs the reconcile loop mutating this market
-            await self._recompute_locked(cid)
+    def _blind_state(self, cid: str, now: float) -> tuple[bool, bool, bool, bool, bool]:
+        """(blind, market_stale, user_blind, hb_blind, halted) for one market.
 
-    async def _recompute_locked(self, cid: str) -> None:
-        meta = self.metas[cid]
-        p = self.profiles[cid]
-        yes_book = self.md.book(meta.yes.token_id)
-        no_book = self.md.book(meta.no.token_id)
-        if yes_book is None or yes_book.is_empty:
-            return
-
-        # crossed/locked or one-sided book -> FV is unreliable; skip this tick
-        bb, ba = yes_book.best_bid(), yes_book.best_ask()
-        if bb is None or ba is None or bb.price >= ba.price:
-            return
-
-        now = time.time()
-        micro = yes_book.microprice(p.micro_levels)
-        if micro is None:
-            return
-        est = self.est[cid]
-        est.flow.decay_to(now)
-        fv = compute_fair_value(micro, est.flow.z, meta.tick_size)
-        prev_fv = est.last_fv
-        est.on_fair_value(fv, now)
-
-        self.risk.update_mark(meta.yes.token_id, fv)
-        self.risk.update_mark(meta.no.token_id, 1.0 - fv)
-
-        pos_yes = self.state.position(meta.yes.token_id)
-        pos_no = self.state.position(meta.no.token_id)
-        q_max = p.q_max_usdc
-        inv_util = abs(pos_yes.size - pos_no.size) * fv / q_max if q_max > 0 else 0.0
-        hours_to_end = _hours_to_end(meta.end_date_iso, now)
-
-        # ── blind/stale conditions ──────────────────────────────────────────
-        # A QUIET market with a live WS link is NOT stale — the CLOB WS pings
-        # every 5s (pong-timeout 10s), so a dead link flips `connected` within
-        # ~15s. Gating on the connection (not book-mutation recency) stops a
-        # legitimately-quiet thin market from false-halting into zero rewards.
+        Shared by the quote path and the "book unusable" path so a halt is enforced
+        even when we cannot compute fair value.
+        """
         market_stale = (
             not self.md.connected
             and self.md.disconnected_since > 0.0
@@ -415,7 +480,91 @@ class Engine:
             and self.gateway.heartbeat_failures >= self.cfg.risk.heartbeat_halt_failures
         )
         halted = cid in self._halted
-        blind = market_stale or user_blind or hb_blind or halted
+        return (market_stale or user_blind or hb_blind or halted,
+                market_stale, user_blind, hb_blind, halted)
+
+    async def _halted_or_blind(self, cid: str) -> bool:
+        blind, _, _, _, _ = self._blind_state(cid, time.time())
+        if blind:
+            return True
+        halted, _ = self.risk.global_halt()
+        return halted
+
+    async def _recompute(self, cid: str) -> None:
+        lock = self._locks.get(cid)
+        if lock is None:
+            return
+        async with lock:  # serialize vs the reconcile loop mutating this market
+            await self._recompute_locked(cid)
+
+    async def _pull_all_quotes(self, cid: str, reason: str) -> None:
+        """Cancel every resting order for a market, regardless of book state.
+
+        A halt must be enforced even when the book is unusable. Previously a
+        one-sided/empty/crossed book caused an early return BEFORE the risk and
+        reconcile steps, so a sweep that cleared the bid side left every previous
+        quote resting with no risk check and no way to enforce HALTED.
+        """
+        meta = self.metas.get(cid)
+        if meta is None:
+            return
+        live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
+        if not live:
+            return
+        log.warning("quotes_pulled", cid=cid[:8], reason=reason, n=len(live))
+        ok = await self.gateway.cancel([o.order_id for o in live])
+        if ok:
+            for o in live:
+                self.state.remove_order(o.order_id)
+
+    async def _recompute_locked(self, cid: str) -> None:
+        meta = self.metas[cid]
+        p = self.profiles[cid]
+        yes_book = self.md.book(meta.yes.token_id)
+        no_book = self.md.book(meta.no.token_id)
+
+        # An unusable book (missing, one-sided, crossed/locked) means fair value is
+        # unreliable, so we cannot quote — but we must still enforce any halt and pull
+        # resting orders rather than leaving them exposed to the flow that broke it.
+        if yes_book is None or yes_book.is_empty:
+            if await self._halted_or_blind(cid):
+                await self._pull_all_quotes(cid, "book_unusable_halt")
+            return
+
+        bb, ba = yes_book.best_bid(), yes_book.best_ask()
+        if bb is None or ba is None or bb.price >= ba.price:
+            if await self._halted_or_blind(cid):
+                await self._pull_all_quotes(cid, "book_crossed_halt")
+            return
+
+        now = time.time()
+        micro = yes_book.microprice(p.micro_levels)
+        if micro is None:
+            if await self._halted_or_blind(cid):
+                await self._pull_all_quotes(cid, "no_microprice_halt")
+            return
+        est = self.est[cid]
+        est.flow.decay_to(now)
+        fv = compute_fair_value(micro, est.flow.z, meta.tick_size)
+        prev_fv = est.last_fv
+        est.on_fair_value(fv, now, yes_token_id=meta.yes.token_id,
+                          token_in_yes_space=self._token_fv)
+
+        self.risk.update_mark(meta.yes.token_id, fv)
+        self.risk.update_mark(meta.no.token_id, 1.0 - fv)
+
+        pos_yes = self.state.position(meta.yes.token_id)
+        pos_no = self.state.position(meta.no.token_id)
+        q_max = p.q_max_usdc
+        inv_util = abs(pos_yes.size - pos_no.size) * fv / q_max if q_max > 0 else 0.0
+        hours_to_end = _hours_to_end(meta.end_date_iso, now)
+
+        # ── blind/stale conditions ──────────────────────────────────────────
+        # A QUIET market with a live WS link is NOT stale — the CLOB WS pings
+        # every 5s (pong-timeout 10s), so a dead link flips `connected` within
+        # ~15s. Gating on the connection (not book-mutation recency) stops a
+        # legitimately-quiet thin market from false-halting into zero rewards.
+        blind, market_stale, user_blind, hb_blind, halted = self._blind_state(cid, now)
         if blind:
             log.warning("market_blind", cid=cid[:8], market_stale=market_stale,
                         user_blind=user_blind, hb_blind=hb_blind, halted=halted)
@@ -426,8 +575,15 @@ class Engine:
                 critical=hb_blind,
             )
 
+        # Resting BUY orders are committed capital: count them against the caps, or
+        # a full stack of bids can fill on an account the caps believed was empty.
+        resting = resting_buy_notional(
+            self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id),
+            {meta.yes.token_id, meta.no.token_id},
+        )
         rd = self.risk.evaluate(meta, ws_stale=blind,
-                                event_group_cost=self._event_group_cost(meta))
+                                event_group_cost=self._event_group_cost(meta),
+                                resting_buy_notional=resting)
         if rd.halt and rd.reason not in ("ws_stale",):
             self.alerter.alert(
                 f"risk_halt:{rd.reason}", f"risk halt: {rd.reason}",
@@ -444,12 +600,23 @@ class Engine:
             p,
         )
 
+        # Exit urgency was previously never populated, so every exit rested at
+        # fv + delta — ABOVE the market — and inventory only unwound if price
+        # happened to rally to us. Derive it from how long we have held, and force
+        # it to the maximum when a halt/reduce means we want OUT rather than more
+        # quotes.
+        held_yes_s = now - self._position_since.get(meta.yes.token_id, now)
+        held_no_s = now - self._position_since.get(meta.no.token_id, now)
+        force_exit = rd.halt or rd.reduce_only
         tq = construct_quotes(QuoteInputs(
             meta=meta, regime=regime, fv=fv, vol_short=est.vol.short,
             toxicity=est.markout.toxicity, yes_view=yes_book.view(),
             no_view=(no_book.view() if no_book else _empty_view()),
             pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
             risk_size_scale=rd.size_scale,
+            mid_price=micro,
+            yes_exit_urgency=1.0 if force_exit else exit_urgency(held_yes_s, p.exit_urgency_s),
+            no_exit_urgency=1.0 if force_exit else exit_urgency(held_no_s, p.exit_urgency_s),
         ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
@@ -510,13 +677,23 @@ class Engine:
                 self.state.remove_order(o.order_id)
         await self._refresh_token_orders(meta)
 
-    async def _refresh_token_orders(self, meta: MarketMeta, grace_s: float = 0.0) -> None:
-        """Open-orders resync for one market's tokens (grace_s=0 = authoritative)."""
+    async def _refresh_token_orders(self, meta: MarketMeta, grace_s: float = 0.0) -> bool:
+        """Open-orders resync for one market's tokens (grace_s=0 = authoritative).
+
+        Returns False without touching local state when the read failed: a failed
+        read must never wipe orders we believe are live, or the reconciler will
+        re-place them as duplicates.
+        """
         live = await self.gateway.open_orders()
+        if live is None:
+            log.warning("order_resync_skipped", cid=meta.condition_id[:8],
+                        reason="open_orders_unreadable")
+            return False
         for tok in (meta.yes.token_id, meta.no.token_id):
             self.state.replace_open_orders(
                 tok, [o for o in live if o.token_id == tok], grace_s=grace_s
             )
+        return True
 
     def _maybe_merge(self, cid: str, meta: MarketMeta, p: StrategyProfile,
                      yes_size: float, no_size: float) -> None:
@@ -531,14 +708,46 @@ class Engine:
             # serialize all on-chain txs so concurrent merges can't reuse a nonce;
             # read on-chain balances as source of truth for the mergeable amount
             async with self._chain_lock:
-                bals = await self.gateway.token_balances([meta.yes.token_id, meta.no.token_id])
-                if bals:
-                    amount = min(amount, bals.get(meta.yes.token_id, 0.0),
-                                 bals.get(meta.no.token_id, 0.0))
+                # route the ledger read by protocol version: V2 shares live in
+                # PositionManager, so reading CTF would return a flat 0 and abort.
+                bals = await self.gateway.token_balances(
+                    {meta.yes.token_id: meta.version, meta.no.token_id: meta.version}
+                )
+                if bals is None:
+                    # unreadable -> do NOT assume flat; skip rather than merge blind
+                    log.warning("merge_skipped_balances_unreadable", cid=cid[:8])
+                    return
+                amount = min(amount, bals.get(meta.yes.token_id, 0.0),
+                             bals.get(meta.no.token_id, 0.0))
                 raw = int(amount * 1e6)
                 if raw <= 0:
                     return
-                await asyncio.to_thread(self.merger.merge, meta.condition_id, raw, meta.neg_risk)
+                tx = await asyncio.to_thread(
+                    self.merger.merge, meta.condition_id, raw, meta.neg_risk,
+                    meta.version, meta.yes.token_id,
+                )
+                if tx is None:
+                    # Two distinct silent failures used to hide here: the merge did
+                    # nothing because it cannot run at all (missing builder creds for
+                    # a DepositWallet), or it tried and failed. Both leave inventory
+                    # stuck, so report with the right cause instead of staying quiet.
+                    if not self.merger.can_merge:
+                        log.error("merge_unavailable", cid=cid[:8],
+                                  signature_type=self.cfg.wallet.signature_type,
+                                  hint="DepositWallet merges need POLY_BUILDER_* creds")
+                        self.alerter.alert(
+                            f"merge_unavailable:{cid[:8]}",
+                            f"cannot merge on {meta.slug[:32]}: signature_type="
+                            f"{self.cfg.wallet.signature_type} requires builder "
+                            f"credentials ({amount:.1f} pairs stuck)",
+                        )
+                    else:
+                        log.error("merge_returned_none", cid=cid[:8], amount=raw,
+                                  version=meta.version.value)
+                        self.alerter.alert(
+                            f"merge_failed:{cid[:8]}",
+                            f"merge of {amount:.1f} pairs on {meta.slug[:32]} returned no tx",
+                        )
         finally:
             self._merging.discard(cid)
 
@@ -561,9 +770,16 @@ class Engine:
                 self._hb_was_down = False
                 log.warning("heartbeat_recovered_resyncing")
                 self.state.clear_orders()
-                for meta in self.metas.values():
-                    with contextlib.suppress(Exception):
-                        await self._refresh_token_orders(meta, grace_s=0.0)
+                for cid, meta in self.metas.items():
+                    lock = self._locks.get(cid)
+                    if lock is None:
+                        continue
+                    # Take the market lock: the quoter may be mid-place(), and a
+                    # snapshot taken before that placement plus grace_s=0 would drop
+                    # the just-placed orders and cause duplicates.
+                    async with lock:
+                        with contextlib.suppress(Exception):
+                            await self._refresh_token_orders(meta, grace_s=0.0)
                 self._wake_all()
             await asyncio.sleep(self.cfg.engine.heartbeat_interval_s)
 
@@ -588,27 +804,51 @@ class Engine:
                     self.alerter.alert("inflight_expired",
                                        f"{len(expired)} stuck in-flight guards cleared")
 
-                positions = self._only_traded(await self.gateway.positions())
-                if positions:
-                    self.state.reconcile_positions(positions)
+                read = await self.gateway.positions()
+                if read is not None:
+                    # Authoritative: this read lists the funder's open positions, so
+                    # one we track that is absent has genuinely closed (merge, redeem
+                    # or a manual sell) and must be zeroed rather than kept forever.
+                    zeroed = self.state.reconcile_positions(
+                        self._only_traded(read), authoritative=True
+                    )
+                    if zeroed:
+                        self.alerter.alert(
+                            "position_closed_elsewhere",
+                            f"{len(zeroed)} tracked position(s) disappeared from the API; zeroed",
+                        )
+                        for tok in zeroed:
+                            cid = self._token_cid.get(tok)
+                            if cid:
+                                self._wake_cid(cid)
+                else:
+                    # unreadable -> do NOT treat as flat; open orders below still
+                    # reconcile, and positions stay as last known-good.
+                    log.warning("positions_unreadable_reconcile")
                 live = await self.gateway.open_orders()
-                by_token: dict[str, list[Any]] = {}
-                for o in live:
-                    by_token.setdefault(o.token_id, []).append(o)
-                # iterate ALL our tokens, not just those in the REST response — a
-                # token whose orders vanished server-side must be cleaned up too.
-                # Hold the market lock so we don't race the quoter mid-flight.
-                for cid, meta in self.metas.items():
-                    lock = self._locks.get(cid)
-                    if lock is None:
-                        continue
-                    async with lock:
-                        for tok in (meta.yes.token_id, meta.no.token_id):
-                            if self.state.inflight(tok) == 0:
-                                self.state.replace_open_orders(tok, by_token.get(tok, []))
+                if live is None:
+                    # Unreadable snapshot: keep local order state as-is. Wiping it
+                    # here would make the quoter re-place every quote as a duplicate.
+                    log.warning("open_orders_unreadable_reconcile")
+                else:
+                    by_token: dict[str, list[Any]] = {}
+                    for o in live:
+                        by_token.setdefault(o.token_id, []).append(o)
+                    # iterate ALL our tokens, not just those in the REST response — a
+                    # token whose orders vanished server-side must be cleaned up too.
+                    # Hold the market lock so we don't race the quoter mid-flight.
+                    for cid, meta in self.metas.items():
+                        lock = self._locks.get(cid)
+                        if lock is None:
+                            continue
+                        async with lock:
+                            for tok in (meta.yes.token_id, meta.no.token_id):
+                                if self.state.inflight(tok) == 0:
+                                    self.state.replace_open_orders(tok, by_token.get(tok, []))
                 if forced:
-                    log.info("forced_reconcile_done", positions=len(positions),
-                             open_orders=len(live))
+                    log.info("forced_reconcile_done",
+                             positions=(-1 if read is None else len(read)),
+                             open_orders=(-1 if live is None else len(live)))
                     self._wake_all()
             except Exception as exc:  # noqa: BLE001
                 log.warning("reconcile_error", err=str(exc))
@@ -628,16 +868,28 @@ class Engine:
         Catches subtle fill-attribution bugs before they compound. On-chain is
         authoritative (it's what the exchange settles), so we correct to it —
         but only for tokens with no in-flight trades (optimistic state is newer).
+
+        Safety: this function OVERWRITES internal state from chain, so it must never
+        act on a failed or partial read. `token_balances` returns None when every RPC
+        failed and routes each token to the ledger owning its protocol version; a
+        read against the wrong ledger would look like a legitimate "0 shares" and
+        would zero out real inventory.
         """
         tokens = [t for t in self._token_cid if self.state.inflight(t) == 0]
-        onchain = await self.gateway.token_balances(tokens)
-        if not onchain:
+        versions = self._token_versions(tokens)
+        if not versions:
+            return
+        onchain = await self.gateway.token_balances(versions)
+        if onchain is None:
+            log.warning("divergence_check_skipped", reason="balances_unreadable",
+                        n=len(versions))
             return
         for tok, chain_size in onchain.items():
             internal = self.state.position(tok).size
             if abs(internal - chain_size) > max(1.0, 0.02 * chain_size):
                 log.error("position_divergence", token=tok[:12],
-                          internal=round(internal, 2), onchain=round(chain_size, 2))
+                          internal=round(internal, 2), onchain=round(chain_size, 2),
+                          version=versions.get(tok, ProtocolVersion.V1).value)
                 self.alerter.alert(
                     f"divergence:{tok[:8]}",
                     f"position drift: internal {internal:.1f} vs on-chain {chain_size:.1f}",
@@ -666,15 +918,39 @@ class Engine:
         for cid, raw in raws.items():
             if cid not in self.metas:
                 continue
+            # A market whose protocol version changed has moved to a different id
+            # space and ledger. Our subscribed ids and cached balances belong to the
+            # old system, so halt for an operator restart instead of quoting ids that
+            # now resolve to nothing.
+            fresh_version = ProtocolVersion.parse(raw.get("version"))
+            if fresh_version is not None and fresh_version is not self.metas[cid].version:
+                if cid not in self._halted:
+                    self._halted.add(cid)
+                    log.critical("market_version_changed", cid=cid[:8],
+                                 was=self.metas[cid].version.value,
+                                 now=fresh_version.value)
+                    self.alerter.alert(
+                        f"version_changed:{cid[:8]}",
+                        f"{self.metas[cid].question[:40]} moved "
+                        f"{self.metas[cid].version.value} -> {fresh_version.value}; restart required",
+                        critical=True,
+                    )
+                    meta = self.metas[cid]
+                    for tok in (meta.yes.token_id, meta.no.token_id):
+                        with contextlib.suppress(Exception):
+                            await self.gateway.cancel_asset(tok)
+                    self._wake_cid(cid)
+                continue
             accepting = bool(raw.get("acceptingOrders", True))
             closed = bool(raw.get("closed", False))
-            if closed or not accepting:
+            resolved = _is_resolved_raw(raw, self.metas[cid].version)
+            if closed or not accepting or resolved:
                 if cid not in self._halted:
                     self._halted.add(cid)
                     log.critical("market_halted_by_meta", cid=cid[:8], closed=closed,
-                                 accepting=accepting)
+                                 accepting=accepting, resolved=resolved)
                     self.alerter.alert(f"halted:{cid[:8]}",
-                                       f"{self.metas[cid].question[:40]} closed/not-accepting",
+                                       f"{self.metas[cid].question[:40]} closed/not-accepting/resolved",
                                        critical=True)
                     meta = self.metas[cid]
                     for tok in (meta.yes.token_id, meta.no.token_id):
@@ -773,6 +1049,16 @@ def _fnum(v: object) -> float | None:
         return float(v)  # type: ignore[arg-type]
     except (ValueError, TypeError):
         return None
+
+
+def _is_resolved_raw(raw: dict[str, Any], version: ProtocolVersion) -> bool:
+    """Resolution flag from the field the market's version actually reports.
+
+    V2 markets use `resolutionStatus`; V1 keeps `umaResolutionStatus`. Reading the
+    wrong one would leave a resolved V2 market quoting indefinitely.
+    """
+    field = "resolutionStatus" if version is ProtocolVersion.V2 else "umaResolutionStatus"
+    return str(raw.get(field) or "").strip().lower() == "resolved"
 
 
 def _hours_to_end(end_date_iso: str | None, now: float) -> float | None:

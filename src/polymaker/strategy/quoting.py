@@ -56,6 +56,7 @@ class QuoteInputs:
     risk_size_scale: float = 1.0  # RiskManager may throttle size in [0,1]
     yes_exit_urgency: float = 0.0  # [0,1]; engine raises with hold time / adverse drift
     no_exit_urgency: float = 0.0
+    mid_price: float = 0.0  # YES midpoint; reward distance is measured from HERE
 
 
 def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
@@ -83,7 +84,21 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     delta = base + p.c_vol * inp.vol_short + p.c_tox * inp.toxicity
     reward_band = m.rewards_max_spread / 100.0
     if inp.regime == Regime.QUIET and reward_band > 0:
-        delta = _clamp(delta, base, max(base, reward_band))
+        # Score weight is ((band - |mid - price|) / band)^2, measured from the MID.
+        # A quote's distance also includes how far fair value sits from the mid, so
+        # clamping delta alone can still land OUTSIDE the band: zero reward while
+        # taking full fill risk at a tighter price than the volatility model wanted.
+        # Compare like with like, and pull quotes when the two goals cannot coexist.
+        mid = inp.mid_price if inp.mid_price > 0 else inp.fv
+        edge = abs(inp.fv - mid)
+        max_scoring_delta = reward_band - edge - p.min_edge_ticks * tick
+        # Tolerance matters here: prices are snapped to a tick grid, and binary
+        # floating point makes an exactly-fitting case look short (0.03 - 0.01
+        # evaluates to 0.019999999999999997). Without it we would refuse to quote a
+        # market where quoting is perfectly viable.
+        if max_scoring_delta < base - _EPS:
+            return TargetQuotes(cid, inp.regime, ())
+        delta = _clamp(delta, base, max(base, max_scoring_delta))
     delta = max(delta, tick)
 
     r = inp.fv - skew
@@ -178,14 +193,18 @@ def _add_layers(
     layers = max(1, layers)
     reward_floor = max(reward_floor, exchange_min)
     per = round(total_size / layers, 2)
-    # consolidate: if a split layer would fall below half the reward floor,
-    # use fewer layers so each resting order can still score
-    while layers > 1 and reward_floor > 0 and per < 0.5 * reward_floor:
+    # Consolidate until every remaining layer can actually score (and meets the
+    # exchange minimum). Splitting a size that cannot support the floor just creates
+    # orders that earn nothing.
+    while layers > 1 and ((per < exchange_min) or (reward_floor > 0 and per < reward_floor)):
         layers -= 1
         per = round(total_size / layers, 2)
-    if reward_floor > 0 and 0.5 * reward_floor <= per < reward_floor:
-        per = reward_floor  # bump each order up to scoring size
     if per < exchange_min or per <= 0:
+        return
+    # Still below the floor after consolidating: decline rather than bump it up. The
+    # old bump silently overrode the RiskManager's size taper and could double the
+    # intended notional while still not scoring.
+    if reward_floor > 0 and per < reward_floor:
         return
     for i in range(layers):
         offset = i * step_ticks * tick
@@ -217,3 +236,19 @@ def _maybe_exit(
     size = math.floor(pos.size * 100) / 100
     if 0 < price < 1 and size >= m.min_order_size:
         quotes.append(Quote(token_id, Side.SELL, price, size))
+
+
+def exit_urgency(held_s: float, half_life_s: float) -> float:
+    """How hard to chase the touch on an exit, from how long we have held.
+
+    The engine previously never set this, so `exit_urgency_s` was dead config and
+    every exit rested at `fv + delta` — above the market — meaning inventory only
+    unwound if the price happened to rally to us. Saturating at 1.0 drives the exit
+    down to the touch, which is the only way a bag actually clears.
+    """
+    if half_life_s <= 0:
+        return 1.0
+    u = held_s / half_life_s
+    if u <= 0:
+        return 0.0
+    return min(1.0, u * u)  # slow at first, decisive once the hold drags on

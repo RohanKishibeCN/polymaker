@@ -69,6 +69,9 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
                   f"spread {round(best_ask - best_bid, 4)} · tick {tick:g}[/dim]")
 
     bal0 = await gw.collateral_balance()
+    if bal0 is None:
+        check("collateral balance readable", False, "balance-allowance did not answer")
+        return False
     console.print(f"  [dim]starting balance: {bal0:.4f} pUSD[/dim]\n")
 
     # ── 1. LIMIT: rest + cancel ─────────────────────────────────────────
@@ -78,19 +81,31 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
     if placed:
         await asyncio.sleep(1.5)
         live = await gw.open_orders()
-        found = any(o.order_id == placed[0].order_id for o in live)
-        check("limit order rests on book", found, f"{limit_size:g} @ {limit_price}, {len(live)} live")
-        await gw.cancel([placed[0].order_id])
-        await asyncio.sleep(1.0)
-        gone = not any(o.order_id == placed[0].order_id for o in await gw.open_orders())
-        check("limit order cancels", gone)
+        if live is None:
+            check("open orders readable", False, "orders endpoint did not answer")
+        else:
+            found = any(o.order_id == placed[0].order_id for o in live)
+            check("limit order rests on book", found,
+                  f"{limit_size:g} @ {limit_price}, {len(live)} live")
+            await gw.cancel([placed[0].order_id])
+            await asyncio.sleep(1.0)
+            after = await gw.open_orders()
+            if after is None:
+                check("limit order cancels", False, "orders endpoint did not answer")
+            else:
+                check("limit order cancels",
+                      not any(o.order_id == placed[0].order_id for o in after))
     else:
         check("limit order placed", False, "post failed — see logs")
 
     # ── 2. MARKET BUY ───────────────────────────────────────────────────
     shares_target = meta.min_order_size + 3.0
     buy_usd = round(shares_target * best_ask * 1.06, 2)
-    before = await gw._token_balance_opt(token) or 0.0  # baseline shares
+    before_opt = await gw._token_balance_opt(token, meta.version)
+    if before_opt is None:
+        check("on-chain balance readable", False, "every RPC endpoint failed")
+        return False
+    before = before_opt  # baseline shares
     console.print(f"\n  [dim]market BUY ~${buy_usd} of YES (targeting ~{shares_target:g} shares)…[/dim]")
     resp_buy = await gw.market_order(token, Side.BUY, buy_usd, meta, fak=True)
     bought, spent, status = _fill(resp_buy, Side.BUY)
@@ -100,7 +115,7 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
     # ── settle: user WS (fast) with on-chain as source of truth ─────────
     if bought > 0:
         console.print("  [dim]waiting for settlement (user WS + chain)…[/dim]")
-        settled = await _wait_settled(cfg, gw, token, before, timeout=60)
+        settled = await _wait_settled(cfg, gw, token, before, meta, timeout=60)
         got = settled - before
         check("buy settled on-chain", got > 0.5, f"{got:.2f} shares now available")
 
@@ -109,8 +124,12 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
         sold = await _sell_with_retry(gw, token, sell_amt, meta, before, console, check)
 
         await asyncio.sleep(3.0)
-        remaining = await gw._token_balance_opt(token)
-        if remaining is not None:
+        remaining = await gw._token_balance_opt(token, meta.version)
+        if remaining is None:
+            # Never report "flat" without an authoritative read: this test moves money.
+            check("position flat after round-trip", False,
+                  "on-chain balance unreadable — could not confirm we are flat")
+        else:
             check("position flat after round-trip", remaining <= before + 0.5,
                   f"{remaining - before:.2f} net shares vs. start ({sold:.2f} sold)")
     else:
@@ -119,9 +138,12 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
     # ── cost ────────────────────────────────────────────────────────────
     await asyncio.sleep(2.0)
     bal1 = await gw.collateral_balance()
-    cost = bal0 - bal1
-    console.print(f"\n  [bold]round-trip cost: {cost:.4f} pUSD[/bold] "
-                  f"[dim](spread + taker fees; balance {bal0:.2f} → {bal1:.2f})[/dim]")
+    if bal1 is None:
+        console.print("  [yellow]! end balance unreadable — cost not computed[/yellow]")
+    else:
+        cost = bal0 - bal1
+        console.print(f"\n  [bold]round-trip cost: {cost:.4f} pUSD[/bold] "
+                      f"[dim](spread + taker fees; balance {bal0:.2f} → {bal1:.2f})[/dim]")
     console.print(f"\n[bold]{'ALL GOOD' if ok else 'CHECK LOGS'}[/bold]")
     return ok
 
@@ -149,7 +171,7 @@ async def _pick_market(cfg: Config, gw: ExecutionGateway) -> tuple[MarketMeta | 
 
 
 async def _wait_settled(cfg: Config, gw: ExecutionGateway, token: str, baseline: float,
-                        *, timeout: float = 60.0) -> float:
+                        meta: MarketMeta, *, timeout: float = 60.0) -> float:
     """Return the settled on-chain share balance once the buy lands.
 
     Races two signals: the user WS `trade` status ladder (fast, push-based) and
@@ -161,7 +183,7 @@ async def _wait_settled(cfg: Config, gw: ExecutionGateway, token: str, baseline:
     async def chain_poll() -> None:
         while not done.is_set():
             await asyncio.sleep(3.0)
-            bal = await gw._token_balance_opt(token)
+            bal = await gw._token_balance_opt(token, meta.version)
             if bal is not None and bal > baseline + 0.01:
                 done.set()
                 return
@@ -196,7 +218,8 @@ async def _wait_settled(cfg: Config, gw: ExecutionGateway, token: str, baseline:
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    return await gw._token_balance_opt(token) or baseline
+    final = await gw._token_balance_opt(token, meta.version)
+    return final if final is not None else baseline
 
 
 async def _sell_with_retry(
@@ -214,11 +237,15 @@ async def _sell_with_retry(
         err = resp.get("error", "") if isinstance(resp, dict) else ""
         console.print(f"  [dim]  not filled yet ({status} {str(err)[:48]}); waiting to retry…[/dim]")
         await asyncio.sleep(6.0)
-        bal = await gw._token_balance_opt(token)
-        if bal is not None:
-            amount = math.floor(max(0.0, bal - 0.0) * 100) / 100  # sell what's actually available
-            if amount < meta.min_order_size:
-                break
+        bal = await gw._token_balance_opt(token, meta.version)
+        if bal is None:
+            # Cannot size a sell safely without knowing what we hold; stop rather
+            # than keep firing orders at an unknown balance.
+            console.print("  [yellow]! on-chain balance unreadable — stopping sell retries[/yellow]")
+            break
+        amount = math.floor(max(0.0, bal) * 100) / 100  # sell what's actually available
+        if amount < meta.min_order_size:
+            break
     check("market SELL filled", False, "could not fill — flatten manually with cancel-all/limit")
     return 0.0
 
