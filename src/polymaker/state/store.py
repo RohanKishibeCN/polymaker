@@ -23,6 +23,11 @@ from polymaker.logging import get_logger
 
 log = get_logger("state.store")
 
+# How long after a fill we distrust a REST read for that token. The Data API indexes
+# position changes asynchronously, so immediately after a fill it can legitimately
+# omit a token we just traded.
+_FILL_SETTLE_GRACE_S = 15.0
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
     token_id  TEXT PRIMARY KEY,
@@ -32,7 +37,8 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 CREATE TABLE IF NOT EXISTS fills (
     trade_id  TEXT PRIMARY KEY,
-    token_id  TEXT, side TEXT, price REAL, size REAL, is_maker INT, ts REAL
+    token_id  TEXT, side TEXT, price REAL, size REAL, is_maker INT, ts REAL,
+    status    TEXT NOT NULL DEFAULT 'MATCHED'
 );
 CREATE TABLE IF NOT EXISTS order_log (
     order_id  TEXT PRIMARY KEY,
@@ -53,6 +59,7 @@ class StateStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
 
         self.positions: dict[str, Position] = {}
@@ -63,6 +70,15 @@ class StateStore:
         self._inflight_ts: dict[str, float] = {}  # oldest in-flight mark, for expiry
         self._last_fill_ts: dict[str, float] = {}
         self._load()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the database was first created."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(fills)")}
+        if "status" not in cols:
+            self._conn.execute(
+                "ALTER TABLE fills ADD COLUMN status TEXT NOT NULL DEFAULT 'MATCHED'"
+            )
+            log.info("schema_migrated", table="fills", added="status")
 
     def close(self) -> None:
         self._conn.close()
@@ -116,6 +132,19 @@ class StateStore:
         self.positions[token_id] = pos
         self._persist_position(pos)
 
+    def mark_fill_settled(self, trade_id: str) -> None:
+        """Record that a fill reached a terminal SUCCESS (CONFIRMED).
+
+        Without this a late or duplicated FAILED for a trade that actually settled was
+        indistinguishable from an unsettled one, and reversing it subtracted real
+        inventory that the exchange had already credited.
+        """
+        with contextlib.suppress(sqlite3.Error):
+            self._conn.execute(
+                "UPDATE fills SET status='CONFIRMED' WHERE trade_id=?", (trade_id,)
+            )
+            self._conn.commit()
+
     def reverse_fill(self, trade_id: str) -> Fill | None:
         """Undo a persisted fill that never settled. Returns the original fill.
 
@@ -131,10 +160,14 @@ class StateStore:
                               (f"{trade_id}:reverse",)).fetchone():
             return None
         row = self._conn.execute(
-            "SELECT token_id, side, price, size, ts FROM fills WHERE trade_id=?",
+            "SELECT token_id, side, price, size, ts, status FROM fills WHERE trade_id=?",
             (trade_id,),
         ).fetchone()
         if row is None:
+            return None
+        if str(row["status"]) == "CONFIRMED":
+            # Already settled on-chain: a late/duplicate FAILED must not undo it.
+            log.warning("reverse_ignored_settled", trade_id=trade_id)
             return None
         fill = Fill(
             token_id=str(row["token_id"]),
@@ -165,33 +198,44 @@ class StateStore:
         a very recent fill (the optimistic value is more current there).
 
         With ``authoritative=True`` the caller asserts this read is complete, so a
-        tracked token ABSENT from the response is treated as closed and zeroed. That
-        matters after a merge/redeem/manual sell: the position simply disappears from
-        the API, and without this the internal books keep phantom shares — the quoter
-        then sells inventory it no longer holds and the merge path computes from
-        inventory that is gone. Returns the token ids that were zeroed.
+        tracked token ABSENT from the response is treated as closed and zeroed — that
+        is how a merge/redeem/manual sell is detected, since the position simply
+        disappears from the API.
+
+        The in-flight and recent-fill guards are evaluated INSIDE the zeroing loop for
+        every tracked token, not just for tokens present in the response. An earlier
+        version collected guarded tokens into a `skipped` set populated from the
+        response alone, so a token that was absent *and* had an unsettled fill (or a
+        fill so recent the API had not indexed it yet) was zeroed anyway — wiping live
+        inventory, understating exposure, and causing the next requote to buy more.
+        Returns the token ids that were zeroed.
         """
         now = time.time()
-        skipped: set[str] = set()
         for token_id, (size, avg) in api_positions.items():
-            if self._inflight.get(token_id, 0) > 0:
-                skipped.add(token_id)
-                continue
-            if now - self._last_fill_ts.get(token_id, 0.0) < 5.0:
-                skipped.add(token_id)  # optimistic value is newer than this read
+            if self._guard_blocks(token_id, now):
                 continue
             self.set_position(token_id, size, avg)
 
         zeroed: list[str] = []
         if authoritative:
             for token_id, pos in list(self.positions.items()):
-                if pos.size <= 0 or token_id in api_positions or token_id in skipped:
+                if pos.size <= 0 or token_id in api_positions:
+                    continue
+                if self._guard_blocks(token_id, now):
+                    # optimistically held and not yet visible on the API; leave it
+                    log.info("position_absent_but_guarded", token=token_id[:12])
                     continue
                 log.warning("position_closed_elsewhere", token=token_id[:12],
                             size=round(pos.size, 2), source="authoritative_read")
                 self.set_position(token_id, 0.0, 0.0)
                 zeroed.append(token_id)
         return zeroed
+
+    def _guard_blocks(self, token_id: str, now: float) -> bool:
+        """True when our optimistic view is newer than any REST read."""
+        if self._inflight.get(token_id, 0) > 0:
+            return True
+        return now - self._last_fill_ts.get(token_id, 0.0) < _FILL_SETTLE_GRACE_S
 
     # ── in-flight guard ─────────────────────────────────────────────────
     def mark_inflight(self, token_id: str) -> None:

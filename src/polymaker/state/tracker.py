@@ -80,6 +80,9 @@ class UserEventProcessor:
                 # restart) must still release the guard rather than leak it.
                 if ev.trade_id in self._applied or self._store.inflight(ev.token_id) > 0:
                     self._store.clear_inflight(ev.token_id)
+                # Mark it settled in the store so a later duplicate FAILED cannot
+                # reverse inventory the exchange has already credited.
+                self._store.mark_fill_settled(ev.trade_id)
                 self._applied.pop(ev.trade_id, None)
                 self._on_change(condition_id)
 
@@ -94,12 +97,22 @@ class UserEventProcessor:
                 self._reverse_fill(prior, ev, condition_id)
             else:
                 # No in-memory record: either we never applied it, or we restarted
-                # between MATCHED and FAILED. Ask the store to undo the persisted
-                # fill so a phantom position/cash cannot survive a restart.
+                # between MATCHED and FAILED. Undo the persisted inventory, but NOT the
+                # cash: `RiskManager._net_cash` is process-local and starts at 0 after a
+                # restart, so crediting the reverse here would invent money that this
+                # process never debited (verified: produced equity +50 on a trade that
+                # should net to 0). `_reconcile_cash` snaps the ledger to the exchange
+                # shortly afterwards, which is the correct authority for cash.
                 undone = self._store.reverse_fill(ev.trade_id)
                 if undone is not None:
-                    self._reverse_effects(undone, ev, condition_id)
-                self._store.clear_inflight(ev.token_id)
+                    self._store.clear_inflight(ev.token_id)
+                    log.warning("trade_failed_reversed_no_cash", trade_id=ev.trade_id,
+                                token=ev.token_id[:12], side=undone.side.value,
+                                size=undone.size,
+                                note="cash side not reversed across a restart")
+                    self._on_change(condition_id)
+                else:
+                    self._store.clear_inflight(ev.token_id)
 
     def _reverse_fill(self, prior: Fill, ev: TradeEvent, condition_id: str) -> None:
         reversed_fill = Fill(prior.token_id, prior.side.opposite, prior.price, prior.size,

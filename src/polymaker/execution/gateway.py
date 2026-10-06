@@ -240,23 +240,31 @@ class ExecutionGateway:
             )
 
             opts = PartialCreateOrderOptions(tick_size=_tick_str(meta.tick_size), neg_risk=meta.neg_risk)
-            args = []
-            for q in quotes:
-                # V2 markets sign against ExchangeV3 (EIP-712 domain version "3");
-                # passing the id as `position_id` is what selects that route, and
-                # ExchangeV3 ignores neg_risk. V1/CTF markets keep `token_id` and
-                # resolve to CTFExchangeV2 with domain version "2".
-                order_args = (
-                    OrderArgsV2(position_id=q.token_id, price=q.price, size=q.size,
-                                side=q.side.value)
-                    if meta.is_v2
-                    else OrderArgsV2(token_id=q.token_id, price=q.price, size=q.size,
-                                     side=q.side.value)
-                )
-                signed = self._client.create_order(order_args, options=opts)
-                args.append(PostOrdersV2Args(order=signed, orderType=OrderType.GTC))
-            resp = self._client.post_orders(args, post_only=self._cfg.execution.post_only)
-            return self._parse_place_response(resp, quotes)
+            cap = max(1, self._cfg.execution.max_orders_per_batch)
+            out: list[OpenOrder] = []
+            # Submit in chunks no larger than the exchange's batch cap. A single
+            # oversized batch is rejected wholesale, which the engine then treats as a
+            # partial failure and quarantines — churn for a purely local misconfig.
+            for i in range(0, len(quotes), cap):
+                chunk = quotes[i:i + cap]
+                args = []
+                for q in chunk:
+                    # V2 markets sign against ExchangeV3 (EIP-712 domain version "3");
+                    # passing the id as `position_id` is what selects that route, and
+                    # ExchangeV3 ignores neg_risk. V1/CTF markets keep `token_id` and
+                    # resolve to CTFExchangeV2 with domain version "2".
+                    order_args = (
+                        OrderArgsV2(position_id=q.token_id, price=q.price, size=q.size,
+                                    side=q.side.value)
+                        if meta.is_v2
+                        else OrderArgsV2(token_id=q.token_id, price=q.price, size=q.size,
+                                         side=q.side.value)
+                    )
+                    signed = self._client.create_order(order_args, options=opts)
+                    args.append(PostOrdersV2Args(order=signed, orderType=OrderType.GTC))
+                resp = self._client.post_orders(args, post_only=self._cfg.execution.post_only)
+                out.extend(self._parse_place_response(resp, chunk))
+            return out
 
         try:
             return await self._io(_place)
@@ -269,11 +277,26 @@ class ExecutionGateway:
         return OpenOrder(oid, q.token_id, q.side, q.price, q.size, OrderState.LIVE)
 
     def _parse_place_response(self, resp: Any, quotes: list[Quote]) -> list[OpenOrder]:
-        """Map a batch post response to OpenOrders. Tolerant of shape variants;
-        the user-WS order events + REST snapshot reconcile anything we miss."""
+        """Map a batch post response to OpenOrders.
+
+        The response is bound to requests POSITIONALLY, so a response whose length does
+        not match the request cannot be attributed safely — a reordered or shifted
+        result would attach an order id to the wrong (token, side, price, size), after
+        which the bot cancels healthy orders and keeps untracked ones. Rather than
+        guess, we return nothing for the ambiguous case and let the engine's
+        quarantine (cancel-all-then-resync) recover the true state.
+        """
         items = resp if isinstance(resp, list) else resp.get("orders", resp.get("data", []))
+        if not isinstance(items, list):
+            log.warning("place_response_unexpected_shape", got=str(resp)[:120])
+            return []
+        if len(items) != len(quotes):
+            log.warning("place_response_length_mismatch", requested=len(quotes),
+                        returned=len(items),
+                        note="ambiguous binding -> quarantining rather than mis-attributing")
+            return []
         out: list[OpenOrder] = []
-        for q, item in zip(quotes, items if isinstance(items, list) else [], strict=False):
+        for q, item in zip(quotes, items, strict=True):
             oid = _first(item, "orderID", "orderId", "order_id", "id", "hash")
             if not oid:
                 log.warning("place_response_missing_id", item=str(item)[:120])
@@ -595,8 +618,16 @@ class ExecutionGateway:
                     skipped += 1
                     continue
             if skipped:
-                log.warning("open_orders_rows_skipped", skipped=skipped, total=len(rows),
-                            note="field-shape mismatch would otherwise look like an empty book")
+                # An all-skipped payload is indistinguishable from an empty book, and
+                # returning [] there lets the reconciler drop every live order and
+                # re-place it. Treat any parsing failure as an unreadable read (None)
+                # rather than trusting a zero we cannot justify.
+                log.warning("open_orders_rows_skipped", skipped=skipped, total=len(rows))
+                if not out:
+                    raise ValueError(
+                        f"all {len(rows)} open-order rows failed to parse "
+                        f"(field-shape mismatch?)"
+                    )
             return out
 
         try:
@@ -619,7 +650,11 @@ class ExecutionGateway:
         """
         user = self.funder
         if not user or not user.startswith("0x") or user == "0xPAPER":
-            return {}
+            # Not applicable (paper mode / no wallet). This must NOT look like "flat":
+            # an empty dict is consumed as an authoritative snapshot, so returning it
+            # would zero every tracked position on each reconcile cycle.
+            log.debug("positions_not_applicable", funder=user[:12] if user else "")
+            return None
         out: dict[str, tuple[float, float]] = {}
         cursor: str | None = None
         try:
@@ -641,6 +676,7 @@ class ExecutionGateway:
                     if rows is None:
                         log.warning("positions_unexpected_shape", got=str(payload)[:120])
                         return None
+                    parsed_here = 0
                     for p in rows:
                         if not isinstance(p, dict):
                             continue
@@ -649,15 +685,31 @@ class ExecutionGateway:
                         if tok is None or size is None or size <= 0:
                             continue
                         out[str(tok)] = (size, _as_float(p.get("avg_price")) or 0.0)
+                        parsed_here += 1
+                    if rows and parsed_here == 0:
+                        # The page had rows but none matched the expected field names.
+                        # That is a schema drift, not an empty portfolio, and treating
+                        # it as "no positions" would wipe every tracked holding.
+                        log.warning("positions_rows_unparsed", rows=len(rows),
+                                    sample=str(rows[0])[:160])
+                        return None
                     page = payload.get("pagination")
-                    cursor = page.get("next_cursor") if isinstance(page, dict) else None
+                    if not isinstance(page, dict):
+                        # No pagination object: we cannot prove the listing is complete,
+                        # so a partial read must not be consumed as authoritative.
+                        log.warning("positions_pagination_missing")
+                        return None
+                    cursor = page.get("next_cursor")
                     if not cursor:
                         break
                 else:
                     log.warning("positions_pagination_capped", pages=_MAX_POSITION_PAGES)
+                    return None  # partial listing is not authoritative
         except (httpx.HTTPError, ValueError, TypeError) as exc:
             log.warning("positions_failed", err=str(exc))
             return None
+        # An empty list IS a valid authoritative answer ("we hold nothing"), so an
+        # empty dict here is legitimate — only the ambiguous cases above return None.
         return out
 
     async def balance_allowance(

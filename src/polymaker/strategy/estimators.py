@@ -22,7 +22,7 @@ class Ewma:
     observation gets the remaining weight. The first observation seeds the mean.
     """
 
-    __slots__ = ("halflife", "_value", "_last_ts", "_initialized")
+    __slots__ = ("halflife", "_value", "_last_ts", "_initialized", "out_of_order")
 
     def __init__(self, halflife_s: float) -> None:
         if halflife_s <= 0:
@@ -31,6 +31,7 @@ class Ewma:
         self._value = 0.0
         self._last_ts = 0.0
         self._initialized = False
+        self.out_of_order = 0  # observations dropped for arriving with a stale ts
 
     def update(self, value: float, ts: float) -> float:
         if not self._initialized:
@@ -38,7 +39,15 @@ class Ewma:
             self._last_ts = ts
             self._initialized = True
             return self._value
-        dt = max(0.0, ts - self._last_ts)
+        if ts < self._last_ts:
+            # Out-of-order observation (buffered WS frame, clock step, or two
+            # estimators fed from different sources). Applying it would decay by
+            # dt=0, i.e. take a full-weight sample out of sequence, AND move the clock
+            # BACKWARDS so the next in-order sample is discounted twice. Treat a stale
+            # timestamp as no-op and keep the clock monotonic.
+            self.out_of_order += 1
+            return self._value
+        dt = ts - self._last_ts
         decay = 0.5 ** (dt / self.halflife)
         self._value = decay * self._value + (1.0 - decay) * value
         self._last_ts = ts
@@ -49,8 +58,8 @@ class Ewma:
 
         Used to age out flow/vol during silence without a new observation.
         """
-        if self._initialized:
-            dt = max(0.0, ts - self._last_ts)
+        if self._initialized and ts > self._last_ts:
+            dt = ts - self._last_ts
             self._value *= 0.5 ** (dt / self.halflife)
             self._last_ts = ts
         return self._value
@@ -100,13 +109,16 @@ class VolEstimator:
 
 
 class FlowEstimator:
-    """Signed aggressor flow and its normalized strength (a real z-score).
+    """Signed aggressor flow and its normalized strength.
 
-    Earlier this reported ``EWMA(signed) / EWMA(|size|)``. That ratio is bounded by
-    1 in absolute value (|EWMA(x)| <= EWMA(|x|) always), so a `trend_flow_z` of 1.5
-    or 2.6 could never be reached and the whole one-sided-flow TRENDING posture was
-    dead configuration. Instead we normalise the EWMA of signed flow by the EWMA of
-    its *variance* about zero, which yields a genuine, unbounded z-score.
+    Earlier this reported ``EWMA(signed) / EWMA(|size|)``. That ratio is bounded by 1
+    in absolute value (|EWMA(x)| <= EWMA(|x|)), so a `trend_flow_z` of 1.5 or 2.6 could
+    never be reached and the one-sided-flow TRENDING posture was dead configuration.
+
+    This normalises the EWMA of signed flow by the EWMA of its squared magnitude,
+    which has better dynamics but is STILL bounded to [-1, 1] (|mean| <= RMS). Any
+    threshold above 1 is therefore unreachable by construction — `StrategyProfile`
+    rejects one at load time rather than letting it silently never fire.
 
     `flow_scale` converts a trade size into a comparable unit for mixing sources
     (used for quote-count style markets where sizes are constant and only the count
@@ -151,8 +163,13 @@ class FlowEstimator:
 
     @property
     def imbalance(self) -> float:
-        """Net/gross flow ratio in [-1, 1] — the bounded companion signal."""
-        gross = self._sq.value ** 0.5
+        """Bounded net-flow ratio in [-1, 1]: 1 all buys, -1 all sells, 0 balanced.
+
+        Distinct from `z` in interpretation and scale: this is a simple composition
+        measure (mean / RMS), useful when only the direction mix matters and no
+        threshold tuning against a z-score is wanted.
+        """
+        gross = math.sqrt(max(self._sq.value, 0.0))
         return self._signed.value / gross if gross > 1e-9 else 0.0
 
 

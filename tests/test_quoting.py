@@ -86,7 +86,11 @@ def test_never_bids_through_fair_value(meta, profile):
 
 
 def test_layers_split_size(meta, profile):
-    tq = construct_quotes(_inputs(meta, profile))
+    # A layer that steps outside the reward band would earn nothing, so use a market
+    # with room for the configured layer count.
+    import dataclasses
+
+    tq = construct_quotes(_inputs(dataclasses.replace(meta, rewards_max_spread=10.0), profile))
     yes = sorted((q for q in tq.quotes if q.token_id == "yes-token" and q.side == Side.BUY),
                  key=lambda q: -q.price)
     assert len(yes) == profile.layers
@@ -169,9 +173,16 @@ def test_no_exit_when_position_is_dust(meta, profile):
 
 
 def test_toxicity_widens_spread(meta, profile):
-    """Higher toxicity should push the YES bid lower (wider spread)."""
-    calm = construct_quotes(_inputs(meta, profile, regime=Regime.TRENDING, toxicity=0.0))
-    toxic = construct_quotes(_inputs(meta, profile, regime=Regime.TRENDING, toxicity=0.02))
+    """Higher toxicity should push the YES bid lower (wider spread).
+
+    Toxic quotes are now also capped to the reward band, so the comparison uses a
+    market with enough band headroom for the widening to be visible.
+    """
+    import dataclasses
+
+    wide = dataclasses.replace(meta, rewards_max_spread=10.0)
+    calm = construct_quotes(_inputs(wide, profile, regime=Regime.TRENDING, toxicity=0.0))
+    toxic = construct_quotes(_inputs(wide, profile, regime=Regime.TRENDING, toxicity=0.02))
 
     def top_yes(tq):
         ps = [q.price for q in tq.quotes if q.token_id == "yes-token" and q.side == Side.BUY]

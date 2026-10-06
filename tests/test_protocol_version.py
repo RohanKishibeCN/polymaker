@@ -384,6 +384,7 @@ def test_gateway_place_passes_position_id_for_v2() -> None:
         class execution:  # noqa: N801
             post_only = True
             rate_budget_fraction = 0.25
+            max_orders_per_batch = 15
         class wallet:  # noqa: N801
             data_api_host = "https://data-api.polymarket.com"
 

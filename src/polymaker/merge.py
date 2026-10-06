@@ -151,13 +151,29 @@ class Merger:
 
     @property
     def can_merge(self) -> bool:
-        """EOA (0) and Gnosis Safe (2) merge on-chain directly. The V2 DepositWallet
-        (1/3) merges via the builder relayer — possible only when builder creds are
-        configured (self-generate once with clob.create_builder_api_key)."""
+        """Whether ANY merge path is actually able to run.
+
+        EOA (0) and Gnosis Safe (2) merge on-chain directly. The V2 DepositWallet
+        (1/3) merges via the builder relayer, which needs builder creds
+        (self-generate once with clob.create_builder_api_key). An intentionally
+        disabled V2 Router path is reported separately, so it is not mistaken for a
+        broken merge and does not raise a false failure alert every cycle.
+        """
+        return self.can_merge_v1 or self.can_merge_v2
+
+    @property
+    def can_merge_v1(self) -> bool:
         st = self._cfg.wallet.signature_type
         if st in (0, 2):
             return True
         return self._cfg.secrets.has_builder_creds
+
+    @property
+    def can_merge_v2(self) -> bool:
+        """V2 Router merges require the feature gate AND a usable submission path."""
+        if not self._cfg.wallet.merge_v2_enabled:
+            return False
+        return self.can_merge_v1
 
     def merge(
         self,
@@ -220,7 +236,7 @@ class Merger:
         if self._cfg.wallet.signature_type in (0, 2):
             tx = fn.build_transaction({
                 "from": self._account.address,
-                "nonce": w3.eth.get_transaction_count(self._account.address),
+                "nonce": w3.eth.get_transaction_count(self._account.address, "pending"),
                 "chainId": self._cfg.wallet.chain_id,
                 "gas": 400_000,
                 "maxFeePerGas": w3.eth.gas_price * 2,
@@ -307,7 +323,7 @@ class Merger:
         tx = fn.build_transaction(
             {
                 "from": addr,
-                "nonce": w3.eth.get_transaction_count(addr),
+                "nonce": w3.eth.get_transaction_count(addr, "pending"),
                 "chainId": self._cfg.wallet.chain_id,
                 "gas": 300_000,
                 "maxFeePerGas": w3.eth.gas_price * 2,
@@ -365,7 +381,7 @@ class Merger:
             to, 0, data, 0, 0, 0, 0, _ZERO, _ZERO, packed
         ).build_transaction({
             "from": signer.address,
-            "nonce": w3.eth.get_transaction_count(signer.address),
+            "nonce": w3.eth.get_transaction_count(signer.address, "pending"),
             "chainId": self._cfg.wallet.chain_id,
             "gas": 600_000,
             "maxFeePerGas": w3.eth.gas_price * 2,

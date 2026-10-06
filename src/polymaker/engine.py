@@ -83,12 +83,14 @@ class Engine:
         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
         self._last_quote_fv: dict[str, float] = {}  # requote suppression
         self._position_since: dict[str, float] = {}  # token -> when we first held it
+        self._book_unusable_since: dict[str, float] = {}  # cid -> first bad-book tick
         # supervised tasks: name -> (factory, task) so a dead task restarts
         self._task_specs: dict[str, Any] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._aux_tasks: list[asyncio.Task[Any]] = []  # fire-and-forget (merges)
         # health / recovery signals
         self._reconcile_now = asyncio.Event()
+        self._last_day_reset = time.time()  # UTC-day boundary for the daily loss window
         self._user_started = False  # user WS task launched (live mode)
         self._hb_was_down = False
         self._chain_lock = asyncio.Lock()  # serialize on-chain txs (nonce safety)
@@ -140,6 +142,9 @@ class Engine:
         self._tasks[name] = asyncio.create_task(factory(), name=name)
 
     _supervise_interval_s: float = 5.0
+    # how long a market's book may stay unusable before we pull its quotes, when we
+    # are NOT halted/blind (e.g. a sweep cleared one side)
+    _bad_book_pull_after_s: float = 3.0
 
     async def _supervise(self) -> None:
         """Restart any engine task that exits while we're running. Never down."""
@@ -177,9 +182,11 @@ class Engine:
         for t in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await t
-        # Drain the blocking client pool for the same reason.
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(self.gateway.drain)
+        # Drain the blocking client pool for the same reason, but BOUNDED: a hung
+        # client call must not stop us from reaching cancel_all, which is the step
+        # that actually protects the account.
+        with contextlib.suppress(Exception, asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.to_thread(self.gateway.drain), timeout=10.0)
         with contextlib.suppress(Exception):
             await self.gateway.cancel_all()
         self.gateway.close()
@@ -319,6 +326,7 @@ class Engine:
         if positions:
             self.state.reconcile_positions(positions)
             log.info("startup_positions", n=len(positions))
+        self._seed_position_clocks()
 
     def _token_versions(self, tokens: list[str]) -> dict[str, ProtocolVersion]:
         """Map our traded token ids to their market's protocol version, so ledger
@@ -388,6 +396,16 @@ class Engine:
             self._sweep[cid] = True
 
     def _on_fill(self, fill: Fill) -> None:
+        # Scope BOTH the cash ledger and the inventory clock to markets we actually
+        # quote. `note_fill` used to run before this check, so a manual UI trade the
+        # operator made in a market we quote would move our net_cash and inventory
+        # basis — and because equity is derived from net_cash, a withdrawal could
+        # then look like a trading loss and trip the daily-loss kill switch.
+        cid = self._token_cid.get(fill.token_id)
+        if cid is None:
+            log.debug("fill_ignored_untracked", token=fill.token_id[:12],
+                      side=fill.side.value, size=fill.size)
+            return
         self.risk.note_fill(fill)
         if fill.side is Side.BUY and fill.size > 0:
             # start the hold clock for exit urgency (an exit that never becomes
@@ -404,6 +422,26 @@ class Engine:
         # Record in the FILLED token's price space and remember which token it was,
         # so the mark can later be resolved in that same space (see _token_fv).
         est.markout.record_fill(fill.side, token_fv, fill.ts, fill.token_id)
+
+    def _seed_position_clocks(self, now: float | None = None) -> None:
+        """Start the hold clock for inventory we did not buy in this process.
+
+        `_position_since` is otherwise written only by live fills, so after a restart
+        with a bag every `held_s` was 0, exit urgency stayed 0, and the exits rested
+        above the market forever — the exact failure urgency exists to prevent.
+        """
+        ts = time.time() if now is None else now
+        for token_id, pos in self.state.positions.items():
+            if pos.size > 0 and token_id not in self._position_since:
+                self._position_since[token_id] = ts
+
+    def _sync_position_clock(self, token_id: str, size: float, now: float | None = None) -> None:
+        """Keep the hold clock consistent with the current holding."""
+        ts = time.time() if now is None else now
+        if size > 0:
+            self._position_since.setdefault(token_id, ts)
+        else:
+            self._position_since.pop(token_id, None)
 
     def _token_fv(self, yes_fv: float, token_id: str, cid: str | None = None) -> float:
         """Convert a YES-space fair value into `token_id`'s own price space.
@@ -497,6 +535,25 @@ class Engine:
         async with lock:  # serialize vs the reconcile loop mutating this market
             await self._recompute_locked(cid)
 
+    async def _maybe_pull_on_bad_book(self, cid: str, reason: str) -> None:
+        """Pull resting quotes when the book is unusable for longer than a grace.
+
+        A sweep that clears one side of the book leaves it "unusable" (one-sided) while
+        the WS link stays healthy, so `_halted_or_blind` is false and the old path left
+        every previous quote resting — exposed to exactly the flow that just swept it.
+        A short grace avoids churn on a transient crossed/dusty book.
+        """
+        now = time.time()
+        if await self._halted_or_blind(cid):
+            self._book_unusable_since.pop(cid, None)
+            await self._pull_all_quotes(cid, reason)
+            return
+        since = self._book_unusable_since.setdefault(cid, now)
+        if now - since >= self._bad_book_pull_after_s:
+            await self._pull_all_quotes(cid, reason)
+            # consume the sweep flag so a stale sweep cannot linger
+            self._sweep.pop(cid, None)
+
     async def _pull_all_quotes(self, cid: str, reason: str) -> None:
         """Cancel every resting order for a market, regardless of book state.
 
@@ -527,22 +584,20 @@ class Engine:
         # unreliable, so we cannot quote — but we must still enforce any halt and pull
         # resting orders rather than leaving them exposed to the flow that broke it.
         if yes_book is None or yes_book.is_empty:
-            if await self._halted_or_blind(cid):
-                await self._pull_all_quotes(cid, "book_unusable_halt")
+            await self._maybe_pull_on_bad_book(cid, "book_unusable")
             return
 
         bb, ba = yes_book.best_bid(), yes_book.best_ask()
         if bb is None or ba is None or bb.price >= ba.price:
-            if await self._halted_or_blind(cid):
-                await self._pull_all_quotes(cid, "book_crossed_halt")
+            await self._maybe_pull_on_bad_book(cid, "book_crossed")
             return
 
         now = time.time()
         micro = yes_book.microprice(p.micro_levels)
         if micro is None:
-            if await self._halted_or_blind(cid):
-                await self._pull_all_quotes(cid, "no_microprice_halt")
+            await self._maybe_pull_on_bad_book(cid, "no_microprice")
             return
+        self._book_unusable_since.pop(cid, None)  # book is healthy again
         est = self.est[cid]
         est.flow.decay_to(now)
         fv = compute_fair_value(micro, est.flow.z, meta.tick_size)
@@ -575,15 +630,21 @@ class Engine:
                 critical=hb_blind,
             )
 
-        # Resting BUY orders are committed capital: count them against the caps, or
-        # a full stack of bids can fill on an account the caps believed was empty.
+        # Resting BUY orders are committed capital: count them against the caps, or a
+        # full stack of bids can fill on an account the caps believed was empty. The
+        # GLOBAL cap needs every market's resting bids, not just this one's, or N
+        # markets can each pass while committing N x the cap.
+        all_tokens = {t for m in self.metas.values() for t in (m.yes.token_id, m.no.token_id)}
+        all_orders = [o for t in all_tokens for o in self.state.orders_for(t)]
         resting = resting_buy_notional(
             self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id),
             {meta.yes.token_id, meta.no.token_id},
         )
         rd = self.risk.evaluate(meta, ws_stale=blind,
                                 event_group_cost=self._event_group_cost(meta),
-                                resting_buy_notional=resting)
+                                resting_buy_notional=resting,
+                                global_resting_buy_notional=resting_buy_notional(
+                                    all_orders, all_tokens))
         if rd.halt and rd.reason not in ("ws_stale",):
             self.alerter.alert(
                 f"risk_halt:{rd.reason}", f"risk halt: {rd.reason}",
@@ -618,6 +679,17 @@ class Engine:
             yes_exit_urgency=1.0 if force_exit else exit_urgency(held_yes_s, p.exit_urgency_s),
             no_exit_urgency=1.0 if force_exit else exit_urgency(held_no_s, p.exit_urgency_s),
         ))
+
+        # A leg can be declined for being too small to score (below the reward floor)
+        # or because no price both scores and respects the required edge. Either way it
+        # earns nothing, so surface it: a one-sided quote forfeits two-sided reward
+        # eligibility and the operator should know before wondering where income went.
+        want = {meta.yes.token_id, meta.no.token_id}
+        got = {q.token_id for q in tq.quotes if q.side is Side.BUY}
+        if want - got:
+            log.warning("entry_leg_declined", cid=cid[:8], regime=regime.value,
+                        missing=sorted(t[:12] for t in (want - got)),
+                        note="below reward floor / band cannot fit the required edge")
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
         plan = reconcile(tq, live, tick=meta.tick_size,
@@ -765,21 +837,37 @@ class Engine:
                 log.critical("heartbeat_down_halting", failures=self.gateway.heartbeat_failures)
                 self._wake_all()
             elif ok and self._hb_was_down:
-                # recovered: our server-side orders were wiped — drop local
-                # order state, resync authoritatively, then resume quoting
                 self._hb_was_down = False
                 log.warning("heartbeat_recovered_resyncing")
-                self.state.clear_orders()
+                # Read BEFORE clearing. The dead-man switch normally means the exchange
+                # already cancelled everything, but a local-only heartbeat gap leaves
+                # real orders resting. Clearing first and then failing the read (the
+                # same network blip can cause both) would empty local state while
+                # orders are still live, and the quoter would re-place them.
+                authoritative = True
                 for cid, meta in self.metas.items():
                     lock = self._locks.get(cid)
                     if lock is None:
                         continue
                     # Take the market lock: the quoter may be mid-place(), and a
-                    # snapshot taken before that placement plus grace_s=0 would drop
-                    # the just-placed orders and cause duplicates.
+                    # snapshot taken before that placement would drop the just-placed
+                    # orders and cause duplicates.
                     async with lock:
                         with contextlib.suppress(Exception):
-                            await self._refresh_token_orders(meta, grace_s=0.0)
+                            if not await self._refresh_token_orders(meta, grace_s=0.0):
+                                authoritative = False
+                if not authoritative:
+                    # Could not confirm the server state -> keep whatever we have and
+                    # let the next reconcile retry, rather than risk duplicates.
+                    log.error("heartbeat_recovery_read_failed_keeping_state")
+                else:
+                    # Drop local orders that the authoritative snapshot did not list.
+                    live_ids = {
+                        o.order_id
+                        for tok in self._token_cid
+                        for o in self.state.orders_for(tok)
+                    }
+                    log.info("heartbeat_recovery_resynced", orders=len(live_ids))
                 self._wake_all()
             await asyncio.sleep(self.cfg.engine.heartbeat_interval_s)
 
@@ -857,9 +945,16 @@ class Engine:
             if rounds % 4 == 0:
                 with contextlib.suppress(Exception):
                     await self._check_position_divergence()
+                with contextlib.suppress(Exception):
+                    await self._reconcile_cash()
             self.state.record_pnl(self.risk.equity, self.risk.net_cash,
                                   self.risk.inventory_value, self.risk.daily_pnl)
             if rounds % 20 == 0:
+                # re-baseline the daily loss window on a UTC day change; without this
+                # `daily_pnl` was lifetime PnL and the $ cap was really a since-start cap
+                if _utc_day_changed(self._last_day_reset):
+                    self.risk.reset_day()
+                    self._last_day_reset = time.time()
                 self.state.checkpoint_wal()
 
     async def _check_position_divergence(self) -> None:
@@ -900,6 +995,30 @@ class Engine:
                 cid = self._token_cid.get(tok)
                 if cid:
                     self._wake_cid(cid)
+
+    async def _reconcile_cash(self) -> None:
+        """Snap the cash ledger to the exchange's real pUSD balance.
+
+        `net_cash` only ever moves on fills, so deposits and withdrawals are invisible
+        to equity — a withdrawal is indistinguishable from a trading loss and could
+        trip the daily-loss kill switch on money that was never lost. We also cannot
+        see manual UI trades that touch the same funder, which is the other source of
+        drift. Rather than guess the cause, reconcile to reality and surface the size
+        of the adjustment.
+        """
+        if self.paper or self.gateway.paper:
+            return
+        exchange_cash = await self.gateway.collateral_balance()
+        if exchange_cash is None:
+            log.debug("cash_reconcile_skipped", reason="balance_unreadable")
+            return
+        delta = self.risk.reconcile_cash(exchange_cash, self.risk.inventory_value)
+        if delta:
+            self.alerter.alert(
+                "cash_reconciled",
+                f"cash ledger adjusted by {delta:+.2f} pUSD (deposit/withdrawal or "
+                f"unattributed fill); cumulative {self.risk.cash_adjustments:+.2f}",
+            )
 
     async def refresh_market_metadata(self) -> None:
         """Pull fresh metadata from Gamma for all traded markets: halt on
@@ -974,12 +1093,24 @@ class Engine:
             "rebate_rate": _fnum(fee.get("rebateRate")),
             "end_date_iso": raw.get("endDate"),
             "min_order_size": _fnum(raw.get("orderMinSize")),
+            # tick size MUST be refreshed: Polymarket re-tickets a market as its
+            # price approaches the extremes (0.001 -> 0.01). `meta.tick_size` is what
+            # signs orders and snaps prices, so a stale value means every order goes
+            # off-grid, gets rejected, and the batch failure triggers quarantine churn.
+            "tick_size": _fnum(raw.get("orderPriceMinTickSize")),
         }
         updates = {k: v for k, v in candidates.items()
                    if v is not None and getattr(old, k) != v}
         if updates:
             self.metas[cid] = dataclasses.replace(old, **updates)
             log.info("meta_refreshed", cid=cid[:8], **updates)
+            if "tick_size" in updates:
+                # Resting orders were priced on the old grid; they must be repriced.
+                log.warning("tick_size_changed_requoting", cid=cid[:8],
+                            was=old.tick_size, now=updates["tick_size"])
+                book = self.md.book(old.yes.token_id) if old.tokens else None
+                if book is not None:
+                    book.set_tick_size(updates["tick_size"])
             self._wake_cid(cid)
 
     async def _metadata_refresh_loop(self) -> None:
@@ -1049,6 +1180,15 @@ def _fnum(v: object) -> float | None:
         return float(v)  # type: ignore[arg-type]
     except (ValueError, TypeError):
         return None
+
+
+def _utc_day_changed(last_ts: float) -> bool:
+    """True when `last_ts` falls on a different UTC calendar day than now."""
+    from datetime import UTC, datetime
+
+    last = datetime.fromtimestamp(last_ts, tz=UTC).date()
+    now = datetime.now(UTC).date()
+    return last != now
 
 
 def _is_resolved_raw(raw: dict[str, Any], version: ProtocolVersion) -> bool:

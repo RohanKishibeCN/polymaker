@@ -41,10 +41,13 @@ exit_urgency_s      = 900
 merge_min_size      = 20.0
 
 
-# romania-pm: "Next PM of Romania" — Alexandru Nazare leg. Live sample 2026-07-06:
-# price ~0.487/0.488 (near 50/50 -> max reward score, low extremity), tick 0.001,
-# 1-tick spread, ~$4k/day tape, rewards: min 50 shares/order, 4.5c band, ~$257/day
-# rate, 25% rebate. endDate is stale (past) but still accepting -> handled as no-end.
+# romania-pm: "Next PM of Romania" — Alexandru Nazare leg.
+# NOTE (2026-10-06): this market has moved a long way from the 2026-07-06 sample that
+# sized this profile. It now trades near 0.106, so the reward floor costs real money on
+# the expensive leg: 100 shares of NO at ~0.89 ties up ~$89, far more than the 22 USDC
+# this profile budgets. The strategy will therefore decline that leg (logged as
+# entry_leg_declined) and quote one-sided. Either raise base_size_usdc for this market or
+# accept one-sided quoting — check the current price before choosing.
 [profiles.romania-pm]
 micro_levels        = 3
 flow_ewma_halflife_s = 120

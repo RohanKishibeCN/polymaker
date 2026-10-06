@@ -45,6 +45,7 @@ class RiskManager:
         self._net_cash = 0.0  # cumulative signed cash from fills (+sell, -buy)
         self._day_start_equity = 0.0
         self._killed = False
+        self._cash_adjustments = 0.0  # cumulative non-trading cash drift
         # Rolling error window: a latched, never-decaying ratio turns one transient
         # reject storm into a permanent shutdown that looks like "no fills".
         self._recent_order_results: list[tuple[float, bool]] = []
@@ -56,6 +57,36 @@ class RiskManager:
 
     def update_mark(self, token_id: str, fv: float) -> None:
         self._marks[token_id] = fv
+
+    def reconcile_cash(self, exchange_cash: float, inventory_basis: float | None = None) -> float:
+        """Reconcile our cash ledger against the exchange's actual pUSD balance.
+
+        `net_cash` is built purely from fills, so deposits and withdrawals are
+        invisible to it — and because equity = net_cash + inventory, a withdrawal
+        looks exactly like a trading loss and can trip the daily-loss kill switch on
+        money that was never lost. Rather than guess at the cause, we snap the ledger
+        to reality and report the drift: a large unexplained jump is also the earliest
+        signal of a mis-attributed fill.
+
+        `inventory_basis` is the mark of positions we hold, used only to log the split
+        between cash and inventory when reporting the adjustment.
+        """
+        delta = exchange_cash - self._net_cash
+        if abs(delta) < 0.01:
+            return 0.0
+        self._net_cash = exchange_cash
+        self._cash_adjustments += delta
+        log.warning("cash_reconciled", delta=round(delta, 2),
+                    ledger=round(exchange_cash, 2),
+                    inventory_basis=None if inventory_basis is None else round(inventory_basis, 2),
+                    cumulative=round(self._cash_adjustments, 2),
+                    note="deposit/withdrawal or mis-attributed fill")
+        return delta
+
+    @property
+    def cash_adjustments(self) -> float:
+        """Cumulative non-trading cash drift (deposits/withdrawals)."""
+        return self._cash_adjustments
 
     def _inventory_value(self) -> float:
         total = 0.0
@@ -86,8 +117,14 @@ class RiskManager:
         log.info("risk_day_reset", equity=round(self.equity, 2))
 
     # ── error-rate breaker (rolling window) ─────────────────────────────
-    def note_order_result(self, ok: bool, now: float | None = None) -> None:
-        ts = time.time() if now is None else now
+    def note_order_result(self, ok: bool) -> None:
+        """Record one order attempt. Timestamps are ALWAYS wall clock.
+
+        An earlier version accepted a caller-supplied `now`, which could be any clock
+        (monotonic, simulated). Mixing it with `error_rate`'s wall-clock pruning made
+        the window compare incomparable timestamps and silently disabled the breaker.
+        """
+        ts = time.time()
         self._recent_order_results.append((ts, ok))
         self._prune(ts)
 
@@ -131,7 +168,22 @@ class RiskManager:
         ws_stale: bool,
         event_group_cost: float,
         resting_buy_notional: float = 0.0,
+        global_resting_buy_notional: float | None = None,
     ) -> RiskDecision:
+        """Per-market pre-trade gate.
+
+        `resting_buy_notional` is THIS market's unfilled bids; the GLOBAL cap must see
+        every market's, so the caller passes the account-wide figure separately. Adding
+        only the current market's orders let N markets each pass while committing N x
+        the cap in total.
+
+        The soft taper measures FILLED inventory only, on purpose. Folding resting
+        orders into the size that governs them closes a feedback loop: a full quote
+        stack shrinks the next target, the reconciler cancels the stack, exposure falls
+        to zero and the size springs back — a cancel/replace limit cycle (the churn
+        `test_no_taper_churn` exists to prevent). Hard caps must see resting orders;
+        the taper must not.
+        """
         halted, why = self.global_halt()
         if halted:
             return RiskDecision(True, False, 0.0, why)
@@ -139,10 +191,14 @@ class RiskManager:
             return RiskDecision(True, False, 0.0, "ws_stale")
 
         resting = max(0.0, resting_buy_notional)
-        market_notional = self._market_notional(meta) + resting
-        total_exposure = self._total_exposure() + resting
+        global_resting = (resting if global_resting_buy_notional is None
+                          else max(0.0, global_resting_buy_notional))
+        filled_market = self._market_notional(meta)
+        filled_total = self._total_exposure()
+        market_notional = filled_market + resting
+        total_exposure = filled_total + global_resting
 
-        # hard caps -> reduce only
+        # hard caps (filled + committed resting orders) -> reduce only
         if market_notional >= self._cfg.max_market_notional_usdc:
             return RiskDecision(False, True, 1.0, "market_cap")
         if event_group_cost >= self._cfg.max_event_group_loss_usdc:
@@ -150,10 +206,10 @@ class RiskManager:
         if total_exposure >= self._cfg.max_total_exposure_usdc:
             return RiskDecision(False, True, 1.0, "total_exposure_cap")
 
-        # soft scaling: taper size as any cap is approached (worst-binding wins)
+        # soft scaling on FILLED inventory only (see docstring)
         scale = min(
-            _headroom(market_notional, self._cfg.max_market_notional_usdc),
-            _headroom(total_exposure, self._cfg.max_total_exposure_usdc),
+            _headroom(filled_market, self._cfg.max_market_notional_usdc),
+            _headroom(filled_total, self._cfg.max_total_exposure_usdc),
             _headroom(event_group_cost, self._cfg.max_event_group_loss_usdc),
         )
         return RiskDecision(False, False, scale, "")
