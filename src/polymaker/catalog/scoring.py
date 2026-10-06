@@ -48,6 +48,10 @@ class BookStats:
     mid: float = 0.0
     spread: float = 0.0
     touch_depth: float = 0.0
+    our_distance_cents: float = 0.0
+    """How far from the mid we expect our own quote to sit, in cents. Competition is
+    weighted by distance, so pretending we score at full weight while competitors do
+    not would overstate our share (up to ~4x when the spread equals the band)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +160,13 @@ def reward_daily_income(m: MarketMeta, book: BookStats | None = None) -> float:
         # Nothing measurable in the band. Claiming the whole pool here is how a dead
         # market masquerades as the best opportunity in the catalog.
         return 0.0
-    our_share = shares / (existing + shares)
+    # Apply the SAME distance weight to ourselves that every competitor's size
+    # already carries, so the share is apples-to-apples.
+    our_score = shares * reward_score_weight(book.our_distance_cents, m.rewards_max_spread)
+    if our_score <= 0:
+        # Our own quote would sit outside the band and earn nothing.
+        return 0.0
+    our_share = our_score / (existing + our_score)
     return m.rewards_daily_rate * our_share
 
 

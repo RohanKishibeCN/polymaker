@@ -158,3 +158,32 @@ def test_store_upsert_is_idempotent(tmp_path):
     store.upsert_market(m)  # second time updates, not duplicates
     assert len(store.top(10)) == 1
     store.close()
+
+
+def test_our_reward_score_is_distance_weighted_like_the_competition():
+    """Our own score must carry the same distance weight as every competitor's size.
+
+    Regression: we scored ourselves at full weight while competitors' sizes were
+    distance-weighted, which overstated our pool share by up to ~4x when the spread
+    approached the band.
+    """
+    m = parse_market({**RAW, "rewardsMinSize": 100, "rewardsMaxSpread": 5.0},
+                     {"0xabc": 100.0})
+    assert m is not None
+    # at the touch (distance ~1c of a 5c band) we keep most of our weight
+    at_touch = score_market(m, BookStats(weighted_shares=1000, mid=0.49,
+                                         our_distance_cents=1.0))
+    # sitting at the band edge we earn essentially nothing, despite the same size
+    at_edge = score_market(m, BookStats(weighted_shares=1000, mid=0.49,
+                                        our_distance_cents=5.0))
+    assert at_touch.reward_daily_income > 0
+    assert at_edge.reward_daily_income == 0.0
+
+
+def test_our_score_is_zero_when_we_would_not_score():
+    m = parse_market({**RAW, "rewardsMinSize": 100, "rewardsMaxSpread": 2.0},
+                     {"0xabc": 100.0})
+    assert m is not None
+    outside = score_market(m, BookStats(weighted_shares=500, mid=0.49,
+                                        our_distance_cents=3.0))
+    assert outside.reward_daily_income == 0.0

@@ -62,7 +62,7 @@ async def fetch_book_stats(
     of everything inside the band. The *thinner* side binds: a two-sided quote only
     scores as well as its weaker leg.
     """
-    weighteds: list[float] = []
+    results: list[tuple[float, float, float]] = []  # (thinner_weight, its dist, mid)
     mid: float | None = None
     spread = 0.0
     for tid in token_ids:
@@ -80,15 +80,22 @@ async def fetch_book_stats(
         best_bid = max(bids)[0]
         best_ask = min(asks)[0]
         this_mid = (best_bid + best_ask) / 2.0
-        weighteds.append(
-            min(_weighted_depth(bids, this_mid, band_cents),
-                _weighted_depth(asks, this_mid, band_cents))
-        )
+        w_bid = _weighted_depth(bids, this_mid, band_cents)
+        w_ask = _weighted_depth(asks, this_mid, band_cents)
+        # The thinner side sets the competition, and we would quote AT the touch on
+        # that same side, so its distance from the mid is the distance we score at.
+        if w_bid <= w_ask:
+            thinner, dist = w_bid, abs(this_mid - best_bid) * 100.0
+        else:
+            thinner, dist = w_ask, abs(best_ask - this_mid) * 100.0
+        results.append((thinner, dist, this_mid))
         if mid is None:
             mid, spread = this_mid, max(0.0, best_ask - best_bid)
-    if mid is None or not weighteds:
+    if mid is None or not results:
         return None
-    return BookStats(weighted_shares=min(weighteds), mid=mid, spread=spread)
+    thinner, dist, _ = min(results, key=lambda t: t[0])
+    return BookStats(weighted_shares=thinner, mid=mid, spread=spread,
+                     our_distance_cents=dist)
 
 
 def _levels(items: Any) -> list[tuple[float, float]]:
