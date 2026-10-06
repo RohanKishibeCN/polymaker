@@ -231,6 +231,53 @@ class Config(BaseModel):
     def enabled_markets(self) -> list[MarketEntry]:
         return [m for m in self.markets if m.enabled]
 
+    def preflight(self) -> list[str]:
+        """Blocking problems that make a LIVE run unsafe or incoherent.
+
+        Returns human-readable issues; an empty list means the configuration is
+        internally consistent. These are exactly the mistakes that are otherwise only
+        discovered mid-session: a market pointing at a profile that does not exist (a
+        KeyError at the first quote), no wallet for a live run, or a proxy that is
+        configured but not actually listening — which silently fails every HTTP call.
+        """
+        issues: list[str] = []
+        known = set(self.profiles)
+        for entry in self.enabled_markets:
+            if entry.profile not in known:
+                issues.append(
+                    f"market {entry.ref!r} uses unknown profile {entry.profile!r} "
+                    f"(known: {sorted(known)})"
+                )
+        if not self.enabled_markets:
+            issues.append("no enabled markets: the bot would start and quote nothing")
+        proxy = self.proxy
+        if proxy:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(proxy)
+            host, port = parsed.hostname, parsed.port
+            if host and port:
+                import socket
+
+                s = socket.socket()
+                s.settimeout(2.0)
+                try:
+                    s.connect((host, port))
+                except OSError:
+                    issues.append(
+                        f"proxy {proxy} is configured but not accepting connections; "
+                        f"every HTTP/WS call will fail"
+                    )
+                finally:
+                    s.close()
+        return issues
+
+    def require_live_secrets(self) -> list[str]:
+        """Issues that block a LIVE (non-paper) run specifically."""
+        if self.secrets.has_wallet:
+            return []
+        return ["PK and BROWSER_ADDRESS are required to trade live (or use --paper)"]
+
     def profile_for(self, entry: MarketEntry) -> StrategyProfile:
         base = self.profiles.get(entry.profile)
         if base is None:

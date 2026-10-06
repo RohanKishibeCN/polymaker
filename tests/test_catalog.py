@@ -187,3 +187,42 @@ def test_our_score_is_zero_when_we_would_not_score():
     outside = score_market(m, BookStats(weighted_shares=500, mid=0.49,
                                         our_distance_cents=3.0))
     assert outside.reward_daily_income == 0.0
+
+
+# ── configuration preflight ─────────────────────────────────────────────────
+
+
+def test_preflight_flags_unknown_profile():
+    """A market pointing at a missing profile must be caught before the first quote."""
+    from polymaker.config import Config, MarketEntry, StrategyProfile
+
+    cfg = Config(
+        profiles={"known": StrategyProfile()},
+        markets=[MarketEntry(slug="s", profile="typo-profile")],
+    )
+    issues = cfg.preflight()
+    assert any("unknown profile" in i for i in issues), issues
+
+
+def test_preflight_flags_no_enabled_markets():
+    from polymaker.config import Config, StrategyProfile
+
+    cfg = Config(profiles={"known": StrategyProfile()}, markets=[])
+    assert any("no enabled markets" in i for i in cfg.preflight())
+
+
+def test_preflight_passes_for_a_consistent_config():
+    from polymaker.config import Config, MarketEntry, StrategyProfile
+
+    cfg = Config(
+        profiles={"known": StrategyProfile()},
+        markets=[MarketEntry(slug="s", profile="known")],
+    )
+    assert cfg.preflight() == []
+
+
+def test_require_live_secrets_blocks_a_walletless_live_run():
+    from polymaker.config import Config
+
+    cfg = Config()
+    assert cfg.require_live_secrets(), "live mode must require a wallet"

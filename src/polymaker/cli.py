@@ -209,6 +209,20 @@ def run(
     from polymaker.logging import configure
 
     cfg = Config.load(config_dir)
+
+    # Fail fast on configuration that would only surface mid-session (unknown profile
+    # -> KeyError on the first quote; dead proxy -> every call fails; no market enabled
+    # -> the bot runs and does nothing). Warnings in paper mode, fatal when live.
+    issues = cfg.preflight() + ([] if paper else cfg.require_live_secrets())
+    if issues:
+        for issue in issues:
+            console.print(f"[red]✗[/red] {issue}")
+        if not paper:
+            console.print("[red]Refusing to start live with the above problems.[/red] "
+                          "Fix them, or run with --paper.")
+            raise typer.Exit(1)
+        console.print("[yellow]! continuing in paper mode despite the above[/yellow]")
+
     configure(json_file=Path(cfg.paths.log_dir) / ("paper.jsonl" if paper else "live.jsonl"))
     if cfg.engine.loop == "uvloop":
         try:
