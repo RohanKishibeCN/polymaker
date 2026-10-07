@@ -123,6 +123,38 @@ def _weighted_depth(levels: list[tuple[float, float]], mid: float, band_cents: f
     return total
 
 
+async def measure_volatility(
+    meta: MarketMeta, client: httpx.AsyncClient | None = None
+) -> float | None:
+    """Stdev of 1-minute price changes for a market's first outcome, or None.
+
+    Used to size adverse-selection risk when ranking markets. `fidelity=1` is only
+    accepted together with `interval=1d` (a wider interval with that fidelity is a
+    400), so this asks for one day of minute bars.
+    """
+    own = client is None
+    cl = client or httpx.AsyncClient(timeout=_BOOK_TIMEOUT_S)
+    try:
+        for tid in (meta.yes.token_id, meta.no.token_id):
+            try:
+                r = await cl.get("/prices-history",
+                                 params={"market": tid, "interval": "1d", "fidelity": 1})
+                r.raise_for_status()
+                pts = [float(p["p"]) for p in r.json().get("history", [])]
+            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                continue
+            if len(pts) < 30:
+                continue
+            import statistics
+
+            diffs = [pts[i + 1] - pts[i] for i in range(len(pts) - 1)]
+            return float(statistics.pstdev(diffs))
+        return None
+    finally:
+        if own:
+            await cl.aclose()
+
+
 async def run_scan(store: CatalogStore, cfg: ScanConfig) -> list[MarketMeta]:
     """Fetch, parse, filter, measure, score, and persist. Returns the kept markets."""
     reward_rates = await fetch_reward_rates(cfg.clob_host)

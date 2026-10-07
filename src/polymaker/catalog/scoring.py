@@ -185,37 +185,29 @@ def competition(m: MarketMeta, book: BookStats | None = None) -> float:
 
 def toxicity(m: MarketMeta, book: BookStats | None = None,
              vol_1m: float | None = None) -> float:
-    """Adverse-selection pressure, 0 (placid) .. 1 (severe).
+    """Adverse-selection pressure from a market's MEASURED volatility, 0..1.
 
-    Two independent signals, worst-case combined:
+    Only volatility is used, deliberately. An earlier version also scored 24h volume
+    against in-band depth; that ratio saturates at the square of the depth ratio and
+    returned 1.0 for essentially every live market, which carries no information and
+    merely flattened the ranking.
 
-    * **Turnover pressure** — 24h volume against the depth actually resting in the
-      band. A thin book that trades heavily is the classic toxic profile: quotes are
-      taken faster than they can be replaced, and every take is informed flow.
-    * **Measured volatility** — 1-minute price stdev, when available, expressed
-      against the reward band. If the price wanders the whole band in a few minutes, a
-      resting order is more likely to be run over than paid for.
+    The signal is the drift faced over a typical holding period (~15 minutes) relative
+    to the reward band:
 
-    Deliberately a bounded heuristic, not a probability model: it exists to *rank*
-    markets so capital is not parked in the most dangerous ones.
+        sigma_15m = sigma_1m * sqrt(15)
+        toxicity  = min(1, sigma_15m / band)
+
+    If the price wanders the whole band inside the time we expect to hold, a resting
+    order is more likely to be run over than paid for. With no volatility measured we
+    return 0: a penalty invented from volume alone is guesswork, and the live quote
+    path has its own measured toxicity (per-fill markout) to protect it.
     """
-    pressure = 0.0
-    denom = competition(m, book)
-    if denom > 0 and m.volume_24hr > 0:
-        # turnover relative to in-band depth; ~10x or more saturates the signal
-        pressure = min(1.0, (m.volume_24hr / denom) / 10.0)
-    elif denom <= 0 and m.volume_24hr > 0:
-        # volume with no measurable resting depth -> nothing to hide behind
-        pressure = 1.0
-
-    vol_signal = 0.0
     band = m.rewards_max_spread / 100.0
     sigma = vol_1m if vol_1m is not None else (book.one_minute_vol if book else 0.0)
-    if band > 0 and sigma > 0:
-        # ~15 minutes of drift vs the band: >= 1x the band saturates
-        vol_signal = min(1.0, (sigma * (15 ** 0.5)) / band)
-
-    return max(pressure, vol_signal)
+    if band <= 0 or not sigma or sigma <= 0:
+        return 0.0
+    return float(min(1.0, (sigma * (15.0 ** 0.5)) / band))
 
 
 def rebate_potential(m: MarketMeta) -> float:

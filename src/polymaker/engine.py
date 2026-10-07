@@ -407,21 +407,52 @@ class Engine:
                       side=fill.side.value, size=fill.size)
             return
         self.risk.note_fill(fill)
-        if fill.side is Side.BUY and fill.size > 0:
-            # start the hold clock for exit urgency (an exit that never becomes
-            # urgent is an exit that never happens)
-            self._position_since.setdefault(fill.token_id, fill.ts)
-        elif fill.side is Side.SELL:
-            self._position_since.pop(fill.token_id, None)
-        cid = self._token_cid.get(fill.token_id)
-        if cid is None:
+        # Journal EVERY fill: it is the primary record the measurement experiment
+        # reconciles against (fills are the only source of trading income).
+        self.journal.write("fill", {
+            "token_id": fill.token_id, "side": fill.side.value, "price": fill.price,
+            "size": fill.size, "trade_id": fill.trade_id, "is_maker": fill.is_maker,
+            "condition_id": cid,
+        }, fill.ts)
+
+        # Reversal fills (a FAILED trade being undone) are bookkeeping corrections,
+        # not trades: they must not seed the hold clock, and they must NOT be fed to
+        # the markout tracker. A reversal carries the original timestamp against the
+        # CURRENT fair value, so it would record an immediate ~0 sample and dilute the
+        # toxicity estimate that the whole risk posture depends on.
+        if fill.trade_id.endswith(":reverse"):
+            log.debug("reversal_fill_applied", token=fill.token_id[:12],
+                      side=fill.side.value, size=fill.size)
             return
+
+        # keep the hold clock consistent with the current holding
+        self._sync_position_clock(fill.token_id, self.state.position(fill.token_id).size,
+                                  fill.ts)
+
         est = self.est[cid]
         fv = est.last_fv if est.last_fv is not None else fill.price
         token_fv = fv if fill.token_id == self.metas[cid].yes.token_id else (1.0 - fv)
         # Record in the FILLED token's price space and remember which token it was,
         # so the mark can later be resolved in that same space (see _token_fv).
         est.markout.record_fill(fill.side, token_fv, fill.ts, fill.token_id)
+
+    def _journal_markout(self, cid: str, sample: Any) -> None:
+        """Persist one resolved markout observation.
+
+        This is the experiment's core datum: it says whether a fill was followed by
+        price moving toward us (good) or through us (we were picked off). The EWMA
+        the strategy reacts to is lossy, so the raw sample is what a post-mortem needs.
+        """
+        self.journal.write("markout", {
+            "condition_id": cid,
+            "token_id": sample.token_id,
+            "side": sample.side.value,
+            "fill_fv": round(sample.fill_fv, 6),
+            "end_fv": round(sample.end_fv, 6),
+            "markout": round(sample.markout, 6),
+            "horizon_s": sample.horizon_s,
+            "fill_ts": sample.fill_ts,
+        }, sample.resolved_ts)
 
     def _seed_position_clocks(self, now: float | None = None) -> None:
         """Start the hold clock for inventory we did not buy in this process.
@@ -603,7 +634,8 @@ class Engine:
         fv = compute_fair_value(micro, est.flow.z, meta.tick_size)
         prev_fv = est.last_fv
         est.on_fair_value(fv, now, yes_token_id=meta.yes.token_id,
-                          token_in_yes_space=self._token_fv)
+                          token_in_yes_space=self._token_fv,
+                          on_markout=lambda s: self._journal_markout(cid, s))
 
         self.risk.update_mark(meta.yes.token_id, fv)
         self.risk.update_mark(meta.no.token_id, 1.0 - fv)
@@ -941,6 +973,10 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 log.warning("reconcile_error", err=str(exc))
 
+            # Periodic markout summary: the single number that decides whether this
+            # strategy has an edge at all (reward income vs adverse selection).
+            if rounds % 20 == 0:
+                self._log_markout_summary()
             # slower loops: on-chain position divergence + pnl snapshot + WAL
             if rounds % 4 == 0:
                 with contextlib.suppress(Exception):
@@ -995,6 +1031,36 @@ class Engine:
                 cid = self._token_cid.get(tok)
                 if cid:
                     self._wake_cid(cid)
+
+    def _log_markout_summary(self) -> None:
+        """Log the pooled markout distribution across all quoted markets."""
+        pooled: list[float] = []
+        per_market: dict[str, dict[str, float]] = {}
+        for cid, est in self.est.items():
+            st = est.markout.stats()
+            if st["n"] > 0:
+                per_market[cid[:8]] = st
+                pooled.extend(s.markout for s in est.markout.samples)
+        if not pooled:
+            log.info("markout_summary", samples=0,
+                     note="no fills resolved yet — nothing measured")
+            return
+        adverse = [v for v in pooled if v < 0]
+        log.info("markout_summary",
+                 samples=len(pooled),
+                 mean=round(sum(pooled) / len(pooled), 5),
+                 adverse_rate=round(len(adverse) / len(pooled), 3),
+                 worst=round(min(pooled), 5),
+                 best=round(max(pooled), 5),
+                 total=round(sum(pooled), 4),
+                 markets=len(per_market))
+        self.journal.write("markout_summary", {
+            "samples": len(pooled),
+            "mean": sum(pooled) / len(pooled),
+            "adverse_rate": len(adverse) / len(pooled),
+            "total": sum(pooled),
+            "per_market": per_market,
+        }, time.time())
 
     async def _reconcile_cash(self) -> None:
         """Snap the cash ledger to the exchange's real pUSD balance.
