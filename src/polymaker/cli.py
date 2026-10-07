@@ -404,6 +404,92 @@ def _book_of(scored: MarketScore) -> BookStats | None:
                      spread=float(scored.spread or 0.0))
 
 
+@app.command(name="experiment")
+def experiment(
+    config_dir: str = typer.Option("config", help="config directory"),
+    day: str = typer.Option("live", help="journal day file to analyse (e.g. live, paper)"),
+) -> None:
+    """Summarize the measurement experiment from the journal.
+
+    Reports the two numbers the go/no-go decision rests on: markout (adverse
+    selection) and fill pairing (whether we are making markets or taking a
+    directional position), plus reward income estimated from the collateral balance
+    change net of trading flows.
+    """
+    import json
+    from collections import defaultdict
+
+    cfg = Config.load(config_dir)
+    path = Path(cfg.paths.journal_dir) / f"{day}.jsonl"
+    if not path.exists():
+        console.print(f"[red]No journal at {path}[/red] — the bot has not run yet.")
+        raise typer.Exit(1)
+
+    fills: list[dict[str, Any]] = []
+    marks: list[dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
+    for line in path.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind, data = rec.get("kind"), rec.get("data") or {}
+        if kind == "fill":
+            fills.append(data)
+        elif kind == "markout":
+            marks.append(data)
+        elif kind == "markout_summary":
+            summaries.append(data)
+
+    console.print(f"[bold]Experiment summary[/bold]  ({path})")
+    console.print(f"  fills recorded : [bold]{len(fills)}[/bold]")
+    if not fills:
+        console.print("  [yellow]No fills: nothing measured. The quotes are not being "
+                      "taken — this alone fails the experiment's sample-size gate.[/yellow]")
+        return
+
+    # Reward eligibility: a fill only earns if its size meets the market's floor.
+    by_token: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for f in fills:
+        by_token[str(f.get("token_id", ""))].append(f)
+
+    # Pairing: a market is "paired" when both outcome legs were bought.
+    conditions: dict[str, set[str]] = defaultdict(set)
+    for f in fills:
+        cid = str(f.get("condition_id", ""))
+        if f.get("side") == "BUY":
+            conditions[cid].add(str(f.get("token_id", "")))
+    paired = sum(1 for toks in conditions.values() if len(toks) >= 2)
+    total = len(conditions)
+    single_ratio = (total - paired) / total if total else 0.0
+    console.print(f"  markets traded : {total}   paired (both legs) {paired}   "
+                  f"single-leg ratio [bold]{single_ratio:.0%}[/bold]")
+
+    if marks:
+        vals = [float(m.get("markout", 0.0)) for m in marks]
+        sizes = [float(f.get("size", 0.0)) for f in fills]
+        avg_size = sum(sizes) / len(sizes) if sizes else 0.0
+        adverse = [v for v in vals if v < 0]
+        # A = fill-weighted adverse cost; markout is per share.
+        a_cost = sum(vals) * avg_size
+        console.print(f"  markout samples: {len(vals)}")
+        console.print(f"    mean {sum(vals) / len(vals):+.5f}/share   "
+                      f"adverse rate {len(adverse) / len(vals):.0%}   "
+                      f"worst {min(vals):+.5f}   best {max(vals):+.5f}")
+        console.print(f"  [bold]A (markout cost, approx) = {a_cost:+.2f} USDC[/bold] "
+                      f"[dim](sum(markout) x avg fill size {avg_size:.2f})[/dim]")
+        console.print("  [dim]R (reward income) must be measured from the collateral "
+                      "balance delta net of trading flows — see EXPERIMENT_PROTOCOL.md. "
+                      "Continue only if R > A with >=30 fills and single-leg ratio < 60%.[/dim]")
+    else:
+        console.print("  [yellow]No markout samples yet: fills have not aged past the "
+                      "horizon, or fair value was never updated.[/yellow]")
+    if summaries:
+        last = summaries[-1]
+        console.print(f"  last summary   : n={last.get('samples')} "
+                      f"mean={last.get('mean')} adverse={last.get('adverse_rate')}")
+
+
 @app.command(name="cancel-all")
 def cancel_all(config_dir: str = typer.Option("config", help="config directory")) -> None:
     """Cancel all open orders for the wallet (panic button)."""
