@@ -173,12 +173,32 @@ class FlowEstimator:
         return self._signed.value / gross if gross > 1e-9 else 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class MarkoutSample:
+    """One resolved markout observation — the raw material of the live experiment.
+
+    The EWMA summary is what the strategy reacts to, but a measurement run needs the
+    individual samples: the mean can look benign while a fat tail of adverse fills
+    quietly drains the account, and only the distribution reveals that.
+    """
+
+    token_id: str
+    side: Side
+    fill_fv: float          # fair value of the traded token at fill time
+    end_fv: float           # fair value of that token at the horizon
+    markout: float          # signed: + favourable, - adverse
+    horizon_s: float
+    fill_ts: float
+    resolved_ts: float
+
+
 @dataclass(slots=True)
 class _PendingMarkout:
     fv_at_fill: float
     side: Side  # our side of the fill (BUY => we bought => adverse if price falls)
     due_ts: float
     token_id: str = ""  # which outcome, so the mark resolves in its own price space
+    fill_ts: float = 0.0
 
 
 class MarkoutTracker:
@@ -191,12 +211,19 @@ class MarkoutTracker:
     which the quoter turns into extra spread / less size.
     """
 
-    __slots__ = ("_horizon_s", "_pending", "_markout")
+    __slots__ = ("_horizon_s", "_pending", "_markout", "_samples", "_max_samples")
 
-    def __init__(self, horizon_s: float = 300.0, ewma_halflife_s: float = 1800.0) -> None:
+    # Keep the most recent observations for the measurement run. Bounded so a long
+    # session cannot grow memory without limit.
+    DEFAULT_MAX_SAMPLES = 5000
+
+    def __init__(self, horizon_s: float = 300.0, ewma_halflife_s: float = 1800.0,
+                 max_samples: int = DEFAULT_MAX_SAMPLES) -> None:
         self._horizon_s = horizon_s
         self._pending: list[_PendingMarkout] = []
         self._markout = Ewma(ewma_halflife_s)
+        self._samples: list[MarkoutSample] = []
+        self._max_samples = max(0, max_samples)
 
     def record_fill(self, side: Side, token_fv_at_fill: float, ts: float,
                     token_id: str = "") -> None:
@@ -204,7 +231,7 @@ class MarkoutTracker:
         TOKEN WE TRADED, in that token's own price space. `token_id` records which
         outcome it was, so the mark can later be resolved in the SAME space."""
         self._pending.append(
-            _PendingMarkout(token_fv_at_fill, side, ts + self._horizon_s, token_id)
+            _PendingMarkout(token_fv_at_fill, side, ts + self._horizon_s, token_id, ts)
         )
 
     def evaluate(
@@ -214,6 +241,7 @@ class MarkoutTracker:
         *,
         yes_token_id: str | None = None,
         token_in_yes_space: Callable[[float, str], float] | None = None,
+        on_resolved: Callable[[MarkoutSample], None] | None = None,
     ) -> None:
         """Resolve any markouts whose horizon has elapsed.
 
@@ -237,11 +265,52 @@ class MarkoutTracker:
             # if we BOUGHT, a rise is good (+); if we SOLD, a fall is good (+)
             signed = move if p.side is Side.BUY else -move
             self._markout.update(signed, ts)
+            if self._max_samples:
+                sample = MarkoutSample(
+                    token_id=p.token_id, side=p.side, fill_fv=p.fv_at_fill,
+                    end_fv=fv_now, markout=signed, horizon_s=self._horizon_s,
+                    fill_ts=p.fill_ts, resolved_ts=ts,
+                )
+                self._samples.append(sample)
+                if len(self._samples) > self._max_samples:
+                    del self._samples[: len(self._samples) - self._max_samples]
+                # Report each sample so it can be persisted: a measurement run must
+                # not depend on the process staying alive to keep its evidence.
+                if on_resolved is not None:
+                    on_resolved(sample)
         self._pending = still
 
     @property
     def pending(self) -> int:
         return len(self._pending)
+
+    @property
+    def samples(self) -> list[MarkoutSample]:
+        """Recent resolved markout observations (oldest first)."""
+        return list(self._samples)
+
+    def stats(self) -> dict[str, float]:
+        """Distribution summary of resolved samples — the experiment's core output.
+
+        `adverse_rate` and `mean` together decide viability: a positive mean with a
+        high adverse rate means the winners are rare and large, which is a very
+        different (and more fragile) profile than a steady small edge.
+        """
+        vals = [s.markout for s in self._samples]
+        n = len(vals)
+        if n == 0:
+            return {"n": 0.0, "mean": 0.0, "adverse_rate": 0.0, "worst": 0.0, "best": 0.0,
+                    "mean_adverse": 0.0, "total": 0.0}
+        adverse = [v for v in vals if v < 0]
+        return {
+            "n": float(n),
+            "mean": sum(vals) / n,
+            "adverse_rate": len(adverse) / n,
+            "worst": min(vals),
+            "best": max(vals),
+            "mean_adverse": (sum(adverse) / len(adverse)) if adverse else 0.0,
+            "total": sum(vals),
+        }
 
     @property
     def markout(self) -> float:
@@ -270,6 +339,7 @@ class MarketEstimators:
         *,
         yes_token_id: str | None = None,
         token_in_yes_space: Callable[[float, str], float] | None = None,
+        on_markout: Callable[[MarkoutSample], None] | None = None,
     ) -> None:
         """Feed the YES-space fair value; the markout resolves in the fill's own space.
 
@@ -284,6 +354,7 @@ class MarketEstimators:
                 ts,
                 yes_token_id=yes_token_id,
                 token_in_yes_space=token_in_yes_space,
+                on_resolved=on_markout,
             )
         self.last_fv = fv
         self.last_fv_ts = ts

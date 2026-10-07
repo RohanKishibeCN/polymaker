@@ -20,7 +20,9 @@ from rich.console import Console
 from rich.table import Table
 
 from polymaker import __version__
+from polymaker.catalog.scoring import BookStats, MarketScore
 from polymaker.config import Config
+from polymaker.domain import MarketMeta
 
 app = typer.Typer(
     name="polymaker",
@@ -299,6 +301,107 @@ def report(
         console.print("[yellow]未配置 NOTION_TOKEN/NOTION_DATABASE_ID，仅打印本地日报.[/yellow]")
     else:
         console.print("[red]Notion 推送失败，详见日志.[/red]")
+
+@app.command(name="select")
+def select(
+    capital: float = typer.Option(100.0, help="USDC available to deploy across the experiment"),
+    config_dir: str = typer.Option("config", help="config directory"),
+    limit: int = typer.Option(15, help="rows to show"),
+    rescan: bool = typer.Option(False, "--rescan", help="re-scan Gamma + measure books first"),
+    min_pool: float = typer.Option(20.0, help="ignore markets below this daily pool"),
+) -> None:
+    """Pick markets whose reward floor FITS `capital`, ranked by expected yield.
+
+    The reward program pays by the smallest qualifying order rather than by account
+    size, so a market is only reachable when BOTH legs can be quoted at
+    `rewardsMinSize`. A two-sided quote costs `shares * (p_yes + p_no)` = `shares`
+    dollars, because the pair redeems for one. This filters to reachable markets and
+    ranks them by risk-adjusted reward yield per dollar of capital deployed.
+    """
+    from polymaker.catalog.gamma import GammaClient
+    from polymaker.catalog.scanner import ScanConfig, measure_volatility, run_scan
+    from polymaker.catalog.scoring import score_market
+    from polymaker.catalog.store import CatalogStore
+
+    cfg = Config.load(config_dir)
+    store = CatalogStore(cfg.paths.db)
+
+    async def _go() -> None:
+        if rescan:
+            console.print("[dim]scanning Gamma + measuring books…[/dim]")
+            await run_scan(store, ScanConfig(rewards_only=True))
+
+        # `top` carries the score the scanner computed WITH a measured book.
+        candidates = [(m, sc) for m, sc in store.top(300)
+                      if m.rewards_daily_rate >= min_pool
+                      and 0 < m.rewards_min_size <= capital]
+        if not candidates:
+            console.print(f"[yellow]No rewarded market needs less than ${capital:.0f} "
+                          f"on each leg. Raise --capital or lower --min-pool.[/yellow]")
+            return
+
+        console.print(f"[dim]measuring volatility for {len(candidates)} reachable markets…[/dim]")
+        scored = []
+        async with GammaClient(cfg.wallet.gamma_host):
+            import httpx as _httpx
+
+            async with _httpx.AsyncClient(base_url=cfg.wallet.clob_host.rstrip("/"),
+                                          timeout=20.0) as cl:
+                sem = asyncio.Semaphore(6)
+
+                async def _one(meta: MarketMeta, base: MarketScore) -> None:
+                    try:
+                        async with sem:
+                            vol = await measure_volatility(meta, cl)
+                    except Exception:  # noqa: BLE001 - a missing history is not fatal
+                        vol = None
+                    # Re-score with measured volatility, reusing the book stats the
+                    # scanner already gathered (competition dominates the income).
+                    sc = score_market(meta, _book_of(base), vol_1m=vol)
+                    if sc.reward_daily_income > 0:
+                        scored.append((sc, meta, vol))
+
+                await asyncio.gather(*(_one(m, sc) for m, sc in candidates))
+
+        if not scored:
+            console.print("[yellow]No reachable market had a measurable reward share. "
+                          "Re-run with --rescan for fresh book data.[/yellow]")
+            return
+        scored.sort(key=lambda t: -t[0].score)
+        table = Table(title=f"Markets reachable with ${capital:.0f} (each leg at the reward floor)")
+        for col in ("score", "$/day", "yield%/d", "need$", "pool", "compet", "tox", "σ1m", "mid", "slug"):
+            table.add_column(col, justify="right" if col != "slug" else "left")
+        for sc, meta, vol in scored[:limit]:
+            mid = (meta.best_bid + meta.best_ask) / 2 if meta.best_bid and meta.best_ask else 0.0
+            table.add_row(
+                f"{sc.score:.2f}", f"{sc.reward_daily_income:.3f}", f"{sc.reward_yield_pct:.2f}",
+                f"{meta.rewards_min_size:.0f}", f"{meta.rewards_daily_rate:.0f}",
+                f"{sc.competition:.0f}", f"{sc.toxicity:.2f}", f"{(vol or 0):.5f}",
+                f"{mid:.4f}", meta.slug[:36],
+            )
+        console.print(table)
+        console.print(
+            "\n[dim]need$ = shares needed on EACH leg (1 share ≈ $1 for the pair). "
+            f"With ${capital:.0f} you can run about "
+            f"{capital / max(1.0, scored[0][1].rewards_min_size):.1f} markets at once.\n"
+            "tox 0 = safest .. 1 = price crosses the whole reward band within ~15min.[/dim]"
+        )
+
+    asyncio.run(_go())
+    store.close()
+
+
+def _book_of(scored: MarketScore) -> BookStats | None:
+    """Recover the book stats implied by a stored score.
+
+    The catalog does not persist raw book levels, but competition is the only book
+    field the scorer needs and it is already stored on the score. Returning None when
+    competition is unknown keeps the scorer's "no measurement -> no income" rule.
+    """
+    if not scored.competition:
+        return None
+    return BookStats(weighted_shares=float(scored.competition),
+                     spread=float(scored.spread or 0.0))
 
 
 @app.command(name="cancel-all")

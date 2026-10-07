@@ -133,3 +133,96 @@ def test_no_fill_markout_detects_a_real_adverse_move():
     # YES fair value rises 0.195 -> 0.295, so NO fair value falls 0.805 -> 0.705
     t.evaluate(0.295, ts=1.0, yes_token_id=yes_id, token_in_yes_space=in_yes_space)
     assert t.toxicity > 0.05, "a real adverse move must register"
+
+
+# ── per-fill markout sampling (the measurement experiment's raw material) ────
+
+
+def test_markout_samples_are_recorded_per_fill():
+    """Every resolved fill must yield one inspectable sample.
+
+    The EWMA summary is what the strategy reacts to, but a measurement run needs the
+    distribution: a benign mean can hide a fat tail of adverse fills.
+    """
+    from polymaker.strategy.estimators import MarkoutTracker
+
+    t = MarkoutTracker(horizon_s=0.0)
+    t.record_fill(Side.BUY, token_fv_at_fill=0.50, ts=1.0, token_id="y")
+    t.evaluate(0.45, ts=2.0)  # adverse: price fell after we bought
+    t.record_fill(Side.BUY, token_fv_at_fill=0.50, ts=3.0, token_id="y")
+    t.evaluate(0.55, ts=4.0)  # favourable
+
+    s = t.samples
+    assert len(s) == 2
+    assert s[0].markout < 0 and s[1].markout > 0
+    assert s[0].token_id == "y" and s[0].side is Side.BUY
+    stats = t.stats()
+    assert stats["n"] == 2
+    assert stats["adverse_rate"] == 0.5
+    assert stats["worst"] < 0 < stats["best"]
+
+
+def test_markout_samples_are_bounded():
+    """A long session must not grow the sample buffer without limit."""
+    from polymaker.strategy.estimators import MarkoutTracker
+
+    t = MarkoutTracker(horizon_s=0.0, max_samples=3)
+    for i in range(10):
+        t.record_fill(Side.BUY, token_fv_at_fill=0.5, ts=float(i), token_id="y")
+        t.evaluate(0.5 - 0.01 * i, ts=float(i) + 0.5)
+    assert len(t.samples) <= 3, "samples must be capped"
+
+
+def test_markout_on_resolved_callback_fires():
+    """Samples must be reportable as they resolve, so evidence survives a restart."""
+    from polymaker.strategy.estimators import MarkoutTracker
+
+    seen = []
+    t = MarkoutTracker(horizon_s=0.0)
+    t.record_fill(Side.BUY, token_fv_at_fill=0.5, ts=0.0, token_id="y")
+    t.evaluate(0.4, ts=1.0, on_resolved=seen.append)
+    assert len(seen) == 1
+    assert seen[0].markout == pytest.approx(-0.1)
+
+
+def test_markout_stats_empty_is_safe():
+    from polymaker.strategy.estimators import MarkoutTracker
+
+    st = MarkoutTracker().stats()
+    assert st["n"] == 0 and st["mean"] == 0.0 and st["adverse_rate"] == 0.0
+
+
+def test_market_estimators_passes_markout_callback():
+    from polymaker.domain import Side
+    from polymaker.strategy.estimators import (
+        FlowEstimator,
+        MarketEstimators,
+        MarkoutTracker,
+        VolEstimator,
+    )
+
+    est = MarketEstimators(vol=VolEstimator(10, 100), flow=FlowEstimator(10),
+                           markout=MarkoutTracker(horizon_s=0.0))
+    got = []
+    est.markout.record_fill(Side.BUY, 0.5, 0.0, "yes-tok")
+    est.on_fair_value(0.45, 1.0, yes_token_id="yes-tok",
+                      token_in_yes_space=lambda fv, t: fv, on_markout=got.append)
+    assert len(got) == 1
+
+
+def test_markout_summary_reflects_real_samples(tmp_path):
+    """End-to-end: fills -> markout samples -> a summary an operator can act on."""
+    from polymaker.strategy.estimators import MarkoutTracker
+
+    t = MarkoutTracker(horizon_s=0.0)
+    # three adverse fills, one favourable -> adverse_rate 0.75, negative mean
+    for i in range(3):
+        t.record_fill(Side.BUY, 0.50, float(i), "y")
+        t.evaluate(0.48, float(i) + 0.5)
+    t.record_fill(Side.BUY, 0.50, 10.0, "y")
+    t.evaluate(0.52, 10.5)
+    st = t.stats()
+    assert st["n"] == 4
+    assert st["adverse_rate"] == pytest.approx(0.75)
+    assert st["mean"] < 0, "net adverse selection must show as a negative mean"
+    assert st["mean_adverse"] < 0 < st["best"]
