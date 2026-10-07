@@ -59,7 +59,8 @@ class BookView:
 class OrderBook:
     """YES-canonical L2 book for one market."""
 
-    __slots__ = ("bids", "asks", "tick_size", "last_update_ts", "local_ts", "book_hash")
+    __slots__ = ("bids", "asks", "tick_size", "last_update_ts", "local_ts", "book_hash",
+                 "stale_snapshots")
 
     def __init__(self, tick_size: float = 0.001) -> None:
         # price -> size. bids and asks both ascending in price.
@@ -69,6 +70,7 @@ class OrderBook:
         self.last_update_ts: float = 0.0  # exchange timestamp (informational)
         self.local_ts: float = 0.0  # local receive time — used for staleness (skew-proof)
         self.book_hash: str | None = None
+        self.stale_snapshots: int = 0  # snapshots ignored for being older than deltas
 
     # ── mutation ────────────────────────────────────────────────────────
     def apply_snapshot(
@@ -78,6 +80,18 @@ class OrderBook:
         ts: float,
         book_hash: str | None = None,
     ) -> None:
+        """Replace the book with a full snapshot.
+
+        A snapshot can arrive AFTER deltas that are newer than it (the server sends a
+        fresh snapshot on (re)subscribe while buffered deltas are still in flight).
+        Applying it unconditionally rewinds the book to a stale state and silently
+        corrupts the top-of-book depth that microprice and the sweep detector read, so
+        a snapshot older than the last applied update is ignored. ts == 0 means the
+        frame carried no timestamp and is always applied.
+        """
+        if ts > 0 and self.last_update_ts > 0 and ts < self.last_update_ts:
+            self.stale_snapshots += 1
+            return
         self.bids = SortedDict({p: s for p, s in bids if s > 0})
         self.asks = SortedDict({p: s for p, s in asks if s > 0})
         self.last_update_ts = ts

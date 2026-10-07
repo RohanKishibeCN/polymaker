@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +27,11 @@ class WalletConfig(BaseModel):
     gamma_host: str = "https://gamma-api.polymarket.com"
     data_api_host: str = "https://data-api.polymarket.com"
     polygon_rpc: str = "https://polygon-bor-rpc.publicnode.com"
+    # Polymarket Protocol V2 on-chain merges go through the Router. The calldata is
+    # derived from the documented ABI and unit-tested, but has NOT been exercised
+    # against a live V2 market yet — keep this off until a small live merge verifies
+    # it, otherwise a wrong condition-id encoding burns gas on a reverting tx.
+    merge_v2_enabled: bool = False
 
 
 class EngineConfig(BaseModel):
@@ -105,7 +110,10 @@ class StrategyProfile(BaseModel):
     # the near-touch depth it consumed (both must hold to flag a toxic sweep)
     event_sweep_mult: float = 4.0
     event_sweep_frac: float = 0.8
-    trend_flow_z: float = 1.5
+    # One-sidedness of flow that trips TRENDING. The estimator's z is bounded to
+    # [-1, 1] by construction (|mean| <= RMS), so this MUST be <= 1 — a larger value
+    # is unreachable and silently disables the one-sided-flow defence.
+    trend_flow_z: float = 0.6
     # short/long realized-vol ratio that trips TRENDING (half size). On a thin
     # book microprice jitter inflates this without real trade flow, so raise it
     # for reward-farming markets that trade rarely.
@@ -117,6 +125,18 @@ class StrategyProfile(BaseModel):
     # exits
     exit_urgency_s: float = 900.0
     merge_min_size: float = 20.0
+
+    @field_validator("trend_flow_z")
+    @classmethod
+    def _trend_flow_z_reachable(cls, v: float) -> float:
+        """Reject an unreachable threshold instead of silently never firing."""
+        if v > 1.0:
+            raise ValueError(
+                f"trend_flow_z={v} can never fire: the flow z-score is bounded to [-1, 1]"
+            )
+        if v < 0:
+            raise ValueError("trend_flow_z must be non-negative")
+        return v
 
     def with_overrides(self, overrides: dict[str, Any]) -> StrategyProfile:
         """Return a copy with per-market override values applied."""
@@ -210,6 +230,53 @@ class Config(BaseModel):
     @property
     def enabled_markets(self) -> list[MarketEntry]:
         return [m for m in self.markets if m.enabled]
+
+    def preflight(self) -> list[str]:
+        """Blocking problems that make a LIVE run unsafe or incoherent.
+
+        Returns human-readable issues; an empty list means the configuration is
+        internally consistent. These are exactly the mistakes that are otherwise only
+        discovered mid-session: a market pointing at a profile that does not exist (a
+        KeyError at the first quote), no wallet for a live run, or a proxy that is
+        configured but not actually listening — which silently fails every HTTP call.
+        """
+        issues: list[str] = []
+        known = set(self.profiles)
+        for entry in self.enabled_markets:
+            if entry.profile not in known:
+                issues.append(
+                    f"market {entry.ref!r} uses unknown profile {entry.profile!r} "
+                    f"(known: {sorted(known)})"
+                )
+        if not self.enabled_markets:
+            issues.append("no enabled markets: the bot would start and quote nothing")
+        proxy = self.proxy
+        if proxy:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(proxy)
+            host, port = parsed.hostname, parsed.port
+            if host and port:
+                import socket
+
+                s = socket.socket()
+                s.settimeout(2.0)
+                try:
+                    s.connect((host, port))
+                except OSError:
+                    issues.append(
+                        f"proxy {proxy} is configured but not accepting connections; "
+                        f"every HTTP/WS call will fail"
+                    )
+                finally:
+                    s.close()
+        return issues
+
+    def require_live_secrets(self) -> list[str]:
+        """Issues that block a LIVE (non-paper) run specifically."""
+        if self.secrets.has_wallet:
+            return []
+        return ["PK and BROWSER_ADDRESS are required to trade live (or use --paper)"]
 
     def profile_for(self, entry: MarketEntry) -> StrategyProfile:
         base = self.profiles.get(entry.profile)

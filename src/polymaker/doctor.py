@@ -77,10 +77,16 @@ async def run_doctor(cfg: Config, console: Console) -> bool:
                               "allowances from the deposit wallet (trade once in the UI)[/yellow]")
 
             positions = await gw.positions()
-            held_tokens = list(positions)
-            total_shares = sum(sz for sz, _ in positions.values())
-            check("positions readable (on funder)", True,
-                  f"{len(positions)} positions, {total_shares:.0f} shares total")
+            if positions is None:
+                check("positions readable (on funder)", False,
+                      "Data API v2 /v2/positions did not answer — check network/proxy")
+                held_tokens = []
+                total_shares = 0.0
+            else:
+                held_tokens = list(positions)
+                total_shares = sum(sz for sz, _ in positions.values())
+                check("positions readable (on funder)", True,
+                      f"{len(positions)} positions, {total_shares:.0f} shares total")
         except Exception as e:  # noqa: BLE001
             check("wallet auth (L2 creds derived)", False, str(e))
             console.print("  [yellow]! signature-type mismatch? deposit wallets use sig_type=3 "

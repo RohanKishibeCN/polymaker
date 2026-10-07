@@ -1149,7 +1149,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
     { name = "py-builder-relayer-client", specifier = ">=0.0.2" },
-    { name = "py-clob-client-v2", specifier = "==1.0.2" },
+    { name = "py-clob-client-v2", specifier = "==1.2.0" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
@@ -1297,7 +1297,7 @@ wheels = [
 
 [[package]]
 name = "py-clob-client-v2"
-version = "1.0.2"
+version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "eth-abi" },
@@ -1307,9 +1307,9 @@ dependencies = [
     { name = "poly-eip712-structs" },
     { name = "py-order-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/53/de/7d5c9e02988a221c44ab2d74b4bd682810e3e3f3a4856be7eef2bc874f6e/py_clob_client_v2-1.0.2.tar.gz", hash = "sha256:9c19a86a1ca67a995f3da4f2d95fd5d5e9e7e14777cb6fe4294b90040ccf67d0", size = 45727, upload-time = "2026-07-02T08:28:59.125Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4a/c4/80c7d75615bb82dfd2600d0fdda5829c64c231e09f38ff9a99db2c7f2dc1/py_clob_client_v2-1.2.0.tar.gz", hash = "sha256:e9781fd3655d1d8c90b7fcd666f05d4facc48b588b5d53f70a35992839634db2", size = 53320, upload-time = "2026-09-25T15:40:06.428Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/b9/2a72a6da948ab7df4b27335d515a1ebd061b8b1b855813af8c6202506b21/py_clob_client_v2-1.0.2-py3-none-any.whl", hash = "sha256:ca0b15016c3850ebafd702c0ffea134b4779878289590922a6ac43045cd3486a", size = 49168, upload-time = "2026-07-02T08:28:57.862Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/ee/53c1582dbb19fdee3cafa1a5ba6815d67b14a337cd543eb5bfd648397d14/py_clob_client_v2-1.2.0-py3-none-any.whl", hash = "sha256:c549a801ae39af47e57c8c04546d3d365b3dc2fd5638e22b563e875a44814043", size = 51827, upload-time = "2026-09-25T15:40:04.753Z" },
 ]
 
 [[package]]

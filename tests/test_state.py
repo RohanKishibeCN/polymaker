@@ -169,3 +169,57 @@ def test_reconcile_matches_layers_one_to_one():
     assert plan.to_cancel == []
     assert len(plan.to_place) == 1  # only the missing deeper layer
     assert plan.to_place[0].price == 0.47
+
+
+# ── failed-trade reversal must undo BOTH inventory and cash ─────────────────
+
+
+def test_failed_trade_reverses_cash_not_just_inventory(tmp_path):
+    """A FAILED trade must not leave phantom cash behind.
+
+    Regression: the reversal only called apply_fill, never the on_fill hook that is
+    the sole writer of risk net_cash. A MATCHED BUY then FAILED left net_cash reduced
+    by money never spent, understating equity and able to latch the daily-loss kill
+    switch on a loss that never happened.
+    """
+    from polymaker.config import RiskConfig
+    from polymaker.domain import Side, TradeState
+    from polymaker.risk.manager import RiskManager
+    from polymaker.state.tracker import TradeEvent, UserEventProcessor
+
+    store = StateStore(tmp_path / "s.db")
+    risk = RiskManager(RiskConfig(), store)
+    proc = UserEventProcessor(store, on_fill=risk.note_fill)
+
+    ev = TradeEvent(token_id="tok-1", our_side=Side.BUY, price=0.50, size=100.0,
+                    trade_id="t1", status=TradeState.MATCHED, ts=1.0)
+    proc.on_trade(ev, "cid")
+    assert store.position("tok-1").size == 100.0
+    assert risk.net_cash == -50.0
+    assert store.inflight("tok-1") == 1
+
+    proc.on_trade(TradeEvent(token_id="tok-1", our_side=Side.BUY, price=0.50, size=100.0,
+                             trade_id="t1", status=TradeState.FAILED, ts=2.0), "cid")
+    assert store.position("tok-1").size == 0.0, "inventory must be restored"
+    assert risk.net_cash == 0.0, f"cash must be restored, got {risk.net_cash}"
+    assert store.inflight("tok-1") == 0, "in-flight guard must be released"
+
+
+def test_failed_after_restart_is_reversed_from_persistence(tmp_path):
+    """A FAILED arriving after a restart still undoes the persisted fill."""
+    from polymaker.domain import Side, TradeState
+    from polymaker.state.tracker import TradeEvent, UserEventProcessor
+
+    store = StateStore(tmp_path / "s.db")
+    proc = UserEventProcessor(store)
+    proc.on_trade(TradeEvent("tok-1", Side.BUY, 0.50, 100.0, "t1", TradeState.MATCHED, 1.0), "cid")
+    assert store.position("tok-1").size == 100.0
+    store.close()
+
+    # fresh process: no in-memory _applied record survives
+    store2 = StateStore(tmp_path / "s.db")
+    assert store2.position("tok-1").size == 100.0, "position is restored from SQLite"
+    proc2 = UserEventProcessor(store2)
+    proc2.on_trade(TradeEvent("tok-1", Side.BUY, 0.50, 100.0, "t1", TradeState.FAILED, 5.0), "cid")
+    assert store2.position("tok-1").size == 0.0, "the persisted fill must be undone"
+    store2.close()

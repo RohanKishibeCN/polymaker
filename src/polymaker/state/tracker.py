@@ -74,9 +74,15 @@ class UserEventProcessor:
             self._on_change(condition_id)
 
         elif ev.status in (TradeState.CONFIRMED, TradeState.MINED):
-            if ev.trade_id in self._applied and ev.status is TradeState.CONFIRMED:
-                self._store.clear_inflight(ev.token_id)
-                # keep the fill; it's now settled
+            if ev.status is TradeState.CONFIRMED:
+                # Terminal success. Clear the guard for tokens we still believe are
+                # in flight; a CONFIRMED for a trade we never applied (e.g. after a
+                # restart) must still release the guard rather than leak it.
+                if ev.trade_id in self._applied or self._store.inflight(ev.token_id) > 0:
+                    self._store.clear_inflight(ev.token_id)
+                # Mark it settled in the store so a later duplicate FAILED cannot
+                # reverse inventory the exchange has already credited.
+                self._store.mark_fill_settled(ev.trade_id)
                 self._applied.pop(ev.trade_id, None)
                 self._on_change(condition_id)
 
@@ -88,14 +94,47 @@ class UserEventProcessor:
         elif ev.status is TradeState.FAILED:
             prior = self._applied.pop(ev.trade_id, None)
             if prior is not None:
-                # reverse the optimistic fill (idempotent via the :reverse id)
-                self._store.apply_fill(
-                    Fill(prior.token_id, prior.side.opposite, prior.price, prior.size,
-                         f"{prior.trade_id}:reverse", prior.ts, is_maker=True)
-                )
-                self._store.clear_inflight(ev.token_id)
-                log.warning("trade_failed_reversed", trade_id=ev.trade_id, token=ev.token_id[:12])
-                self._on_change(condition_id)
+                self._reverse_fill(prior, ev, condition_id)
+            else:
+                # No in-memory record: either we never applied it, or we restarted
+                # between MATCHED and FAILED. Undo the persisted inventory, but NOT the
+                # cash: `RiskManager._net_cash` is process-local and starts at 0 after a
+                # restart, so crediting the reverse here would invent money that this
+                # process never debited (verified: produced equity +50 on a trade that
+                # should net to 0). `_reconcile_cash` snaps the ledger to the exchange
+                # shortly afterwards, which is the correct authority for cash.
+                undone = self._store.reverse_fill(ev.trade_id)
+                if undone is not None:
+                    self._store.clear_inflight(ev.token_id)
+                    log.warning("trade_failed_reversed_no_cash", trade_id=ev.trade_id,
+                                token=ev.token_id[:12], side=undone.side.value,
+                                size=undone.size,
+                                note="cash side not reversed across a restart")
+                    self._on_change(condition_id)
+                else:
+                    self._store.clear_inflight(ev.token_id)
+
+    def _reverse_fill(self, prior: Fill, ev: TradeEvent, condition_id: str) -> None:
+        reversed_fill = Fill(prior.token_id, prior.side.opposite, prior.price, prior.size,
+                             f"{prior.trade_id}:reverse", prior.ts, is_maker=True)
+        if self._store.apply_fill(reversed_fill):
+            self._reverse_effects(prior, ev, condition_id)
+
+    def _reverse_effects(self, prior: Fill, ev: TradeEvent, condition_id: str) -> None:
+        """Undo the money side of a fill that will never settle.
+
+        The original optimistic application moved BOTH inventory and cash: inventory
+        via `apply_fill`, cash via `on_fill` -> `risk.note_fill`. Reversing only the
+        inventory left `net_cash` permanently overstated by the purchase, which
+        understates equity and can latch the daily-loss kill switch on money that was
+        never spent. The reverse fill must therefore be reported to risk as well.
+        """
+        self._store.clear_inflight(ev.token_id)
+        log.warning("trade_failed_reversed", trade_id=ev.trade_id,
+                    token=ev.token_id[:12], side=prior.side.value, size=prior.size)
+        self._on_fill(Fill(prior.token_id, prior.side.opposite, prior.price, prior.size,
+                           f"{prior.trade_id}:reverse", prior.ts, is_maker=True))
+        self._on_change(condition_id)
 
     def on_order(self, ev: OrderEvent, condition_id: str) -> None:
         if ev.is_cancel or ev.remaining_size <= 0:

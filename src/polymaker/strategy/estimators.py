@@ -9,6 +9,7 @@ observations with timestamps, read scalar summaries. No I/O.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from polymaker.domain import Side
@@ -21,7 +22,7 @@ class Ewma:
     observation gets the remaining weight. The first observation seeds the mean.
     """
 
-    __slots__ = ("halflife", "_value", "_last_ts", "_initialized")
+    __slots__ = ("halflife", "_value", "_last_ts", "_initialized", "out_of_order")
 
     def __init__(self, halflife_s: float) -> None:
         if halflife_s <= 0:
@@ -30,6 +31,7 @@ class Ewma:
         self._value = 0.0
         self._last_ts = 0.0
         self._initialized = False
+        self.out_of_order = 0  # observations dropped for arriving with a stale ts
 
     def update(self, value: float, ts: float) -> float:
         if not self._initialized:
@@ -37,7 +39,15 @@ class Ewma:
             self._last_ts = ts
             self._initialized = True
             return self._value
-        dt = max(0.0, ts - self._last_ts)
+        if ts < self._last_ts:
+            # Out-of-order observation (buffered WS frame, clock step, or two
+            # estimators fed from different sources). Applying it would decay by
+            # dt=0, i.e. take a full-weight sample out of sequence, AND move the clock
+            # BACKWARDS so the next in-order sample is discounted twice. Treat a stale
+            # timestamp as no-op and keep the clock monotonic.
+            self.out_of_order += 1
+            return self._value
+        dt = ts - self._last_ts
         decay = 0.5 ** (dt / self.halflife)
         self._value = decay * self._value + (1.0 - decay) * value
         self._last_ts = ts
@@ -48,8 +58,8 @@ class Ewma:
 
         Used to age out flow/vol during silence without a new observation.
         """
-        if self._initialized:
-            dt = max(0.0, ts - self._last_ts)
+        if self._initialized and ts > self._last_ts:
+            dt = ts - self._last_ts
             self._value *= 0.5 ** (dt / self.halflife)
             self._last_ts = ts
         return self._value
@@ -99,22 +109,37 @@ class VolEstimator:
 
 
 class FlowEstimator:
-    """Signed aggressor flow and its normalized strength (a crude z-score)."""
+    """Signed aggressor flow and its normalized strength.
 
-    __slots__ = ("_signed", "_abs")
+    Earlier this reported ``EWMA(signed) / EWMA(|size|)``. That ratio is bounded by 1
+    in absolute value (|EWMA(x)| <= EWMA(|x|)), so a `trend_flow_z` of 1.5 or 2.6 could
+    never be reached and the one-sided-flow TRENDING posture was dead configuration.
+
+    This normalises the EWMA of signed flow by the EWMA of its squared magnitude,
+    which has better dynamics but is STILL bounded to [-1, 1] (|mean| <= RMS). Any
+    threshold above 1 is therefore unreachable by construction — `StrategyProfile`
+    rejects one at load time rather than letting it silently never fire.
+
+    `flow_scale` converts a trade size into a comparable unit for mixing sources
+    (used for quote-count style markets where sizes are constant and only the count
+    carries information).
+    """
+
+    __slots__ = ("_signed", "_sq", "_halflife")
 
     def __init__(self, halflife_s: float) -> None:
         self._signed = Ewma(halflife_s)
-        self._abs = Ewma(halflife_s)
+        self._sq = Ewma(halflife_s)
+        self._halflife = halflife_s
 
-    def update(self, aggressor: Side, size: float, ts: float) -> None:
-        signed = size if aggressor is Side.BUY else -size
-        self._signed.update(signed, ts)
-        self._abs.update(abs(size), ts)
+    def update(self, aggressor: Side, size: float, ts: float, *, flow_scale: float = 1.0) -> None:
+        x = (size if aggressor is Side.BUY else -size) * flow_scale
+        self._signed.update(x, ts)
+        self._sq.update(x * x, ts)
 
     def decay_to(self, ts: float) -> None:
         self._signed.decay_to(ts)
-        self._abs.decay_to(ts)
+        self._sq.decay_to(ts)
 
     @property
     def signed(self) -> float:
@@ -122,9 +147,30 @@ class FlowEstimator:
 
     @property
     def z(self) -> float:
-        """Signed flow normalized by average trade magnitude, in ~[-1, 1]+."""
-        denom = self._abs.value
-        return self._signed.value / denom if denom > 1e-9 else 0.0
+        """One-sidedness of flow in [-1, 1]: sign is direction, |z| is persistence.
+
+        Denominator is the RMS magnitude of recent flow (EWMA of x^2 on a slower
+        half-life), so for a perfectly steady stream of same-size prints the mean
+        tends to the RMS and z tends to +/-1; mixed two-way flow keeps z near 0.
+
+        NOTE THE BOUND. |EWMA(x)| <= RMS(x) always, so |z| <= 1 is a mathematical
+        property, not a tuning choice: a threshold above 1 can never fire. The
+        previous implementation divided by EWMA(|x|) and was bounded for the same
+        reason, which is why `trend_flow_z` had no effect at any setting.
+        """
+        rms = math.sqrt(max(self._sq.value, 0.0))
+        return self._signed.value / rms if rms > 1e-9 else 0.0
+
+    @property
+    def imbalance(self) -> float:
+        """Bounded net-flow ratio in [-1, 1]: 1 all buys, -1 all sells, 0 balanced.
+
+        Distinct from `z` in interpretation and scale: this is a simple composition
+        measure (mean / RMS), useful when only the direction mix matters and no
+        threshold tuning against a z-score is wanted.
+        """
+        gross = math.sqrt(max(self._sq.value, 0.0))
+        return self._signed.value / gross if gross > 1e-9 else 0.0
 
 
 @dataclass(slots=True)
@@ -132,6 +178,7 @@ class _PendingMarkout:
     fv_at_fill: float
     side: Side  # our side of the fill (BUY => we bought => adverse if price falls)
     due_ts: float
+    token_id: str = ""  # which outcome, so the mark resolves in its own price space
 
 
 class MarkoutTracker:
@@ -151,21 +198,50 @@ class MarkoutTracker:
         self._pending: list[_PendingMarkout] = []
         self._markout = Ewma(ewma_halflife_s)
 
-    def record_fill(self, side: Side, fv_at_fill: float, ts: float) -> None:
-        self._pending.append(_PendingMarkout(fv_at_fill, side, ts + self._horizon_s))
+    def record_fill(self, side: Side, token_fv_at_fill: float, ts: float,
+                    token_id: str = "") -> None:
+        """Queue a fill for marking out. `token_fv_at_fill` is the fair value OF THE
+        TOKEN WE TRADED, in that token's own price space. `token_id` records which
+        outcome it was, so the mark can later be resolved in the SAME space."""
+        self._pending.append(
+            _PendingMarkout(token_fv_at_fill, side, ts + self._horizon_s, token_id)
+        )
 
-    def evaluate(self, fv_now: float, ts: float) -> None:
-        """Resolve any markouts whose horizon has elapsed."""
+    def evaluate(
+        self,
+        yes_fv_now: float,
+        ts: float,
+        *,
+        yes_token_id: str | None = None,
+        token_in_yes_space: Callable[[float, str], float] | None = None,
+    ) -> None:
+        """Resolve any markouts whose horizon has elapsed.
+
+        The stored fill price is in TOKEN space, so the current fair value must be
+        converted into that same token's space before differencing. Comparing a NO
+        fill's 1-fv against the YES fair value manufactures an enormous fake adverse
+        move — for a market at 0.195 that is a markout of about -0.61, which pins
+        toxicity and silently disables quoting for the next half hour.
+        """
         still: list[_PendingMarkout] = []
         for p in self._pending:
-            if ts >= p.due_ts:
-                move = fv_now - p.fv_at_fill
-                # if we BOUGHT, a rise is good (+); if we SOLD, a fall is good (+)
-                signed = move if p.side is Side.BUY else -move
-                self._markout.update(signed, ts)
-            else:
+            if ts < p.due_ts:
                 still.append(p)
+                continue
+            fv_now = (
+                token_in_yes_space(yes_fv_now, p.token_id)
+                if (token_in_yes_space is not None and p.token_id)
+                else yes_fv_now
+            )
+            move = fv_now - p.fv_at_fill
+            # if we BOUGHT, a rise is good (+); if we SOLD, a fall is good (+)
+            signed = move if p.side is Side.BUY else -move
+            self._markout.update(signed, ts)
         self._pending = still
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
 
     @property
     def markout(self) -> float:
@@ -187,8 +263,27 @@ class MarketEstimators:
     last_fv: float | None = None
     last_fv_ts: float = 0.0
 
-    def on_fair_value(self, fv: float, ts: float) -> None:
+    def on_fair_value(
+        self,
+        fv: float,
+        ts: float,
+        *,
+        yes_token_id: str | None = None,
+        token_in_yes_space: Callable[[float, str], float] | None = None,
+    ) -> None:
+        """Feed the YES-space fair value; the markout resolves in the fill's own space.
+
+        `token_in_yes_space` converts a YES-space fair value into a specific token's
+        price space (NO is 1 - YES). Without it we cannot mark out correctly, so
+        pending markouts are left queued rather than resolved against the wrong space.
+        """
         self.vol.update(fv, ts)
-        self.markout.evaluate(fv, ts)
+        if token_in_yes_space is not None and yes_token_id is not None:
+            self.markout.evaluate(
+                fv,
+                ts,
+                yes_token_id=yes_token_id,
+                token_in_yes_space=token_in_yes_space,
+            )
         self.last_fv = fv
         self.last_fv_ts = ts

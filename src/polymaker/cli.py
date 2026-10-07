@@ -78,16 +78,25 @@ def markets(
         console.print("[yellow]Catalog empty. Run `polymaker scan` first.[/yellow]")
         raise typer.Exit()
 
-    table = Table(title="Political markets by score")
-    for col in ("score", "reward/day", "rebate/day", "spread", "tick", "neg", "question"):
+    table = Table(title="Political markets by reward yield per $ of capital")
+    for col in ("score", "$/day", "yield%/d", "capital", "compet.", "tox", "spread",
+                "tick", "neg", "question"):
         table.add_column(col, justify="right" if col != "question" else "left")
     for meta, sc in rows:
         table.add_row(
-            f"{sc.score:.2f}", f"{meta.rewards_daily_rate:.0f}", f"{sc.rebate_potential:.0f}",
+            f"{sc.score:.2f}", f"{sc.reward_daily_income:.4f}",
+            f"{sc.reward_yield_pct:.3f}", f"{sc.capital_usdc:.0f}",
+            f"{sc.competition:.0f}", f"{sc.toxicity:.2f}",
             f"{sc.spread:.3f}", f"{meta.tick_size:g}", "Y" if meta.neg_risk else "-",
-            meta.question[:60],
+            meta.question[:52],
         )
     console.print(table)
+    console.print(
+        "\n[dim]score = risk-adjusted reward yield per $ of capital deployed; "
+        "$/day = our share of the pool at the market's minimum scoring size; "
+        "compet. = score-weighted shares already inside the reward band; "
+        "tox = 0 safest .. 1 most likely to be run over.[/dim]"
+    )
     console.print("\nAdd one with: [bold]polymaker markets-add <slug>[/bold]  (slugs are in the catalog)")
 
 
@@ -200,6 +209,20 @@ def run(
     from polymaker.logging import configure
 
     cfg = Config.load(config_dir)
+
+    # Fail fast on configuration that would only surface mid-session (unknown profile
+    # -> KeyError on the first quote; dead proxy -> every call fails; no market enabled
+    # -> the bot runs and does nothing). Warnings in paper mode, fatal when live.
+    issues = cfg.preflight() + ([] if paper else cfg.require_live_secrets())
+    if issues:
+        for issue in issues:
+            console.print(f"[red]✗[/red] {issue}")
+        if not paper:
+            console.print("[red]Refusing to start live with the above problems.[/red] "
+                          "Fix them, or run with --paper.")
+            raise typer.Exit(1)
+        console.print("[yellow]! continuing in paper mode despite the above[/yellow]")
+
     configure(json_file=Path(cfg.paths.log_dir) / ("paper.jsonl" if paper else "live.jsonl"))
     if cfg.engine.loop == "uvloop":
         try:

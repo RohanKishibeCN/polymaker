@@ -18,14 +18,52 @@ from __future__ import annotations
 from typing import Any
 
 from polymaker.config import Config
+from polymaker.domain import ProtocolVersion
+from polymaker.execution.ledger import narrow_v2_condition_id, v2_condition_id_bytes31
 from polymaker.logging import get_logger
 
 log = get_logger("merge")
 
-# Polygon mainnet contracts (pre-V2 defaults; confirm collateral in the spike).
+# Polygon mainnet contracts.
+# NOTE: the CLOB-v1 Neg Risk Adapter (0xd91E80cF...296) was deprecated 2026-07-14 with a
+# grace period that ended 2026-07-17; relayer calls to it are fully retired, so the old
+# address silently fails for DepositWallet (sig_type 1/3) merges. Use the current adapter.
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+NEG_RISK_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"  # NegRiskCtfCollateralAdapter
+LEGACY_NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # deprecated, do not use
 USDC_COLLATERAL = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+# pUSD is what the collateral adapters and V2 position ops expect as collateralToken.
+PUSD_COLLATERAL = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+
+# ── Polymarket Protocol V2 position operations (Router) ─────────────────────
+# V2 positions live in PositionManager, not CTF, and split/merge/redeem through the
+# Router. The condition id is bytes31 (CTF's is bytes32) and outcomeIndex is 0=YES /
+# 1=NO, replacing CTF's index sets 1/2.
+ROUTER = "0x12121212006e4CD160D18e3f00711DA5c3372600"
+POSITION_MANAGER = "0x006F54F7f9A22e0000CC2AB60031000000ae9fEF"
+
+_ROUTER_ABI = [
+    {
+        "name": "merge",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "conditionId", "type": "bytes31"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [],
+    },
+    {
+        "name": "split",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "conditionId", "type": "bytes31"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [],
+    },
+]
 
 _CTF_ABI = [
     {
@@ -82,33 +120,80 @@ class Merger:
         self._account: Any = None
 
     def _ensure_web3(self) -> None:
+        """Build a Web3 client with a HARD request timeout and endpoint fallback.
+
+        Without a timeout a single hung RPC call blocks forever — and because every
+        merge runs under the engine's chain lock, that permanently disables all merges
+        with no exception and no alert. Mirrors the fallback list used for balances.
+        """
         if self._w3 is not None:
             return
         from eth_account import Account
         from web3 import Web3
         from web3.middleware import ExtraDataToPOAMiddleware
 
-        rpc = self._cfg.secrets.polygon_rpc or self._cfg.wallet.polygon_rpc
-        w3 = Web3(Web3.HTTPProvider(rpc))
-        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-        self._w3 = w3
-        self._account = Account.from_key(self._cfg.secrets.pk)
+        configured = self._cfg.secrets.polygon_rpc or self._cfg.wallet.polygon_rpc
+        rpcs = [configured, "https://polygon-bor-rpc.publicnode.com",
+                "https://polygon.llamarpc.com", "https://rpc.ankr.com/polygon"]
+        last: Exception | None = None
+        for rpc in dict.fromkeys(rpcs):
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
+                w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                _ = w3.eth.block_number  # fail fast on a dead endpoint
+                self._w3 = w3
+                self._account = Account.from_key(self._cfg.secrets.pk)
+                return
+            except Exception as exc:  # noqa: BLE001, PERF203 - try the next endpoint
+                last = exc
+                continue
+        raise RuntimeError(f"no usable polygon RPC endpoint (last error: {last})")
 
     @property
     def can_merge(self) -> bool:
-        """EOA (0) and Gnosis Safe (2) merge on-chain directly. The V2 DepositWallet
-        (1/3) merges via the builder relayer — possible only when builder creds are
-        configured (self-generate once with clob.create_builder_api_key)."""
+        """Whether ANY merge path is actually able to run.
+
+        EOA (0) and Gnosis Safe (2) merge on-chain directly. The V2 DepositWallet
+        (1/3) merges via the builder relayer, which needs builder creds
+        (self-generate once with clob.create_builder_api_key). An intentionally
+        disabled V2 Router path is reported separately, so it is not mistaken for a
+        broken merge and does not raise a false failure alert every cycle.
+        """
+        return self.can_merge_v1 or self.can_merge_v2
+
+    @property
+    def can_merge_v1(self) -> bool:
         st = self._cfg.wallet.signature_type
         if st in (0, 2):
             return True
         return self._cfg.secrets.has_builder_creds
 
-    def merge(self, condition_id: str, amount_raw: int, neg_risk: bool) -> str | None:
-        """Merge `amount_raw` (6-dec) YES+NO pairs. Returns tx hash or None."""
+    @property
+    def can_merge_v2(self) -> bool:
+        """V2 Router merges require the feature gate AND a usable submission path."""
+        if not self._cfg.wallet.merge_v2_enabled:
+            return False
+        return self.can_merge_v1
+
+    def merge(
+        self,
+        condition_id: str,
+        amount_raw: int,
+        neg_risk: bool,
+        version: ProtocolVersion = ProtocolVersion.V1,
+        position_id: str | None = None,
+    ) -> str | None:
+        """Merge `amount_raw` (6-dec) YES+NO pairs. Returns tx hash or None.
+
+        V1/CTF merges through Conditional Tokens (or the Neg Risk Adapter). V2 merges
+        through the Router and takes a bytes31 condition id, derived from the
+        position id when one is supplied.
+        """
         if amount_raw <= 0 or not self.can_merge:
             return None
         try:
+            if version is ProtocolVersion.V2:
+                return self._merge_v2(condition_id, amount_raw, position_id)
             st = self._cfg.wallet.signature_type
             if st == 0:
                 return self._merge_eoa(condition_id, amount_raw, neg_risk)
@@ -116,8 +201,105 @@ class Merger:
                 return self._merge_safe(condition_id, amount_raw, neg_risk)
             return self._merge_deposit_wallet(condition_id, amount_raw, neg_risk)  # 1/3
         except Exception as exc:  # noqa: BLE001
-            log.error("merge_failed", condition=condition_id[:12], err=str(exc))
+            log.error("merge_failed", condition=condition_id[:12], err=str(exc),
+                      version=version.value)
             return None
+
+    def _merge_v2(
+        self, condition_id: str, amount_raw: int, position_id: str | None
+    ) -> str | None:
+        """Merge V2 positions through the Router.
+
+        The Router takes `merge(bytes31 conditionId, uint256 amount)` and pulls the
+        pairs from the caller via PositionManager operator approval
+        (`setApprovalForAll(ROUTER, true)`) — an approval the existing CTF grants do
+        NOT cover. Without it the tx reverts, so we refuse rather than burn gas.
+
+        Gated behind `wallet.merge_v2_enabled` (default off): the calldata shape is
+        derived from documented ABIs and verified offline, but has not yet been
+        exercised against a live V2 market. Enable only after a small live merge.
+        """
+        if not self._cfg.wallet.merge_v2_enabled:
+            log.warning("merge_v2_disabled", condition=condition_id[:12],
+                        hint="set wallet.merge_v2_enabled=true after verifying a live merge")
+            return None
+
+        self._ensure_web3()
+        w3 = self._w3
+        cond = self._v2_condition_bytes31(condition_id, position_id)
+        if cond is None:
+            return None
+
+        c = w3.eth.contract(address=w3.to_checksum_address(ROUTER), abi=_ROUTER_ABI)
+        fn = c.functions.merge(cond, amount_raw)
+        # Build via the deposit wallet (sig 1/3) or directly from the EOA.
+        if self._cfg.wallet.signature_type in (0, 2):
+            tx = fn.build_transaction({
+                "from": self._account.address,
+                "nonce": w3.eth.get_transaction_count(self._account.address, "pending"),
+                "chainId": self._cfg.wallet.chain_id,
+                "gas": 400_000,
+                "maxFeePerGas": w3.eth.gas_price * 2,
+                "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+            })
+            signed = self._account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        else:
+            data = fn.build_transaction(
+                {"gas": 0, "gasPrice": 0, "nonce": 0, "chainId": self._cfg.wallet.chain_id}
+            )["data"]
+            tx_hash = self._relay_deposit_wallet_call(w3.to_checksum_address(ROUTER), data)
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        status = receipt.get("status", 1)
+        h = str(receipt["transactionHash"].hex())
+        log.info("merge_v2_sent", condition=condition_id[:12], amount=amount_raw,
+                 tx=h[:14], status=status)
+        if status != 1:
+            raise RuntimeError(f"router v2 merge reverted: {h}")
+        return h
+
+    def _v2_condition_bytes31(self, condition_id: str, position_id: str | None) -> bytes | None:
+        """bytes31 condition id for Router V2 calls.
+
+        Prefers narrowing Gamma's own bytes32 `conditionId` (authoritative) and only
+        falls back to deriving from the position id, which is the unverified path.
+        """
+        narrowed = narrow_v2_condition_id(condition_id)
+        if narrowed is not None:
+            return narrowed
+        log.warning("merge_v2_condition_not_padded", condition=condition_id[:24],
+                    hint="using derived position-id fallback (unverified)")
+        if position_id is not None and str(position_id).isdigit():
+            return v2_condition_id_bytes31(int(position_id))
+        return None
+
+    def _relay_deposit_wallet_call(self, target: str, data: str) -> str:
+        """Submit one call through the DepositWallet + builder relayer (gasless)."""
+        import os
+        import time as _time
+
+        from py_builder_relayer_client.client import RelayClient
+        from py_builder_relayer_client.models import DepositWalletCall
+        from py_builder_signing_sdk.config import BuilderConfig
+        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+
+        w3, sec = self._w3, self._cfg.secrets
+        if self._cfg.proxy:
+            for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                      "http_proxy", "https_proxy", "all_proxy"):
+                os.environ[k] = self._cfg.proxy
+        creds = BuilderApiKeyCreds(
+            key=sec.builder_key, secret=sec.builder_secret, passphrase=sec.builder_passphrase)
+        client = RelayClient(
+            sec.relayer_url, self._cfg.wallet.chain_id, private_key=sec.pk,
+            builder_config=BuilderConfig(local_builder_creds=creds))
+        nonce = client.get_nonce(self._account.address, "WALLET")["nonce"]
+        deadline = str(int(_time.time()) + 3600)
+        call = DepositWalletCall(target=target, value="0", data=data)
+        resp = client.execute_deposit_wallet_batch(
+            [call], w3.to_checksum_address(sec.browser_address), nonce, deadline)
+        return str(getattr(resp, "transaction_hash", None) or getattr(resp, "hash", None))
 
     def _merge_eoa(self, condition_id: str, amount_raw: int, neg_risk: bool) -> str:
         self._ensure_web3()
@@ -141,7 +323,7 @@ class Merger:
         tx = fn.build_transaction(
             {
                 "from": addr,
-                "nonce": w3.eth.get_transaction_count(addr),
+                "nonce": w3.eth.get_transaction_count(addr, "pending"),
                 "chainId": self._cfg.wallet.chain_id,
                 "gas": 300_000,
                 "maxFeePerGas": w3.eth.gas_price * 2,
@@ -199,7 +381,7 @@ class Merger:
             to, 0, data, 0, 0, 0, 0, _ZERO, _ZERO, packed
         ).build_transaction({
             "from": signer.address,
-            "nonce": w3.eth.get_transaction_count(signer.address),
+            "nonce": w3.eth.get_transaction_count(signer.address, "pending"),
             "chainId": self._cfg.wallet.chain_id,
             "gas": 600_000,
             "maxFeePerGas": w3.eth.gas_price * 2,
@@ -224,35 +406,10 @@ class Merger:
         the mergePositions call and POST it to the relayer, which submits on-chain and
         pays the gas. Requests route through cfg.proxy (Polymarket geo-blocks). Verified
         live 2026-07-09 (neg-risk merge, tx 0x4d2a2064)."""
-        import os
-        import time as _time
-
-        from py_builder_relayer_client.client import RelayClient
-        from py_builder_relayer_client.models import DepositWalletCall
-        from py_builder_signing_sdk.config import BuilderConfig
-        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
-
         self._ensure_web3()
-        w3, sec = self._w3, self._cfg.secrets
-        # the relayer client uses bare `requests`, which only honors a proxy via env vars
-        if self._cfg.proxy:
-            for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                      "http_proxy", "https_proxy", "all_proxy"):
-                os.environ[k] = self._cfg.proxy
+        w3 = self._w3
         to, data = self._inner_merge_call(condition_id, amount_raw, neg_risk)
-
-        creds = BuilderApiKeyCreds(
-            key=sec.builder_key, secret=sec.builder_secret, passphrase=sec.builder_passphrase)
-        client = RelayClient(
-            sec.relayer_url, self._cfg.wallet.chain_id, private_key=sec.pk,
-            builder_config=BuilderConfig(local_builder_creds=creds))
-        signer = self._account.address
-        nonce = client.get_nonce(signer, "WALLET")["nonce"]
-        deadline = str(int(_time.time()) + 3600)
-        call = DepositWalletCall(target=w3.to_checksum_address(to), value="0", data=data)
-        resp = client.execute_deposit_wallet_batch(
-            [call], w3.to_checksum_address(sec.browser_address), nonce, deadline)
-        h = str(getattr(resp, "transaction_hash", None) or getattr(resp, "hash", None))
+        h = self._relay_deposit_wallet_call(w3.to_checksum_address(to), data)
         receipt = w3.eth.wait_for_transaction_receipt(h, timeout=180)
         status = receipt.get("status", 1)
         log.info("merge_sent_deposit_wallet", condition=condition_id[:12],

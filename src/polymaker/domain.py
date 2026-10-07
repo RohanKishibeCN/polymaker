@@ -23,6 +23,37 @@ class Side(str, Enum):
         return Side.SELL if self is Side.BUY else Side.BUY
 
 
+class ProtocolVersion(str, Enum):
+    """Which position system a market settles in.
+
+    Selected ONLY from Gamma's `version` field — the presence of `positionIds` or
+    `clobTokenIds` is not a reliable discriminator (a CTF market can carry
+    `positionIds` as a PositionManager-workflow leg), so field presence must never
+    be used to pick the protocol.
+
+    V1 (CTF):            outcome id = clobTokenIds,   ledger = Conditional Tokens,
+                         exchange = CTFExchangeV2,   EIP-712 domain version "2".
+    V2 (Polymarket V2):  outcome id = positionIds,    ledger = PositionManager,
+                         exchange = ExchangeV3,      EIP-712 domain version "3".
+    """
+
+    V1 = "v1"
+    V2 = "v2"
+
+    @classmethod
+    def parse(cls, raw: object) -> ProtocolVersion | None:
+        """Map Gamma's `version` to a known protocol, or None if unsupported."""
+        value = str(raw or "").strip().lower()
+        for member in cls:
+            if member.value == value:
+                return member
+        return None
+
+    @property
+    def is_ctf(self) -> bool:
+        return self is ProtocolVersion.V1
+
+
 class Regime(str, Enum):
     """Per-market quoting regime (see the README)."""
 
@@ -94,6 +125,10 @@ class MarketMeta:
     liquidity_num: float = 0.0
     volume_num: float = 0.0  # lifetime
     volume_24hr: float = 0.0  # trailing 24h CLOB volume (drives rebate estimate)
+    # protocol / lifecycle
+    version: ProtocolVersion = ProtocolVersion.V1  # authoritative id-system selector
+    scanned_ts: float = 0.0  # when Gamma was last consulted for this market
+    resolved: bool = False  # V2 `resolutionStatus == "resolved"`, or V1 equivalent
 
     @property
     def yes(self) -> TokenMeta:
@@ -102,6 +137,16 @@ class MarketMeta:
     @property
     def no(self) -> TokenMeta:
         return self.tokens[1]
+
+    @property
+    def is_v2(self) -> bool:
+        return self.version is ProtocolVersion.V2
+
+    def ledger(self) -> str:
+        """ERC-1155 contract holding this market's outcome shares."""
+        from polymaker.execution.ledger import ledger_for
+
+        return ledger_for(self.version)
 
     def other_token(self, token_id: str) -> str:
         a, b = self.tokens
